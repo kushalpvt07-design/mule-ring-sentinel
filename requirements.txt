@@ -1,0 +1,50 @@
+# requirements.txt
+# ────────────────
+# Every package here is imported by the code. Nothing here is aspirational —
+# an unused dependency is a false statement about what the project needs, and
+# a missing one is a broken Quick Start.
+#
+# Removed in v3, having never been imported anywhere:
+#   lightgbm     the only gradient-booster used is xgboost
+#   matplotlib   all plotting is plotly (dashboard) or ASCII bars (console)
+#   httpx        no test makes an HTTP call; the API is tested by importing it
+#
+# Added in v3:
+#   requests     dashboard/app.py:423 posts to the live /score endpoint
+
+# ── Core graph & data ──
+# networkx is upper-bounded because the extractor depends on the semantics of
+# DiGraph iteration and pagerank's default alpha; a major bump may change both.
+networkx>=3.1,<4.0
+pandas>=2.0,<3.0
+numpy>=1.24,<3.0
+
+# ── Community detection ──
+# Provides the `community` module (community.best_partition). NOTE: there is an
+# unrelated PyPI package literally named `community` that also imports as
+# `community` and will shadow this one. If `community.best_partition` raises
+# AttributeError, run: pip uninstall community && pip install python-louvain
+python-louvain>=0.16
+
+# ── Machine learning ──
+# TreeSHAP comes from xgboost's own `pred_contribs=True`, not the `shap`
+# package — exact, and one fewer dependency. See models/explain.py.
+xgboost>=2.0,<4.0
+# Used for the logistic-regression and graph-ablation baselines, and for
+# GroupKFold. The pipeline degrades gracefully (those baselines are reported as
+# skipped) if it is absent, but the honest-lift table is incomplete without it.
+scikit-learn>=1.3
+
+# ── API layer ──
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.0
+
+# ── Dashboard ──
+streamlit>=1.32
+pyvis>=0.3.2
+plotly>=5.18
+requests>=2.31
+
+# ── Testing ──
+pytest>=8.0

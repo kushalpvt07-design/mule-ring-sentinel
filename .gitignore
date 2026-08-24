@@ -1,0 +1,64 @@
+# .gitignore
+# ──────────
+# Generated data artifacts (large, and exactly reproducible from SEED=42 in
+# data/generator.py — so the recipe is committed instead of the output).
+data/raw/*.csv
+data/processed/*.csv
+
+# Trained model binaries. Regenerate with `python -m models.train`.
+models/saved_models/*.xgb
+models/saved_models/*.bin
+models/saved_models/*.pkl
+
+# ── DELIBERATELY NOT IGNORED: models/saved_models/metrics.json ──
+# It is generated, so the instinct is to ignore it. Don't. It is the published
+# evidence for every number in the README, and the dashboard and API read it,
+# so a clone without it cannot show a single metric.
+#
+# The reason committing it is safe is that staleness is now *guarded*: v2
+# shipped a metrics.json advertising ROC-AUC 0.9999 for a model that had already
+# been retired, and nothing caught it. tests/test_baselines.py::
+# TestMetricsAreNotStale::test_metrics_describe_the_current_model_version fails
+# the build the moment the file's model_version drifts from features.MODEL_VERSION,
+# and a second test recomputes the leakage claim against the shipped CSVs. Keep
+# both if you keep the file committed.
+
+# pyvis writes its bundled vis-network/tom-select JS beside any saved HTML.
+# Vendored third-party assets, regenerated on every dashboard run.
+lib/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/
+
+# Jupyter
+.ipynb_checkpoints/
