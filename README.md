@@ -25,6 +25,15 @@ convention. See [Defense-only, by construction](#defense-only-by-construction).
 
 ---
 
+### Why a Custom Synthetic Generator?
+
+Real-world payment graphs carry no ground-truth labels for unflagged accounts, which makes precise cost-matrix evaluation (₹2,00,000/miss vs. ₹15,000/false alert) impossible on production data — you cannot score a confusion matrix without knowing which accounts are truly mules. The AML/ML literature relies on synthetic injection for exactly this reason (IBM's AMLSim being the canonical example). Off-the-shelf simulators, however, could not be used here for four structural reasons:
+
+* **Topological ground truth vs. single-row fraud.** Simulators like PaySim label individual transaction rows, not multi-hop network objects. A topological detector needs ring-level entities (`ring_id`, `ring_type`, `hijack_prob`) to build ring-disjoint temporal splits and to measure per-archetype recall (fast cycles vs. stealth cycles) — something row-level labels cannot express.
+* **The UPI organic substrate.** Graph-typology simulators such as AMLSim do inject rings, but their transaction dynamics are not calibrated to UPI: instant, 24×7, zero-fee VPA-to-VPA micropayments. Detection difficulty lives in how well a ring hides inside *realistic* background traffic — salary-day bursts, kirana merchant fan-ins, high-velocity P2P reciprocity — and reproducing that substrate required a UPI-specific generator rather than adapting a simulator built for a different payment regime.
+* **Temporal containment as a serving-scope boundary.** Constraining 100% of a ring's timeline to a single 60-day split guarantees zero positive-entity leakage across train/val/test (verified: ring-ID overlap across splits is 0) and mirrors the API's fixed 60-day serving context. Rings that straddle a window edge in production are an explicit out-of-scope boundary for v3, not an oversight.
+* **Engineered prevalence.** Real money-mule prevalence is a fraction of a percent. Synthetic prevalence was deliberately elevated to ~4–6% to give XGBoost enough positive-class representation to learn from without extreme-imbalance degradation. The decision *economics* — not the base rate — are reintroduced downstream through the rupee cost matrix; absolute precision figures are therefore reported at the elevated prevalence and would compress at production base rates (see Limitations).
+
 ## Results
 
 <!-- METRICS:BEGIN -->
