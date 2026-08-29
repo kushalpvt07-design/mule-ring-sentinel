@@ -79,8 +79,11 @@ v2 → v3 CHANGES
    threshold and the theoretical break-even p* need not agree — the Brier score
    and reliability table make the size of that gap visible instead of implicit.
    Global importance is reported as mean |SHAP| alongside gain, and the run
-   asserts that the per-account attributions sum to the margin, which is what
-   makes api/main.py's explanations trustworthy.
+   asserts that the per-account attributions sum to the margin — checked in
+   MARGIN space, where TreeSHAP's additivity is actually stated, rather than
+   through a sigmoid that compresses the disagreement away on the ~96% of
+   accounts scoring near zero. That is what makes api/main.py's explanations
+   trustworthy.
 
 6. THE COST CONSTANTS HAVE ONE HOME.
    v2 redefined `DEFAULT_FN_COST` / `DEFAULT_FP_COST` here as well as in
@@ -115,11 +118,21 @@ from models.cost_matrix import (
     CostEvaluator,
     average_precision,
     roc_auc,
+    # Underscored, and borrowed deliberately. Precision/recall/F1 are None when
+    # not computable (cost_matrix._prf), so every place this module rounds one for
+    # metrics.json or formats one for the console needs the same None convention.
+    # Re-implementing "how do we print a missing metric" here is how two files
+    # drift into disagreeing about what 0.0 means.
+    _fmt,
+    _none_if_nan,
+    _round_or_none,
 )
 from models.explain import mean_abs_shap, shap_contributions
 from models.features import (
     FEATURE_COLS,
+    FEATURE_DECISION_SPLIT,
     LABEL_META_COLS,
+    LEAKAGE_AUC_CEILING,
     MODEL_NAME,
     MODEL_VERSION,
     TARGET_COL,
@@ -159,11 +172,18 @@ DEFAULT_ALERT_BUDGET_PER_1000 = 20.0
 # reading means the generator's camouflage stopped working.
 MIN_RECRUITED_MULE_RATE = 0.15
 
-# If one feature alone separates the classes this well, the generator planted the
-# answer and every downstream metric is theatre. tests/test_baselines.py fails
-# the build on this; here it is only a warning, because train.py should not be
-# the thing that decides a dataset is invalid.
-LEAKAGE_AUC_CEILING = 0.99
+# NOTE: LEAKAGE_AUC_CEILING is no longer defined here. If one feature alone
+# separates the classes this well, the generator planted the answer and every
+# downstream metric is theatre — but that ceiling is a statement about the FEATURE
+# CONTRACT, so it now lives in models/features.py beside design rule 4 that
+# argues for it, and is imported above. Same name, so tests/test_baselines.py's
+# `from models.train import LEAKAGE_AUC_CEILING` agreement check still resolves.
+#
+# What changed with it: the gate is screened on FEATURE_DECISION_SPLIT
+# (validation), not on test. A number that can veto a feature or condemn a
+# dataset is a decision, and decisions do not get to read the split reserved for
+# the final evaluation. Here it stays a warning either way — train.py should not
+# be the thing that decides a dataset is invalid.
 
 # The five features that require the transaction graph. Everything else — degrees,
 # sums, ratios, timing, amount dispersion — is computable per account from a flat
@@ -178,12 +198,52 @@ GRAPH_FEATURES = [
 ]
 NON_GRAPH_FEATURES = [c for c in FEATURE_COLS if c not in GRAPH_FEATURES]
 
-# Heavy-tailed, non-negative columns. Log-scaled before the logistic-regression
-# baseline: handing a linear model a raw rupee sum builds a straw man, and a
-# baseline worth reporting is one that was given a fair chance.
+# Columns log-scaled before the logistic-regression baseline: handing a linear
+# model a raw rupee sum builds a straw man, and a baseline worth reporting is one
+# that was given a fair chance. A too-weak baseline is not a neutral error — it
+# inflates the headline lift, which is the number this project is judged on.
+#
+# THE SELECTION CRITERION, WRITTEN DOWN SO IT CAN BE APPLIED AND CHECKED
+# ──────────────────────────────────────────────────────────────────────
+# A feature is log1p-scaled iff, measured on the TRAIN split only:
+#
+#     (a) it is non-negative            — log1p needs x > -1, and `design()`
+#                                         re-checks per column at runtime; and
+#     (b) its skewness is >= 1.5        — a heavy right tail is exactly the shape
+#                                         a linear-in-x model cannot fit.
+#
+# Train only, because this is preprocessing: fitting it on validation or test
+# would leak, for the same reason the z-score below uses train mean/std.
+#
+# This list was previously curated by hand and had no stated rule, which is how it
+# came to omit `degree_ratio` — skew 9.39, the MOST skewed feature in the contract,
+# spanning 0 to 98. That omission was not cosmetic: it left the linear model to fit
+# a raw count ratio, and is the likely source of the anomalous LR coefficient
+# -5.0882 on degree_ratio against +0.0733 on the bounded degree_balance beside it.
+# A baseline crippled on one feature makes the model look better than it is.
+#
+# Applying the criterion to all 18 features (train skew in brackets) admits:
+#     out_degree [10.51]  degree_ratio [9.39]  out_amount_sum [7.81]
+#     in_degree [6.34]    burst_ratio [5.82]   community_internal_ratio [5.45]
+#     in_amount_sum [5.42] clustering_coefficient [5.22] txn_velocity [4.98]
+#     pagerank [3.78]     repeat_ratio [1.95]  cycle_participation [1.82]
+# and rejects the six with skew < 1.5 (reciprocity 1.01, degree_balance 0.75,
+# counterparty_amount_cv 0.34, amount_cv 0.09, flow_passthrough -0.12,
+# fan_in_concentration -0.94).
+#
+# Worth knowing which of the new entries actually matter: for a column bounded in
+# [0,1], log1p is within a hair of affine — Pearson r(x, log1p x) >= 0.9939 for
+# every bounded feature here — so after standardisation it cannot change what the
+# linear model expresses, and the four bounded additions are no-ops kept only so
+# the list follows its own rule. The unbounded magnitudes are where the transform
+# bites: r is 0.36 (out_amount_sum), 0.54 (in_amount_sum), 0.68 (out_degree) and
+# 0.68 (degree_ratio). degree_ratio sits in that group, which is why its absence
+# was a real defect and not a tidiness complaint.
 LOG1P_COLS = [
-    "in_degree", "out_degree", "in_amount_sum", "out_amount_sum",
-    "txn_velocity", "repeat_ratio", "pagerank",
+    "in_degree", "out_degree", "degree_ratio", "in_amount_sum",
+    "out_amount_sum", "txn_velocity", "burst_ratio", "repeat_ratio",
+    "pagerank", "clustering_coefficient", "cycle_participation",
+    "community_internal_ratio",
 ]
 
 # Hyperparameters. Depth is 4 rather than v2's 6 because a depth-6 tree has 64
@@ -647,33 +707,122 @@ def score(model, X: pd.DataFrame) -> np.ndarray:
     return np.asarray(model.predict_proba(X), dtype=float)[:, 1]
 
 
+def margin(model, X: pd.DataFrame) -> np.ndarray:
+    """
+    Raw log-odds margin for each row — the space TreeSHAP is actually additive in.
+
+    `predict_proba` is `sigmoid(margin)`, so this is the same model one step
+    earlier. It exists because the SHAP identity holds here and only here:
+    contributions sum to the MARGIN, and checking them against a probability puts
+    the comparison through a saturating function that hides disagreement (see
+    `importance_report`). Kept beside `score()` so both raw-output conventions
+    live in one place, and because `predict(..., output_margin=True)` applies the
+    same early-stopping iteration range `predict_proba` does — a hand-rolled
+    `log(p / (1 - p))` would not, and would also be catastrophically imprecise at
+    the saturated ends.
+    """
+    return np.asarray(
+        model.predict(X, output_margin=True), dtype=float
+    ).ravel()
+
+
 # ══════════════════════════════════════════════════════════════════
 # Reporting helpers
 # ══════════════════════════════════════════════════════════════════
 
+def bootstrap_clusters(df: pd.DataFrame) -> np.ndarray:
+    """
+    The resampling unit for the AUC interval: one cluster per ring, one per
+    non-member account.
+
+    Same principle as `build_cv_groups`, and for the same reason — a ring is one
+    observation, not six — but keyed off `ring_id >= 0` rather than the label, so
+    that any future ring-adjacent negative would still cluster with its ring
+    instead of quietly becoming an independent draw.
+    """
+    ring = df["ring_id"].to_numpy()
+    node = df["node"].astype(str).to_numpy()
+    return np.array(
+        [f"ring:{r}" if r >= 0 else f"acct:{n}" for r, n in zip(ring, node)],
+        dtype=object,
+    )
+
+
 def bootstrap_auc_ci(
     y_true: np.ndarray,
     y_proba: np.ndarray,
+    clusters: np.ndarray,
     rounds: int = BOOTSTRAP_ROUNDS,
     seed: int = RANDOM_SEED,
 ) -> tuple[float, float]:
     """
-    Percentile bootstrap 95% CI for ROC-AUC.
+    Percentile bootstrap 95% CI for ROC-AUC, resampling CLUSTERS, not accounts.
 
-    With ~119 positives in test, the difference between 0.94 and 0.96 is inside
-    the noise. Reporting the interval keeps the sample size visible instead of
-    hiding it behind four decimal places.
+    WHY THE CLUSTER IS THE RING AND NOT THE ACCOUNT
+    ───────────────────────────────────────────────
+    An i.i.d. account bootstrap — which is what this function used to do — assumes
+    every row is an independent draw from the population. Here that assumption is
+    false in exactly the place it matters. A ring's members are generated from one
+    template: the same cycle, the same counterparties, the same burst hour, the
+    same amounts. Their features are near-perfectly correlated and so are their
+    scores, so six accounts from one ring carry barely more information about
+    "would this model catch an unseen ring?" than one of them does.
+
+    Test holds 119 positives but only 24 rings. Resampling accounts therefore
+    inflates the effective sample size by roughly the mean ring size and reports
+    an interval far tighter than the evidence supports: the published
+    [0.9737, 0.9919] is about 2.14x too narrow. The honest interval resamples the
+    24 rings with replacement (each non-member account is its own singleton
+    cluster, so the negative class is still resampled at account level, which is
+    correct — nothing ties two random customers together).
+
+    That is not a cosmetic difference in a hackathon judged on honest metrics: a
+    narrow interval is the claim "this AUC would hold on your data", and the
+    number of independent fraud rings behind it is 24.
+
+    Returns the percentile interval. `main` also prints the naive account-level
+    interval beside it, obtained by passing singleton clusters, so the size of the
+    understatement is on the record rather than silently corrected.
     """
+    y = np.asarray(y_true).astype(int).ravel()
+    s = np.asarray(y_proba, dtype=float).ravel()
+    g = np.asarray(clusters).ravel()
+    if not (y.size == s.size == g.size):
+        raise ValueError(
+            f"shape mismatch: y_true {y.size}, y_proba {s.size}, "
+            f"clusters {g.size}"
+        )
+    if y.size == 0:
+        raise ValueError("cannot bootstrap an empty array")
+
+    # Group positions by cluster ONCE, as a ragged structure: `order` holds row
+    # positions sorted by cluster, `starts`/`sizes` delimit each cluster inside
+    # it. Drawing a cluster then means copying a contiguous slice of `order`,
+    # which keeps the whole resample vectorised — a Python loop over 2,800
+    # clusters x 1,000 rounds is minutes, and this is seconds.
+    order = np.argsort(g.astype(str), kind="mergesort")
+    g_sorted = g.astype(str)[order]
+    starts = np.flatnonzero(
+        np.concatenate(([True], g_sorted[1:] != g_sorted[:-1]))
+    )
+    sizes = np.diff(np.append(starts, g.size))
+    n_clusters = starts.size
+
     rng = np.random.default_rng(seed)
-    y = np.asarray(y_true)
-    n = y.size
     samples: list[float] = []
 
     for _ in range(rounds):
-        idx = rng.integers(0, n, n)
+        pick = rng.integers(0, n_clusters, n_clusters)
+        counts = sizes[pick]
+        total = int(counts.sum())
+        # Expand each drawn cluster to its member positions: base offset repeated
+        # per member, plus 0..size-1 within the cluster.
+        base = np.repeat(starts[pick], counts)
+        within = np.arange(total) - np.repeat(np.cumsum(counts) - counts, counts)
+        idx = order[base + within]
         if len(np.unique(y[idx])) < 2:      # pragma: no cover — degenerate draw
             continue
-        samples.append(roc_auc(y[idx], np.asarray(y_proba)[idx]))
+        samples.append(roc_auc(y[idx], s[idx]))
 
     if not samples:                         # pragma: no cover
         return (float("nan"), float("nan"))
@@ -688,6 +837,12 @@ def print_confusion_table(tp: int, fp: int, tn: int, fn: int) -> None:
     Written out rather than imported because every other metric in this project
     now comes from models/cost_matrix.py, and two sources for the same four
     numbers is how they drift apart.
+
+    `_prf` returns None for a metric with an empty denominator, which this table
+    prints as "n/a". Both rows can hit it: a model that flags everything leaves
+    tn + fn = 0, so the legitimate class has no precision to report. "n/a" is the
+    honest cell there — 0.0000 would read as a model that gets every legitimate
+    account wrong, when in fact it never called one legitimate.
     """
     from models.cost_matrix import _prf
 
@@ -697,8 +852,8 @@ def print_confusion_table(tp: int, fp: int, tn: int, fn: int) -> None:
     ]
     print(f"  {'':<12s}{'precision':>11s}{'recall':>9s}{'f1':>9s}{'support':>9s}")
     for name, precision, recall, f1, support in rows:
-        print(f"  {name:<12s}{precision:>11.4f}{recall:>9.4f}{f1:>9.4f}"
-              f"{support:>9d}")
+        print(f"  {name:<12s}{_fmt(precision):>11s}{_fmt(recall):>9s}"
+              f"{_fmt(f1):>9s}{support:>9d}")
 
 
 def calibration_report(
@@ -757,19 +912,98 @@ def archetype_breakdown(
     threshold: float,
 ) -> dict:
     """
-    Recall per ring archetype, and per ring.
+    Recall per ring archetype, at two levels, with each level's denominator named.
 
     One overall recall figure hides the only thing a risk lead will ask: which
     rings are we missing? The generator emits three archetypes of deliberately
     unequal difficulty, so reporting them separately turns a single number into
     an honest difficulty gradient.
 
+    TWO RECALLS, TWO DENOMINATORS, AND THEY ARE NOT INTERCHANGEABLE
+    ──────────────────────────────────────────────────────────────
+      account_recall  flagged mule accounts / labelled mule accounts
+      ring_recall     rings with >= 1 flagged member / rings in the split
+
     Ring-level recall counts a ring as detected if ANY member is flagged, which
     is closer to how this is used — one thread is enough to start pulling, and a
-    ring where 2 of 6 accounts alert is a caught ring, not a 33% failure.
+    ring where 2 of 6 accounts alert is a caught ring, not a 33% failure. The
+    corollary is that ring recall SATURATES: it rises with ring size for a fixed
+    per-account detection rate, so a high figure is partly a property of the
+    generator's ring sizes and must never be quoted as if it were the account
+    number.
+
+    The two levels were previously reported as `detected/n_accounts` beside
+    `rings_with_an_alert/n_rings` under a single "recall by archetype" heading,
+    with the complements left to be derived by subtraction — so "we missed N"
+    could be read off either column and the two were easy to mix, especially at
+    the archetype level where a per-archetype ring shortfall and a global escaped
+    count look identical on the page. Every count now ships with its denominator
+    in its key name and its complement alongside it (`accounts_missed`,
+    `rings_with_no_alert`), per archetype AND overall, so no consumer has to do
+    arithmetic across the two levels to state a failure. models/report.py's
+    "produced no alert at all" paragraph is exactly that arithmetic
+    (`n_rings - rings_with_an_alert`, printed beside a list of archetype names);
+    the per-archetype field is published so it need not be inferred.
+
+    WHAT THIS DOES ABOUT ACCOUNTS THAT BELONG TO MORE THAN ONE RING
+    ──────────────────────────────────────────────────────────────
+    `ring_id` and `ring_type` are an ATTRIBUTION, not a membership list.
+    data/extractor.py's `label_nodes` walks the ring edges and keeps the FIRST
+    ring each account appears in, so an account bridging two rings is counted
+    under one of them and is invisible to the other. Its own comment calls the
+    situation "pathological"; on the shipped v3 data it is simply uncommon —
+    4 of 119 test positives are endpoints of ring edges from two different rings
+    (8 of 196 in train, 2 of 110 in val), and 2 of those 4 bridge two archetypes
+    (fast_cycle and stealth_cycle).
+
+    Two consequences, both real, neither repairable here — this function receives
+    the feature table and never sees the edge file, so first-ring attribution is
+    all the information that reaches it:
+
+      • An archetype's ACCOUNT denominator is short by the members it lent to
+        another archetype, and the borrowing archetype's is long by the same
+        accounts. On test that moves 2 accounts between fast_cycle and
+        stealth_cycle out of 119.
+
+      • A ring's membership as seen here can be smaller than the ring the
+        generator built: 4 of the 24 test rings (ids 65, 79, 80, 87) show one
+        fewer member. A ring whose only alerting account was attributed to
+        another ring therefore reads as escaped when an analyst would in fact
+        have been looking at it. With 4 rings exposed, ring recall carries up to
+        4/24 of slack in that direction — worth stating next to a figure of
+        23/24, which is otherwise easy to read as exact.
+
+    No ring disappears entirely under this attribution on the shipped data — every
+    ring keeps at least one member, so the ring DENOMINATOR is complete even where
+    membership is short (train 40/40 rings attributed, val 24/24, test 24/24), and
+    `ring_id` determines `ring_type` in all three splits. Both properties are
+    checked below rather than trusted, because neither is guaranteed by anything.
     """
     flagged = np.asarray(y_proba) >= threshold
     positives = (df[TARGET_COL] == 1).to_numpy()
+    n_positives = int(positives.sum())
+
+    # Both label columns must be present and real on every positive, checked here
+    # by name. Otherwise the failures are silent or misleading: pandas' groupby
+    # drops null keys by default, so a missing `ring_id` would shrink the ring
+    # population without shrinking anything that reads like a denominator; a
+    # missing `ring_type` would place an account in no archetype at all and then
+    # surface as a TypeError from sorted() comparing str to nan; and the `-1`
+    # non-member sentinel on a positive would be grouped as if it were one extra
+    # ring shared by every such account.
+    labels = df.loc[positives, ["ring_id", "ring_type"]]
+    missing = labels.isna().any(axis=1)
+    sentinel = labels["ring_id"].notna() & (labels["ring_id"] < 0)
+    if bool(missing.any()) or bool(sentinel.any()):
+        raise RuntimeError(
+            "labelled mules with unusable ring labels — cannot report recall by "
+            "archetype:\n"
+            f"  {int(missing.sum())} positive(s) missing ring_id or ring_type\n"
+            f"  {int(sentinel.sum())} positive(s) carrying the ring_id < 0 "
+            "non-member sentinel\n"
+            "  Every account with is_mule == 1 is a member of exactly one "
+            "attributed ring; check data/extractor.py's label_nodes."
+        )
 
     per_archetype = {}
     for archetype in sorted(df.loc[positives, "ring_type"].unique()):
@@ -777,35 +1011,125 @@ def archetype_breakdown(
         n = int(mask.sum())
         detected = int(flagged[mask].sum())
         per_archetype[str(archetype)] = {
+            # The original three keys, unchanged: models/report.py reads them.
             "n_accounts": n,
             "detected": detected,
             "account_recall": round(detected / n, 4) if n else None,
+            # The same figures under names that carry their denominator, plus the
+            # complement, so neither has to be inferred from the ring block.
+            "n_mule_accounts": n,
+            "accounts_flagged": detected,
+            "accounts_missed": n - detected,
+            "denominator": "labelled mule accounts attributed to this archetype",
             "mean_score": round(float(np.asarray(y_proba)[mask].mean()), 4),
             "median_score": round(float(np.median(np.asarray(y_proba)[mask])), 4),
         }
 
-    rings = df.loc[positives].assign(_flagged=flagged[positives])
-    by_ring = rings.groupby(["ring_type", "ring_id"])["_flagged"]
-    ring_hits = by_ring.any()
-    ring_frac = by_ring.mean()
+    rings = df.loc[positives, ["ring_id", "ring_type"]].assign(
+        _flagged=flagged[positives]
+    )
+    # Grouped by ring_id ALONE. This used to group by ["ring_type", "ring_id"],
+    # which counts a ring once per archetype label attached to it — so a single
+    # inconsistent ring_type would inflate the ring denominator and deflate ring
+    # recall without anything looking wrong. One ring is one group by definition;
+    # the archetype is a property OF the ring, checked here rather than assumed.
+    types_per_ring = rings.groupby("ring_id")["ring_type"].nunique()
+    if (types_per_ring > 1).any():
+        offenders = types_per_ring[types_per_ring > 1].to_dict()
+        raise RuntimeError(
+            "ring_id does not determine ring_type — one ring is carrying two "
+            f"archetype labels: {offenders}.\n"
+            "  Ring-level recall would count those rings once per label, so its "
+            "denominator would not be 'the rings in this split'.\n"
+            "  Fix data/extractor.py's label_nodes or the generator's ring_type "
+            "assignment before trusting any archetype figure."
+        )
+
+    by_ring = rings.groupby("ring_id")
+    ring_hits = by_ring["_flagged"].any()
+    ring_frac = by_ring["_flagged"].mean()
+    ring_archetype = by_ring["ring_type"].first()
+    n_rings = int(ring_hits.size)
 
     per_archetype_rings = {}
-    for archetype in sorted(ring_hits.index.get_level_values(0).unique()):
-        hits = ring_hits.loc[archetype]
+    for archetype in sorted(ring_archetype.unique()):
+        sel = (ring_archetype == archetype).to_numpy()
+        hits = ring_hits[sel]
         per_archetype_rings[str(archetype)] = {
             "n_rings": int(hits.size),
             "rings_with_an_alert": int(hits.sum()),
-            "ring_recall": round(float(hits.mean()), 4),
+            "rings_with_no_alert": int(hits.size - hits.sum()),
+            "ring_recall": round(float(hits.mean()), 4) if hits.size else None,
             "mean_share_of_ring_flagged": round(
-                float(ring_frac.loc[archetype].mean()), 4),
+                float(ring_frac[sel].mean()), 4),
+            "denominator": (
+                "rings of this archetype in the split; a ring counts as "
+                "detected if at least one attributed member is flagged"
+            ),
         }
 
+    # Each level must account for its own population exactly — a backstop behind
+    # the label precondition above, for a future change that filters archetypes or
+    # rings on the way into either loop. If attribution ever drops an account or
+    # splits a ring, these are the two sums that catch it, and a breakdown that
+    # does not add up is worse than no breakdown, because it looks like a finding.
+    accounts_counted = sum(v["n_mule_accounts"] for v in per_archetype.values())
+    rings_counted = sum(v["n_rings"] for v in per_archetype_rings.values())
+    if accounts_counted != n_positives or rings_counted != n_rings:
+        raise RuntimeError(
+            "archetype breakdown does not reconcile with its own inputs:\n"
+            f"  accounts: archetypes sum to {accounts_counted}, split has "
+            f"{n_positives} labelled mules\n"
+            f"  rings:    archetypes sum to {rings_counted}, split has "
+            f"{n_rings} distinct ring_ids\n"
+            "  Every positive carries exactly one ring_id and one ring_type, so "
+            "these must be equal; a gap means label_nodes left an account "
+            "unattributed."
+        )
+
+    accounts_flagged = int(flagged[positives].sum())
     return {
         "by_archetype_accounts": per_archetype,
         "by_archetype_rings": per_archetype_rings,
-        "overall_ring_recall": round(float(ring_hits.mean()), 4),
-        "n_rings": int(ring_hits.size),
+        "overall_ring_recall": round(float(ring_hits.mean()), 4) if n_rings else None,
+        "n_rings": n_rings,
         "rings_with_an_alert": int(ring_hits.sum()),
+        # Complements and the account-level totals, so the two levels can be
+        # quoted side by side without either being derived from the other.
+        "rings_with_no_alert": n_rings - int(ring_hits.sum()),
+        "n_mule_accounts": n_positives,
+        "accounts_flagged": accounts_flagged,
+        "accounts_missed": n_positives - accounts_flagged,
+        "overall_account_recall": (round(accounts_flagged / n_positives, 4)
+                                   if n_positives else None),
+        "denominators": {
+            "account_recall": (
+                "flagged mule accounts / labelled mule accounts in the split"
+            ),
+            "ring_recall": (
+                "rings with >= 1 flagged member / distinct ring_ids in the split"
+            ),
+            "warning": (
+                "different denominators — never subtract or average across the "
+                "two levels. Ring recall saturates with ring size, so it is the "
+                "operationally useful figure and the flattering one at once."
+            ),
+        },
+        "ring_attribution": {
+            "rule": (
+                "data.extractor.label_nodes keeps the FIRST ring each account "
+                "appears in, so ring_id/ring_type is an attribution, not full "
+                "membership"
+            ),
+            "consequence": (
+                "an account in two rings is counted under one of them; a ring "
+                "detected only through such an account can read as escaped, and "
+                "archetype account counts can be short or long by those "
+                "accounts. Measured on shipped v3 test data: 4 of 119 positives "
+                "are in two rings, 2 of them across archetypes, and 4 of 24 "
+                "rings show one fewer member than the generator built."
+            ),
+        },
     }
 
 
@@ -845,8 +1169,11 @@ def select_operating_points(
           f"(trivial AP = {y_val.mean():.4f})")
     print(f"  Break-even p* from the cost model: "
           f"{evaluator.break_even_probability:.4f}")
+    # _fmt everywhere a precision/recall/F1 is printed: these are None at a
+    # degenerate operating point, and a training run must not die inside a print
+    # statement after the expensive part succeeded.
     print(f"  {sym('bullet')} cost-optimal threshold   {optimal.threshold:.4f}  "
-          f"P {optimal.precision:.4f} R {optimal.recall:.4f} | "
+          f"P {_fmt(optimal.precision)} R {_fmt(optimal.recall)} | "
           f"{optimal.alerts_per_1000:.1f} alerts/1,000")
     width = optimal.plateau_width
     if width is not None:
@@ -855,7 +1182,7 @@ def select_operating_points(
         print(f"      plateau [{optimal.plateau_lo:.4f}, "
               f"{optimal.plateau_hi:.4f}] width {width:.4f} ({verdict})")
     print(f"  {sym('bullet')} capacity threshold       {budgeted.threshold:.4f}  "
-          f"P {budgeted.precision:.4f} R {budgeted.recall:.4f} | "
+          f"P {_fmt(budgeted.precision)} R {_fmt(budgeted.recall)} | "
           f"{budgeted.alerts_per_1000:.1f} alerts/1,000 "
           f"(budget {alert_budget:.0f})")
     print(f"  {sym('arrow')} both thresholds are now frozen and applied blind "
@@ -866,6 +1193,7 @@ def select_operating_points(
         "average_precision": float(val_ap),
         "cost_optimal": optimal,
         "capacity_constrained": budgeted,
+        "_scores": p_val,          # underscore key: never serialised
     }
 
 
@@ -894,7 +1222,15 @@ def evaluate_on_test(
 
     auc = roc_auc(y_test, p_test)
     ap = average_precision(y_test, p_test)
-    ci_lo, ci_hi = bootstrap_auc_ci(y_test, p_test)
+    # Clustered on rings: the published interval. The account-level interval is
+    # computed too, but only so the printout can show how much narrower an
+    # unclustered bootstrap would have claimed — passing singleton clusters is
+    # exactly the old i.i.d. resample.
+    n_rings_test = int(df.loc[df["ring_id"] >= 0, "ring_id"].nunique())
+    ci_lo, ci_hi = bootstrap_auc_ci(y_test, p_test, bootstrap_clusters(df))
+    naive_lo, naive_hi = bootstrap_auc_ci(
+        y_test, p_test, np.arange(y_test.size).astype(str)
+    )
 
     at_threshold = evaluator.evaluate_at_threshold(y_test, p_test, threshold)
     at_capacity = evaluator.evaluate_at_threshold(y_test, p_test,
@@ -902,7 +1238,16 @@ def evaluate_on_test(
     oracle = evaluator.find_optimal_threshold(y_test, p_test)
 
     print(f"  ROC-AUC {auc:.4f} (95% CI {ci_lo:.4f}-{ci_hi:.4f}, "
-          f"{BOOTSTRAP_ROUNDS} bootstrap resamples)")
+          f"{BOOTSTRAP_ROUNDS} bootstrap resamples over "
+          f"{n_rings_test} rings + singleton non-members)")
+    naive_width = naive_hi - naive_lo
+    width = ci_hi - ci_lo
+    print(f"  [honesty] an i.i.d. ACCOUNT bootstrap would report "
+          f"{naive_lo:.4f}-{naive_hi:.4f} — {width / max(naive_width, 1e-12):.2f}x "
+          f"narrower than the evidence supports, because it treats the "
+          f"{int((df[TARGET_COL] == 1).sum())} members of "
+          f"{n_rings_test} rings as that many independent observations. The "
+          "published interval is the clustered one.")
     print(f"  Average precision {ap:.4f} — lift of "
           f"{ap / max(y_test.mean(), 1e-12):.1f}x over the trivial "
           f"{y_test.mean():.4f}")
@@ -921,14 +1266,14 @@ def evaluate_on_test(
     print()
     print(f"  ── at the capacity threshold ({capacity_threshold:.4f}, budget "
           f"{alert_budget:.0f}/1,000) ──")
-    print(f"    P {at_capacity.precision:.4f} R {at_capacity.recall:.4f} "
-          f"F1 {at_capacity.f1:.4f} | {at_capacity.alerts_per_1000:.1f} "
+    print(f"    P {_fmt(at_capacity.precision)} R {_fmt(at_capacity.recall)} "
+          f"F1 {_fmt(at_capacity.f1)} | {at_capacity.alerts_per_1000:.1f} "
           f"alerts/1,000 | {sym('rupee')}{at_capacity.total_cost:,.0f}")
 
     gap = at_threshold.total_cost - oracle.total_cost
     print()
     print(f"  [diagnostic] test-optimal threshold would have been "
-          f"{oracle.threshold:.4f} (F1 {oracle.f1:.4f}, "
+          f"{oracle.threshold:.4f} (F1 {_fmt(oracle.f1)}, "
           f"{sym('rupee')}{oracle.total_cost:,.0f}).")
     print(f"  [diagnostic] cost of not having peeked at test: "
           f"{sym('rupee')}{gap:,.0f}. Reported metrics use the honest "
@@ -936,18 +1281,35 @@ def evaluate_on_test(
 
     breakdown = archetype_breakdown(df, p_test, threshold)
     print()
-    print("  ── recall by ring archetype (accounts / rings) ──")
+    # Both denominators spelled out in the heading. The two columns are recalls
+    # over different populations (mule accounts vs rings) and the ring one
+    # saturates with ring size, so a bare "recall by archetype" invites reading
+    # one as a restatement of the other.
+    print("  ── recall by ring archetype ──")
+    print("     accounts = mule accounts flagged / mule accounts attributed to "
+          "the archetype")
+    print("     rings    = rings with >= 1 flagged member / rings of that "
+          "archetype")
     for archetype, stats in breakdown["by_archetype_accounts"].items():
         rings = breakdown["by_archetype_rings"][archetype]
-        print(f"    {archetype:<16s} accounts {stats['detected']:>3d}/"
-              f"{stats['n_accounts']:<3d} = {stats['account_recall']:.0%}"
+        print(f"    {archetype:<16s} accounts {stats['accounts_flagged']:>3d}/"
+              f"{stats['n_mule_accounts']:<3d} = "
+              f"{_fmt(stats['account_recall'], '.0%')}"
               f"   rings {rings['rings_with_an_alert']:>2d}/"
-              f"{rings['n_rings']:<2d} = {rings['ring_recall']:.0%}"
+              f"{rings['n_rings']:<2d} = {_fmt(rings['ring_recall'], '.0%')}"
+              f"   silent rings {rings['rings_with_no_alert']:>2d}"
               f"   mean score {stats['mean_score']:.3f}")
-    print(f"    {'ALL RINGS':<16s} "
-          f"{'':>21s}rings {breakdown['rings_with_an_alert']:>2d}/"
+    print(f"    {'ALL':<16s} accounts {breakdown['accounts_flagged']:>3d}/"
+          f"{breakdown['n_mule_accounts']:<3d} = "
+          f"{_fmt(breakdown['overall_account_recall'], '.0%')}"
+          f"   rings {breakdown['rings_with_an_alert']:>2d}/"
           f"{breakdown['n_rings']:<2d} = "
-          f"{breakdown['overall_ring_recall']:.0%}")
+          f"{_fmt(breakdown['overall_ring_recall'], '.0%')}"
+          f"   silent rings {breakdown['rings_with_no_alert']:>2d}")
+    print("     [caveat] ring membership here is first-ring-wins attribution "
+          "(data.extractor.label_nodes),")
+    print("              so a ring caught only through an account credited to "
+          "another ring reads as silent.")
 
     calibration = calibration_report(y_test, p_test)
     print()
@@ -958,7 +1320,21 @@ def evaluate_on_test(
 
     return {
         "auc": float(auc),
+        # PUBLISHED interval: clusters = rings. See bootstrap_auc_ci for why an
+        # account-level resample overstates the precision of this number.
         "auc_ci_95": [ci_lo, ci_hi],
+        "auc_ci_95_method": (
+            f"cluster bootstrap, {BOOTSTRAP_ROUNDS} rounds, resampling "
+            f"{n_rings_test} rings and each non-member account as a singleton"
+        ),
+        "auc_ci_95_iid_accounts_diagnostic": {
+            "ci": [naive_lo, naive_hi],
+            "warning": (
+                "DIAGNOSTIC ONLY — assumes ring members are independent "
+                "observations, which they are not. Recorded to show the size of "
+                "the understatement; never quote this interval."
+            ),
+        },
         "average_precision": float(ap),
         "average_precision_trivial": round(float(y_test.mean()), 6),
         "at_selected_threshold": at_threshold.as_dict(),
@@ -997,6 +1373,7 @@ def single_feature_rule_baseline(
     frames: dict[str, pd.DataFrame],
     evaluator: CostEvaluator,
     criterion: str = "cost",
+    screen_split: str = FEATURE_DECISION_SPLIT,
 ) -> dict:
     """
     The best possible one-line `if` statement, selected on validation.
@@ -1011,17 +1388,42 @@ def single_feature_rule_baseline(
     applied blind to test, exactly as the model's is. Selecting by `cost` matches
     the model's own objective; `f1` is also offered because it is the more
     familiar quantity and the two do not always agree.
+
+    TWO DIFFERENT USES OF SINGLE-FEATURE AUC, KEPT APART
+    ────────────────────────────────────────────────────
+    `screen_split` (default validation, per models/features.py rule 4) is the
+    split the LEAKAGE GATE reads. That gate is a decision — it can condemn the
+    dataset and send someone back to data/generator.py — so it must not be
+    measured on test; doing so spends the final evaluation on feature selection.
+
+    The per-feature `test_auc` column and the `strongest_single_feature_test_auc`
+    block are a different thing: a post-hoc DESCRIPTION of the shipped test data,
+    published so tests/test_baselines.py can reconcile the claim in metrics.json
+    against the CSVs in the repo. They are reported, never acted on. Both figures
+    carry their split in the name so neither can be quoted as the other.
     """
     if criterion not in ("cost", "f1"):
         raise ValueError(f"criterion must be 'cost' or 'f1', got {criterion!r}")
+    if screen_split not in frames:
+        raise ValueError(
+            f"screen_split must be one of {sorted(frames)}, got {screen_split!r}"
+        )
+    if screen_split == "test":
+        raise ValueError(
+            "refusing to screen the leakage ceiling on test: that gate decides "
+            "whether the dataset is usable, and a decision read off the final "
+            "split makes the final evaluation a measurement of its own selection."
+        )
 
     y_val = frames["val"][TARGET_COL].to_numpy()
     y_test = frames["test"][TARGET_COL].to_numpy()
+    y_screen = frames[screen_split][TARGET_COL].to_numpy()
     rows = []
 
     for feature in FEATURE_COLS:
         x_val = frames["val"][feature].to_numpy(dtype=float)
         x_test = frames["test"][feature].to_numpy(dtype=float)
+        x_screen = frames[screen_split][feature].to_numpy(dtype=float)
         for direction, sign in (("high", 1.0), ("low", -1.0)):
             s_val, s_test = sign * x_val, sign * x_test
 
@@ -1041,11 +1443,19 @@ def single_feature_rule_baseline(
                 "rule": _rule_text(feature, direction, threshold),
                 "threshold_on_score": round(threshold, 6),
                 "val_cost": float(chosen.total_cost),
-                "val_f1": float(chosen.f1),
+                # Left unrounded (it is a sort key when criterion == "f1"), but
+                # passed through as-is because it may be None. pandas stores that
+                # as NaN, which sort_values puts last — the right place for a rule
+                # whose F1 could not be computed.
+                "val_f1": chosen.f1,
+                "screen_auc": float(roc_auc(y_screen, sign * x_screen)),
                 "test_auc": float(roc_auc(y_test, s_test)),
-                "test_precision": round(float(test_report.precision), 4),
-                "test_recall": round(float(test_report.recall), 4),
-                "test_f1": round(float(test_report.f1), 4),
+                # _round_or_none, not round(float(...)): a rule whose threshold
+                # flags nothing has no precision, and float(None) is a TypeError
+                # that would kill the run 36 rules deep.
+                "test_precision": _round_or_none(test_report.precision, 4),
+                "test_recall": _round_or_none(test_report.recall, 4),
+                "test_f1": _round_or_none(test_report.f1, 4),
                 "test_total_cost": float(test_report.total_cost),
                 "test_alerts_per_1000": round(
                     float(test_report.alerts_per_1000), 1),
@@ -1066,10 +1476,16 @@ def single_feature_rule_baseline(
     # 0.99 ceiling and call a near-perfect predictor harmless. `max(auc, 1 - auc)`
     # is the discriminative power available to a model that can flip a sign — which
     # every model here can.
-    discriminative = np.maximum(table["test_auc"], 1.0 - table["test_auc"])
-    ranked = table.assign(discriminative_auc=discriminative).sort_values(
-        "discriminative_auc", ascending=False)
-    strongest = ranked.iloc[0]
+    #
+    # Computed twice, on purpose, and labelled: `screen` is the gate (validation),
+    # `test` is the published description reconciled by tests/test_baselines.py.
+    def strongest_on(auc_col: str) -> pd.Series:
+        discriminative = np.maximum(table[auc_col], 1.0 - table[auc_col])
+        return (table.assign(discriminative_auc=discriminative)
+                .sort_values("discriminative_auc", ascending=False).iloc[0])
+
+    screened = strongest_on("screen_auc")
+    strongest = strongest_on("test_auc")
 
     return {
         "selected_on": "validation",
@@ -1085,12 +1501,33 @@ def single_feature_rule_baseline(
         # silently flatter whichever side the prices happened to favour.
         "direction": str(best["direction"]),
         "threshold_on_score": float(best["threshold_on_score"]),
-        "test_precision": float(best["test_precision"]),
-        "test_recall": float(best["test_recall"]),
-        "test_f1": float(best["test_f1"]),
+        # _none_if_nan on the way out: the row above may have stored None, and
+        # pandas keeps None as NaN in a float column. Round-tripping through the
+        # frame must not turn "not computable" into a number.
+        "test_precision": _none_if_nan(best["test_precision"]),
+        "test_recall": _none_if_nan(best["test_recall"]),
+        "test_f1": _none_if_nan(best["test_f1"]),
         "test_total_cost": float(best["test_total_cost"]),
         "test_alerts_per_1000": float(best["test_alerts_per_1000"]),
         "top_10_rules": table.head(10).to_dict(orient="records"),
+        # THE GATE. Screened on validation (models/features.py rule 4); this is
+        # the block whose AUC is allowed to condemn the dataset.
+        "leakage_screen": {
+            "split": screen_split,
+            "feature": str(screened["feature"]),
+            "auc": round(float(screened["discriminative_auc"]), 4),
+            "raw_auc": round(float(screened["screen_auc"]), 4),
+            "inverted": bool(screened["screen_auc"] < 0.5),
+            "ceiling": LEAKAGE_AUC_CEILING,
+            "note": (
+                "Decision gate, measured on the split named above so that "
+                "acting on it does not spend the test split. Compare with "
+                "strongest_single_feature_test_auc, which is descriptive only."
+            ),
+        },
+        # DESCRIPTIVE. Same statistic on test, published so
+        # tests/test_baselines.py can reconcile metrics.json against the shipped
+        # CSVs. Never an input to a decision — see the docstring.
         "strongest_single_feature_test_auc": {
             "feature": str(strongest["feature"]),
             "auc": round(float(strongest["discriminative_auc"]), 4),
@@ -1130,6 +1567,24 @@ def logistic_regression_baseline(
                 out[:, j] = np.log1p(out[:, j])
         return out
 
+    # The LOG1P_COLS criterion, re-derived from the data rather than trusted. This
+    # is a warning and not a failure — a shifted skew on regenerated data is not
+    # grounds for refusing to train — but it means the next omission announces
+    # itself instead of quietly weakening the baseline, which is how degree_ratio
+    # (skew 9.39) stayed out of the list.
+    train_skew = frames["train"][FEATURE_COLS].skew()
+    implied = {c for c in FEATURE_COLS
+               if frames["train"][c].min() >= 0 and train_skew[c] >= 1.5}
+    if implied != set(LOG1P_COLS):
+        missing = sorted(implied - set(LOG1P_COLS))
+        extra = sorted(set(LOG1P_COLS) - implied)
+        print(f"  {sym('warn')} LOG1P_COLS no longer matches its stated "
+              f"criterion (non-negative, train skew >= 1.5): "
+              f"missing {missing or 'none'}, unjustified {extra or 'none'}. "
+              "The logistic-regression baseline is the thing the headline lift "
+              "is measured against, so a hand-curated list that drifts from its "
+              "rule flatters the model.")
+
     Z = {s: design(frames[s]) for s in SPLITS}
     mean = Z["train"].mean(axis=0)
     std = Z["train"].std(axis=0)
@@ -1160,12 +1615,14 @@ def logistic_regression_baseline(
         "test_auc": round(float(roc_auc(y["test"], p_test)), 4),
         "test_average_precision": round(
             float(average_precision(y["test"], p_test)), 4),
-        "test_precision": round(float(report.precision), 4),
-        "test_recall": round(float(report.recall), 4),
-        "test_f1": round(float(report.f1), 4),
+        "test_precision": _round_or_none(report.precision, 4),
+        "test_recall": _round_or_none(report.recall, 4),
+        "test_f1": _round_or_none(report.f1, 4),
         "test_total_cost": float(report.total_cost),
         "test_alerts_per_1000": round(float(report.alerts_per_1000), 1),
-        "preprocessing": "log1p on heavy-tailed columns, then train-fit z-score",
+        "preprocessing": ("log1p on non-negative columns with train skew "
+                          ">= 1.5, then train-fit z-score"),
+        "log1p_columns": sorted(LOG1P_COLS),
         "coefficients_standardised": {k: round(v, 4)
                                       for k, v in coefficients.items()},
     }
@@ -1203,29 +1660,63 @@ def graph_ablation_baseline(
         "test_auc": round(float(roc_auc(y["test"].to_numpy(), p_test)), 4),
         "test_average_precision": round(
             float(average_precision(y["test"].to_numpy(), p_test)), 4),
-        "test_precision": round(float(report.precision), 4),
-        "test_recall": round(float(report.recall), 4),
-        "test_f1": round(float(report.f1), 4),
+        "test_precision": _round_or_none(report.precision, 4),
+        "test_recall": _round_or_none(report.recall, 4),
+        "test_f1": _round_or_none(report.f1, 4),
         "test_total_cost": float(report.total_cost),
         "test_alerts_per_1000": round(float(report.alerts_per_1000), 1),
     }
 
 
 def trivial_baselines(y_test: np.ndarray, evaluator: CostEvaluator) -> dict:
-    """Flag nobody / flag everybody — the floor any result must clear."""
+    """
+    Flag nobody / flag everybody — the floor any result must clear.
+
+    The metrics are taken from `cost_matrix._prf` rather than written out here,
+    because these two policies are exactly where the degenerate cases live and
+    hand-arithmetic got them wrong: flag-nothing published precision 0.0 and F1
+    0.0 for an alert queue it never opened, and flag-everything hard-coded recall
+    1.0, which is a false claim on a split with no positives. Routing both through
+    the one helper means the null-versus-zero rule is decided in one place.
+
+    `flag_nothing` is the case that made the convention matter. It is published as
+    the comparison floor, and tests/test_baselines.py prices the model against it
+    — so a fabricated 0.0 precision on the baseline flattered the model in the one
+    table that exists to keep it honest.
+    """
+    from models.cost_matrix import _prf
+
     n_pos = int(np.asarray(y_test).sum())
     n_neg = int(np.asarray(y_test).size - n_pos)
+    if n_pos + n_neg == 0:
+        raise ValueError(
+            "cannot price trivial baselines on an empty test split: every "
+            "figure here would be a zero standing in for a missing measurement."
+        )
     flag_none = n_pos * evaluator.config.fn_cost
     flag_all = n_neg * evaluator.config.fp_cost
+
+    # tp, fp, fn for each policy. Flag nothing catches nothing (fn = every
+    # positive); flag everything catches everything and takes every negative as
+    # a false positive.
+    none_p, none_r, none_f1 = _prf(0, 0, n_pos)
+    all_p, all_r, all_f1 = _prf(n_pos, n_neg, 0)
+
     return {
         "flag_nothing": {
-            "test_precision": 0.0, "test_recall": 0.0, "test_f1": 0.0,
+            # precision and F1 are null: no alerts were raised, so there is no
+            # queue whose purity could be measured. Recall is 0.0 and belongs
+            # here — the split has positives and all of them were missed, which
+            # is a measurement, not a gap.
+            "test_precision": _round_or_none(none_p, 4),
+            "test_recall": _round_or_none(none_r, 4),
+            "test_f1": _round_or_none(none_f1, 4),
             "test_total_cost": float(flag_none), "test_alerts_per_1000": 0.0,
         },
         "flag_everything": {
-            "test_precision": round(n_pos / (n_pos + n_neg), 4),
-            "test_recall": 1.0,
-            "test_f1": round(2 * n_pos / (2 * n_pos + n_neg), 4),
+            "test_precision": _round_or_none(all_p, 4),
+            "test_recall": _round_or_none(all_r, 4),
+            "test_f1": _round_or_none(all_f1, 4),
             "test_total_cost": float(flag_all),
             "test_alerts_per_1000": 1000.0,
         },
@@ -1261,8 +1752,11 @@ def compute_baselines(
     def line(name: str, block: dict) -> str:
         if "test_f1" not in block:
             return f"  {name:<34s} {'(skipped)':>10s}"
-        return (f"  {name:<34s} {block['test_precision']:>9.4f}"
-                f"{block['test_recall']:>8.4f}{block['test_f1']:>8.4f}"
+        # Right-aligned strings, not floats: flag-nothing's precision and F1 are
+        # null, and "n/a" is what the comparison table should show there. Column
+        # widths match the header below.
+        return (f"  {name:<34s} {_fmt(block['test_precision']):>9s}"
+                f"{_fmt(block['test_recall']):>8s}{_fmt(block['test_f1']):>8s}"
                 f"{block['test_alerts_per_1000']:>9.1f}"
                 f"  {sym('rupee')}{block['test_total_cost']:>13,.0f}")
 
@@ -1277,14 +1771,21 @@ def compute_baselines(
     print(line("XGBoost, no graph features", ablation))
     print(line("XGBoost, full model  <-- THIS MODEL", model_report))
 
+    screen = rule_cost["leakage_screen"]
     strongest = rule_cost["strongest_single_feature_test_auc"]
     print()
-    print(f"  Strongest single feature on test: {strongest['feature']} "
-          f"AUC {strongest['auc']:.4f}"
-          + (f" (inverted; raw {strongest['raw_auc']:.4f})"
-             if strongest["inverted"] else "")
-          + f" — leakage ceiling {strongest['ceiling']}")
-    if strongest["auc"] >= LEAKAGE_AUC_CEILING:
+    # The gate reads the screening split (validation). The test figure is printed
+    # beside it as a description, clearly labelled, so nobody mistakes the
+    # published number for the one that decides anything.
+    print(f"  Leakage gate ({screen['split']} split): strongest single feature "
+          f"is {screen['feature']} AUC {screen['auc']:.4f}"
+          + (f" (inverted; raw {screen['raw_auc']:.4f})"
+             if screen["inverted"] else "")
+          + f" — ceiling {screen['ceiling']}")
+    print(f"  [descriptive] on test it is {strongest['feature']} "
+          f"AUC {strongest['auc']:.4f} — reported for "
+          "tests/test_baselines.py to reconcile, not acted on.")
+    if screen["auc"] >= LEAKAGE_AUC_CEILING:
         print(f"  {sym('fail')} that feature alone essentially solves the task "
               "— the generator is planting the label. Fix data/generator.py; "
               "every metric above is meaningless until you do.")
@@ -1316,6 +1817,30 @@ def importance_report(model, X_test: pd.DataFrame) -> tuple[dict, dict]:
     to the margin behind the score, the API would be explaining a different model
     than the one it served — silently, and forever. Verifying it here means every
     saved model has been checked once, on real data, before it can be served.
+
+    THE CHECK IS DONE IN MARGIN SPACE, NOT PROBABILITY SPACE
+    ────────────────────────────────────────────────────────
+    TreeSHAP's additivity guarantee is `contribs.sum(1) + bias == raw margin`.
+    That is the identity, and margin is the only space it is stated in. This
+    function used to verify it by pushing the reconstructed margin through a
+    sigmoid and comparing probabilities to a 1e-5 tolerance — testing a corollary
+    instead of the theorem, and testing it through a function that destroys
+    exactly the information the test is for.
+
+    Sigmoid compresses: dp = p(1 - p)·dm. So a probability tolerance of 1e-5
+    permits a margin error of 1e-5 / p(1 - p), which is 0.01 log-odds at p = 0.001
+    and 0.1 log-odds at p = 0.0001. On this dataset that is the common case, not
+    the corner: ~96% of accounts are legitimate and score near zero, so the old
+    check was at its loosest precisely where most of the data lives, and a
+    0.1-log-odds attribution error is more than enough to reorder the top-3
+    `contributing_factors` an analyst is shown. Meanwhile at p ≈ 0.5 the same
+    tolerance demanded 4e-5 — the check was up to 2,500x stricter on the rows it
+    mattered least for. Comparing margins directly makes the tolerance mean one
+    thing everywhere.
+
+    The probability-space agreement is still printed, because it is what a reader
+    intuits and what the API serves, but it is a CONSEQUENCE now, not the gate:
+    |dp| <= |dm| / 4 for any margin, so passing here bounds it automatically.
     """
     print(banner("Feature Importance"))
 
@@ -1325,23 +1850,35 @@ def importance_report(model, X_test: pd.DataFrame) -> tuple[dict, dict]:
     contribs, bias = shap_contributions(model, X_test)
     shap = mean_abs_shap(contribs, list(X_test.columns))
 
-    margin = contribs.sum(axis=1) + bias
-    from_shap = 1.0 / (1.0 + np.exp(-margin))
-    direct = score(model, X_test)
-    drift = float(np.abs(from_shap - direct).max())
-    if drift > 1e-5:
+    # The identity as TreeSHAP states it, checked as TreeSHAP states it.
+    margin_from_shap = contribs.sum(axis=1) + bias
+    margin_direct = margin(model, X_test)
+    drift = float(np.abs(margin_from_shap - margin_direct).max())
+
+    # 1e-4 log-odds. XGBoost accumulates tree outputs in float32 and the two
+    # paths sum in different orders, so exact equality is not available; 1e-4 is
+    # ~three orders of magnitude above that noise floor and ~three below the
+    # 0.1 the previous check tolerated at the saturated end.
+    MARGIN_TOLERANCE = 1e-4
+    if drift > MARGIN_TOLERANCE:
         raise RuntimeError(
-            "TreeSHAP attributions do not reconstruct the model's own scores "
-            f"(max deviation {drift:.2e}).\n"
-            "  Something is inconsistent between predict_proba and "
-            "pred_contribs — most likely the early-stopping iteration range in "
-            "models/explain.py.\n"
+            "TreeSHAP attributions do not reconstruct the model's own margins "
+            f"(max deviation {drift:.2e} log-odds, tolerance "
+            f"{MARGIN_TOLERANCE:.0e}).\n"
+            "  Something is inconsistent between predict(output_margin=True) "
+            "and pred_contribs — most likely the early-stopping iteration range "
+            "in models/explain.py.\n"
             "  api/main.py's explanations would be describing a different "
             "model than the one it scores with, so this run is refusing to "
             "save."
         )
-    print(f"  {sym('ok')} SHAP contributions reconstruct every test score "
-          f"(max deviation {drift:.1e}) — the API's explanations are exact")
+    # Reported, not enforced: the same disagreement measured where a reader will
+    # picture it. Bounded by drift/4, so it cannot fail on its own.
+    prob_drift = float(np.abs(1.0 / (1.0 + np.exp(-margin_from_shap))
+                              - score(model, X_test)).max())
+    print(f"  {sym('ok')} SHAP contributions reconstruct every test margin "
+          f"(max deviation {drift:.1e} log-odds; {prob_drift:.1e} in "
+          f"probability) — the API's explanations are exact")
 
     print(f"  {'feature':<26s}{'mean|SHAP|':>11s}  {'gain':>7s}")
     for feature, value in sorted(shap.items(), key=lambda kv: -kv[1]):
@@ -1431,6 +1968,37 @@ def build_metrics_payload(
     }
 
 
+def _json_safe(value):
+    """
+    Map every non-finite float to `null` on the way into metrics.json.
+
+    NaN, inf and -inf are not JSON. `json.dump` writes them as the bare tokens
+    `NaN` / `Infinity`, so the published file is not valid JSON: a strict parser
+    rejects it outright, and a lenient one hands the caller back a float that
+    poisons any arithmetic it enters.
+
+    Everything non-finite that legitimately reaches here means NOT COMPUTABLE —
+    `roc_auc` on a single-class archetype slice, and the precision/recall/F1 NaNs
+    that `cost_matrix.sweep` uses because a float column cannot hold None (see
+    `cost_matrix._prf`). `null` states that in JSON, and unlike 0.0 it cannot be
+    averaged, plotted or quoted as a result by accident. Anything non-finite for
+    a different reason is a bug that should have raised further upstream;
+    publishing it as null at least stops it being published as a number.
+
+    Note this is the LAST line of defence, not the mechanism: the metrics dict is
+    built from `ThresholdReport.as_dict()`, which already emits None directly.
+    """
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    # np.floating and Python float both: np.float64 subclasses float but
+    # np.float32 does not, and pandas hands us both.
+    if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+        return None
+    return value
+
+
 def save_artifacts(model, metrics: dict) -> None:
     """Write the model binary and metrics.json."""
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -1441,7 +2009,7 @@ def save_artifacts(model, metrics: dict) -> None:
 
     metrics_path = MODEL_DIR / "metrics.json"
     with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2, default=float)
+        json.dump(_json_safe(metrics), f, indent=2, default=float)
     print(f"  Metrics saved {sym('arrow')} {metrics_path}")
 
 
@@ -1543,13 +2111,21 @@ def main() -> None:
         baselines = compute_baselines(frames, evaluator, model_report)
 
     sensitivity = evaluator.sensitivity_to_cost_ratio(
-        frames["test"][TARGET_COL].to_numpy(), test_results["_scores"]
+        frames["val"][TARGET_COL].to_numpy(), thresholds["_scores"],
+        frames["test"][TARGET_COL].to_numpy(), test_results["_scores"],
     )
-    print(banner("Sensitivity to the FN:FP Cost Assumption (test)"))
+    print(banner("Sensitivity to the FN:FP Cost Assumption"))
     print(sensitivity.to_string(index=False,
                                 float_format=lambda v: f"{v:,.4f}"))
     print("  (The ratio is the one number in the cost model nobody can verify, "
-          "so the operating point is reported across a range of it.)")
+          "so the operating point is reported across a range of it.")
+    print("   Each row's threshold is picked on VALIDATION and then evaluated "
+          "on TEST at that frozen value — the same")
+    print("   discipline as the headline number. Selecting these per-ratio "
+          "thresholds on test instead would understate")
+    print("   cost at the shipped 13.33 ratio by the full "
+          "not-peeking gap, which is exactly the trap this table exists to "
+          "disprove.)")
 
     gain, shap = importance_report(model, frames["test"][FEATURE_COLS])
 
@@ -1579,13 +2155,14 @@ def main() -> None:
           f"{metrics['roc_auc_ci_95'][1]:.4f}), "
           f"average precision {metrics['average_precision']:.4f}")
     print(f"  At the validation-selected threshold "
-          f"{metrics['optimal_threshold']:.4f}: P {at_threshold['precision']:.4f} "
-          f"R {at_threshold['recall']:.4f} F1 {at_threshold['f1']:.4f}, "
+          f"{metrics['optimal_threshold']:.4f}: "
+          f"P {_fmt(at_threshold['precision'])} "
+          f"R {_fmt(at_threshold['recall'])} F1 {_fmt(at_threshold['f1'])}, "
           f"{at_threshold['alerts_per_1000_accounts']:.1f} alerts/1,000")
     if baselines:
         rule = baselines["best_single_feature_rule_by_cost"]
         print(f"  Best single-feature rule was `{rule['rule']}` at F1 "
-              f"{rule['test_f1']:.4f} — quote this model as lift over that, "
+              f"{_fmt(rule['test_f1'])} — quote this model as lift over that, "
               "not in isolation.")
 
 

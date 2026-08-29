@@ -270,3 +270,126 @@ class TestModelEarnsItsComplexity:
             f"without graph features (₹{ablation['test_total_cost']:,.0f}). The "
             f"graph pipeline is a net negative on test."
         )
+
+
+# ══════════════════════════════════════════════════════════════════
+# 4. The sensitivity table is not secretly an oracle
+# ══════════════════════════════════════════════════════════════════
+
+class TestSensitivityTableDoesNotPeekAtTest:
+    """
+    The regression guard for a defect that shipped once.
+
+    `sensitivity_to_cost_ratio` used to take one split and call
+    find_optimal_threshold() on it, and train.py passed it TEST. Every row
+    therefore chose its threshold with test labels, which made the row at the
+    shipped ratio a silent duplicate of `oracle_threshold_diagnostic` — it
+    published ₹39,39,300 where the honest cost is ₹55,00,000.
+
+    That is the worst class of bug in this repo: not a wrong number, but a
+    dishonest one, sitting inside the artefact whose whole job is to prove the
+    operating point was not cherry-picked. The README's fourth honesty claim is
+    literally "the threshold is never selected on test", so nothing here may
+    contradict it.
+    """
+
+    @staticmethod
+    def _row_nearest_shipped_ratio(metrics) -> dict:
+        table = metrics.get("cost_ratio_sensitivity") or []
+        if not table:
+            pytest.skip("metrics.json has no cost_ratio_sensitivity block")
+        shipped = float(metrics["cost_config"]["fn_fp_ratio"])
+        row = min(table, key=lambda r: abs(float(r["fn_fp_ratio"]) - shipped))
+        # Fail with the diagnosis rather than a bare KeyError three tests deep.
+        assert "val_threshold" in row and "test_total_cost" in row, (
+            f"sensitivity rows use the legacy schema {sorted(row)}. That schema "
+            f"is the defect: its 'threshold'/'total_cost' columns were produced "
+            f"by optimising on TEST. Re-run `python -m models.train` to "
+            f"regenerate metrics.json with split-tagged columns."
+        )
+        return row
+
+    def test_every_row_records_which_split_chose_its_threshold(self, metrics):
+        """
+        Provenance is structural, not documentary. A bare `threshold` column is
+        the old, ambiguous schema — the one that let a test-selected number pass
+        as a reported result. Names must say which split produced them.
+        """
+        _require_current_metrics(metrics)
+        table = metrics.get("cost_ratio_sensitivity") or []
+        if not table:
+            pytest.skip("metrics.json has no cost_ratio_sensitivity block")
+
+        for row in table:
+            assert "val_threshold" in row, (
+                f"sensitivity row for ratio {row.get('fn_fp_ratio')} has no "
+                f"'val_threshold'. Keys present: {sorted(row)}. A threshold "
+                f"column without a split in its name is how the test-peeking "
+                f"bug hid — every figure here must carry its provenance."
+            )
+            assert "threshold" not in row, (
+                "sensitivity rows still carry the ambiguous 'threshold' key; "
+                "use 'val_threshold' so the selection split is unmistakable."
+            )
+
+    def test_shipped_ratio_reuses_the_validation_threshold(self, metrics):
+        """
+        At the ratio the project actually ships, the sensitivity table must land
+        on the very threshold the headline uses — because both are selected the
+        same way, on validation. Under the bug this was 0.2665 against a
+        validation threshold of 0.5908.
+        """
+        _require_current_metrics(metrics)
+        row = self._row_nearest_shipped_ratio(metrics)
+        val_threshold = float(metrics["validation"]["cost_optimal"]["threshold"])
+        got = float(row["val_threshold"])
+        # Tolerance covers the 13.33-vs-13.3333 rounding in the ratio grid,
+        # which can nudge the plateau; it is far tighter than the 0.32 gap the
+        # oracle bug produced.
+        assert abs(got - val_threshold) < 0.05, (
+            f"the sensitivity row at ratio {row['fn_fp_ratio']} reports "
+            f"threshold {got:.4f}, but the validation-selected threshold is "
+            f"{val_threshold:.4f}. A gap this size means the row optimised on "
+            f"a different split — almost certainly test."
+        )
+
+    def test_no_row_undercuts_the_honest_headline_cost(self, metrics):
+        """
+        The fingerprint of test-peeking is a cost that beats the honest one. A
+        threshold frozen from validation cannot outperform, on test, a threshold
+        that was chosen using test labels — so if the table's shipped-ratio cost
+        comes in below the published total, it was not frozen.
+        """
+        _require_current_metrics(metrics)
+        row = self._row_nearest_shipped_ratio(metrics)
+        headline = float(metrics["total_cost"])
+        reported = float(row["test_total_cost"])
+        # 2% slack for the ratio-grid rounding (fn_cost 199,950 vs 200,000);
+        # the shipped defect understated cost by 28%.
+        assert reported >= headline * 0.98, (
+            f"sensitivity at ratio {row['fn_fp_ratio']} reports test cost "
+            f"₹{reported:,.0f}, undercutting the published headline "
+            f"₹{headline:,.0f} by {100 * (1 - reported / headline):.1f}%. A "
+            f"validation-frozen threshold cannot beat the headline on test; "
+            f"this row was optimised on test labels."
+        )
+
+    def test_shipped_row_is_not_the_oracle_row(self, metrics):
+        """
+        The bug stated directly: the sensitivity row had become a copy of the
+        explicitly-labelled test-peeking diagnostic, minus its warning label.
+        """
+        _require_current_metrics(metrics)
+        oracle = (metrics.get("test", {}) or {}).get("oracle_threshold_diagnostic")
+        if not oracle:
+            pytest.skip("metrics.json has no oracle_threshold_diagnostic block")
+
+        row = self._row_nearest_shipped_ratio(metrics)
+        assert abs(float(row["val_threshold"])
+                   - float(oracle["threshold"])) > 1e-6, (
+            f"the sensitivity row at ratio {row['fn_fp_ratio']} uses threshold "
+            f"{row['val_threshold']}, which is exactly "
+            f"oracle_threshold_diagnostic's test-selected threshold. That block "
+            f"carries the warning {oracle.get('warning','')!r} — the sensitivity "
+            f"table inherited its numbers without inheriting its caveat."
+        )

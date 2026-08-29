@@ -184,7 +184,17 @@ def build_graph(edges_df: pd.DataFrame) -> nx.DiGraph:
     )
 
     G = nx.DiGraph()
-    G.add_nodes_from(set(work["sender"]) | set(work["receiver"]))
+    # sorted(), not set(): `partition_fingerprint` and `extend_partition` both
+    # rest on the claim that "build_graph produces node insertion order
+    # deterministically", and iterating a set of str does not. CPython randomises
+    # str hashing per process unless PYTHONHASHSEED is pinned, so two replicas of
+    # the service — different processes — enumerated the same accounts in
+    # different orders, Louvain consumed its seeded RNG stream differently, and
+    # the frozen reference partition differed between them. Verified: three
+    # interpreters, three different orderings of the same 3,000 ids. The existing
+    # determinism test compares two runs inside ONE process, so it could never
+    # see this. Sorting costs one O(n log n) pass on ~3k ids.
+    G.add_nodes_from(sorted(set(work["sender"]) | set(work["receiver"])))
     G.add_edges_from(
         (
             row.sender,
@@ -221,6 +231,59 @@ def compute_pagerank(G: nx.DiGraph) -> dict[str, float]:
         return nx.pagerank(G, alpha=0.85, max_iter=200)
     except nx.PowerIterationFailedConvergence:
         return nx.pagerank(G, alpha=0.85, max_iter=1000, tol=1e-4)
+
+
+def undirected_projection(G: nx.DiGraph) -> nx.Graph:
+    """
+    Collapse the directed graph to an undirected one, SUMMING reciprocal edges.
+
+    THE DEFECT THIS REPLACES
+    ────────────────────────
+    `G.to_undirected()` was used here, and networkx resolves a reciprocal pair by
+    copying one direction's attribute dict over the other's — last edge iterated
+    wins. So for every pair that transacts both ways, the undirected `weight`
+    became ONE direction's transaction count instead of the pair's total, and the
+    other direction's traffic vanished.
+
+    Measured on the shipped data: 5.9% of undirected pairs are reciprocal, and
+    they lose 55.9% (train) / 55.7% (test) of their own transaction weight —
+    6.28% and 6.40% of ALL transaction weight in the graph. 24.3% of those pairs
+    on train touch a ring account, because reciprocal traffic is precisely the
+    camouflage a layering ring wears.
+
+    That matters to two consumers that read `weight` off this graph:
+      * `compute_louvain_communities` — python-louvain optimises WEIGHTED
+        modularity, so half the evidence for keeping a mutual pair together was
+        being discarded;
+      * `extend_partition` — assigns an unseen account to its heaviest known
+        neighbour, so the tie-break was decided on half a relationship.
+    (`nx.clustering` and `compute_community_internal_ratio` count edges rather
+    than weights and are unaffected either way.)
+
+    `total_amount` is summed for the same reason. The per-transaction `amounts`
+    and `timestamps_ns` lists are deliberately NOT carried across: no consumer
+    reads them off the undirected graph, and concatenating them here would
+    double the peak memory of the largest attributes in the graph for nothing.
+
+    ⚠ TRAIN/SERVE SKEW, NOT YET CLOSED: `api/main.py` builds its own reference
+    projection with `build_graph(ctx).to_undirected()`, and `tests/conftest.py`
+    does the same for its Louvain fixture. Until both call this function, the
+    frozen serving partition is computed on last-wins weights while training
+    uses summed ones — which is exactly the class of skew `test_contract.py`'s
+    TRAIN/SERVE check exists to catch.
+    """
+    UG = nx.Graph()
+    UG.add_nodes_from(G.nodes())
+    for u, v, data in G.edges(data=True):
+        weight = int(data.get("weight", 1))
+        amount = float(data.get("total_amount", 0.0))
+        if UG.has_edge(u, v):
+            edge = UG[u][v]
+            edge["weight"] += weight
+            edge["total_amount"] += amount
+        else:
+            UG.add_edge(u, v, weight=weight, total_amount=amount)
+    return UG
 
 
 def compute_louvain_communities(UG: nx.Graph) -> dict[str, int]:
@@ -429,8 +492,17 @@ def _bounded_forward_distances(
     succ: dict[str, set[str]],
     start: str,
     depth: int,
+    skip_edge: tuple[str, str] | None = None,
 ) -> dict[str, int]:
-    """BFS hop-distance from `start` to every node within `depth` hops."""
+    """
+    BFS hop-distance from `start` to every node within `depth` hops.
+
+    `skip_edge`
+        One directed edge (u, v) to pretend is absent for this traversal only.
+        Needed because BFS reports the SHORTEST distance, and a shortest path of
+        length 1 hides every longer path to the same node — see
+        `compute_cycle_participation` for why that mattered.
+    """
     dist = {start: 0}
     queue = deque(((start, 0),))
     while queue:
@@ -438,6 +510,8 @@ def _bounded_forward_distances(
         if d == depth:
             continue
         for nxt in succ.get(node, ()):
+            if skip_edge is not None and node == skip_edge[0] and nxt == skip_edge[1]:
+                continue
             if nxt not in dist:
                 dist[nxt] = d + 1
                 queue.append((nxt, d + 1))
@@ -480,6 +554,42 @@ def compute_cycle_participation(
     those, and counting them here would make every reciprocal social payment
     look like laundering.
 
+    THE MUTUAL-PAIR DEFECT THIS FUNCTION USED TO HAVE
+    ────────────────────────────────────────────────
+    "Exclude length-2 cycles" was implemented as a length test on the ONE
+    distance BFS returns, and BFS returns the SHORTEST distance. So for a mutual
+    pair n ⇄ m, `reach[m][n]` was always 1 — the direct edge m → n — giving a
+    candidate cycle length of 2, which failed `MIN_CYCLE_LEN <= 2` and dropped m
+    from the numerator. The shortest path masked every longer one: if n and m
+    ALSO sat together on a genuine 3-to-8-hop ring, that cycle was invisible.
+
+    The rule being enforced was meant to be "the length-2 cycle does not count".
+    What was enforced was "a mutual counterparty never counts" — which discards
+    exactly the accounts a layering ring dresses in reciprocal traffic to look
+    social. Measured on the shipped data, correcting it raises the score for
+    443 / 3,090 training nodes (14.3%) and 241 / 2,907 test nodes (8.3%), and
+    recovers 666 / 360 neighbour slots respectively; mean cycle_participation
+    among ring accounts goes 0.3125 → 0.3382 on train and 0.2988 → 0.3139 on
+    test. Direction-corrected single-feature AUC moves by under 0.005, so this
+    is a definition correction rather than a scoreboard change — which is the
+    point: the old number did not measure what the docstring claimed.
+
+    The correction is to re-run the BFS for mutual pairs only, with the single
+    reciprocal edge masked out (`skip_edge`). Masking exactly one edge is what
+    keeps the answer honest:
+
+      * the returned distance d' is then >= 2 by construction, so
+        `MIN_CYCLE_LEN` keeps its meaning and pure 2-cycles are still excluded;
+      * a BFS shortest path never revisits its own start, so n → m ⇝ n is a
+        genuine SIMPLE cycle, not a closed walk that merely passes twice
+        through the pair. (This is why the cheaper trick — asking whether some
+        successor of m can reach n — is wrong: that path may route back through
+        m, and n → m → x ⇝ m → n contains a cycle through m alone.)
+
+    Cost is one extra BFS per mutual pair inside the core, not per node: 3,124
+    extra traversals over 885 mutual pairs on train, 2,907 over 782 on test,
+    which is roughly a doubling of this function's work and still under 5s.
+
     MEASURED on the training split: 2.5s for 3,090 nodes / 20,741 pairs, of
     which the cycle core reduces 16,158 repeated edges to 4,970. Serving cost
     matters because api/main.py rebuilds this graph per scoring batch, so if the
@@ -505,6 +615,10 @@ def compute_cycle_participation(
         for n in core_nodes
     }
 
+    def closes(d: int | None) -> bool:
+        """Does a return path of `d` hops make a cycle of allowed length?"""
+        return d is not None and MIN_CYCLE_LEN <= d + 1 <= max_len
+
     out: dict[str, float] = {}
     for node in G.nodes():
         neighbours = nbrs.get(node)
@@ -513,17 +627,41 @@ def compute_cycle_participation(
             continue
 
         on_cycle: set[str] = set()
+
         # Edge node → m closes a cycle if m can reach node within max_len - 1.
         for m in succ.get(node, ()):
             d = reach.get(m, {}).get(node)
-            if d is not None and MIN_CYCLE_LEN <= d + 1 <= max_len:
+            if closes(d):
                 on_cycle.add(m)
+            elif d == 1:
+                # d == 1 means the edge m → node exists: a mutual pair, whose
+                # length-2 cycle is correctly rejected above. But BFS reported
+                # only that shortest hop, so any LONGER return path m ⇝ node was
+                # never seen. Ask again with the reciprocal edge masked; the
+                # answer is then the shortest path of length >= 2, which is the
+                # shortest cycle through this pair that is not the mutual pair.
+                d2 = _bounded_forward_distances(
+                    succ, m, max_len - 1, skip_edge=(m, node)).get(node)
+                if closes(d2):
+                    on_cycle.add(m)
+
         # Edge m → node closes a cycle if node can reach m within max_len - 1.
         node_reach = reach.get(node, {})
         for m in pred.get(node, ()):
+            if m in on_cycle:
+                continue
             d = node_reach.get(m)
-            if d is not None and MIN_CYCLE_LEN <= d + 1 <= max_len:
+            if closes(d):
                 on_cycle.add(m)
+            elif d == 1:
+                # Mirror of the case above, for the other direction round the
+                # pair. Both are checked because they are different cycles: one
+                # uses the edge node → m, the other the edge m → node, and
+                # either one qualifies m as sharing a cycle with node.
+                d2 = _bounded_forward_distances(
+                    succ, node, max_len - 1, skip_edge=(node, m)).get(m)
+                if closes(d2):
+                    on_cycle.add(m)
 
         out[node] = len(on_cycle & neighbours) / len(neighbours)
 
@@ -535,6 +673,49 @@ def compute_cycle_participation(
 # ══════════════════════════════════════════════════════════════════
 
 _NS_PER_HOUR = 3_600_000_000_000
+
+# ══════════════════════════════════════════════════════════════════
+# THE UNDEFINED CASE, AND WHY IT IS NOT 0.0
+# ══════════════════════════════════════════════════════════════════
+# Three features below are genuinely undefined for some accounts: HHI needs at
+# least one inbound counterparty, a coefficient of variation needs at least two
+# observations. All three used to return 0.0 there — and for all three, 0.0 is
+# ALSO the most fraud-like value the feature can take (low HHI = a wide fan-in
+# collector; low CV = a ring paying every hop the same sum). "No data" and
+# "maximally suspicious" were the same number, so the model could not tell them
+# apart and the undefined accounts were pooled with the strongest fraud signal
+# the column carries.
+#
+# WHAT WOULD BE CLEANEST, AND WHY IT IS UNAVAILABLE
+# ────────────────────────────────────────────────
+# NaN. XGBoost learns a missing-branch natively and it is unambiguous. It is
+# blocked twice over by code this module must not fight:
+#   * models/train.py raises on any non-finite feature value ("the threshold
+#     sweep cannot be trusted over non-finite scores"), naming this file in the
+#     error;
+#   * tests/test_features.py asserts every FEATURE_COLS value is finite and
+#     non-NaN on all three splits.
+# An out-of-range sentinel (-1.0, or 2.0 for the HHI) is blocked by the same
+# test file: `fan_in_concentration` is asserted inside [0, 1] and the two CVs are
+# asserted non-negative. Adding a companion `is_defined` column is blocked by
+# `compute_node_features`, which refuses any column not declared in
+# models/features.py — a file this pass does not own.
+#
+# WHAT IS DONE INSTEAD
+# ────────────────────
+# Each undefined case returns the least fraud-like value in the feature's legal
+# range, so the collision moves off the signal instead of sitting on top of it.
+# The remaining ambiguity is with genuine values at that end, and it is
+# resolvable: `in_degree` distinguishes "no inbound counterparties" from "one",
+# and `repeat_ratio` distinguishes "one transaction" from "many".
+#
+# This is rare on the shipped data — 23/3,090 train, 32/2,954 val, 33/2,907 test
+# accounts for the HHI, and 1-3 and 4-9 accounts respectively for the two CVs —
+# which is why it is a correctness fix rather than a scoreboard one. Rare also
+# means a tree can never isolate these accounts into their own leaf, so the only
+# thing that matters is WHICH neighbourhood they get pooled into.
+UNDEFINED_HHI = 1.0     # no inbound value at all → not a fan-in hub
+UNDEFINED_CV = 1.0      # CV of an exponential: the no-structure reference point
 
 
 def compute_fan_in_concentration(in_amounts: list[float]) -> float:
@@ -551,10 +732,18 @@ def compute_fan_in_concentration(in_amounts: list[float]) -> float:
     extremes are informative and the model may use either; what matters is that
     the documentation matches the arithmetic. Wide fan-in shows up as high
     `in_degree` combined with low HHI.
+
+    UNDEFINED (no inbound edges, or inbound value summing to zero) returns
+    `UNDEFINED_HHI` = 1.0, not 0.0. With k inbound counterparties HHI is bounded
+    below by 1/k, so 0.0 was unreachable-when-defined — it read as "the widest
+    fan-in in the graph", which is the exact opposite of the truth for an account
+    with no inbound traffic whatsoever. 1.0 says "inbound value is not spread
+    across anyone", which is the honest reading of an empty fan-in and sits at
+    the benign end. See the block above for why not NaN.
     """
     total = float(sum(in_amounts))
     if not in_amounts or total <= 0:
-        return 0.0
+        return UNDEFINED_HHI
     shares = np.asarray(in_amounts, dtype=float) / total
     return float(np.sum(shares ** 2))
 
@@ -598,13 +787,22 @@ def compute_amount_cv(amounts: list[float]) -> float:
     Rings repeat near-identical values as they layer funds, so a low CV across
     many transactions is the signal. Computing this over per-edge totals — the
     v1 behaviour — destroyed exactly that signal.
+
+    UNDEFINED (fewer than two transactions, or a zero mean) returns
+    `UNDEFINED_CV` = 1.0, not 0.0. On the shipped test split the DEFINED
+    distribution runs p05 0.449 / median 1.749 / p95 2.904, with ring accounts at
+    median 1.333 against 1.803 for the rest — so 0.0 sat below the entire defined
+    range, at the far end of the direction that means "ring". One transaction is
+    no evidence of uniformity at all; 1.0 is the CV of an exponential, the
+    maximum-entropy spread for a positive quantity, and lands inside the bulk of
+    the defined distribution where "no evidence either way" belongs.
     """
     if len(amounts) < 2:
-        return 0.0
+        return UNDEFINED_CV
     arr = np.asarray(amounts, dtype=float)
     mean = arr.mean()
     if mean == 0:
-        return 0.0
+        return UNDEFINED_CV
     return float(arr.std() / mean)
 
 
@@ -620,13 +818,19 @@ def compute_counterparty_amount_cv(per_counterparty_means: list[float]) -> float
     That distinction is the reason this feature exists: `amount_cv` alone cannot
     separate "consistent within each relationship" from "consistent across all
     relationships", and the second is the laundering signature.
+
+    UNDEFINED (fewer than two counterparties, or a zero mean) returns
+    `UNDEFINED_CV` for the same reason as `compute_amount_cv`: an account with a
+    single relationship gives no evidence that it pays everyone alike, and 0.0
+    asserted exactly that. `repeat_ratio` and the degree columns are what
+    separate a one-counterparty account from a consistent multi-hop one.
     """
     if len(per_counterparty_means) < 2:
-        return 0.0
+        return UNDEFINED_CV
     arr = np.asarray(per_counterparty_means, dtype=float)
     mean = arr.mean()
     if mean == 0:
-        return 0.0
+        return UNDEFINED_CV
     return float(arr.std() / mean)
 
 
@@ -693,7 +897,10 @@ def compute_node_features(
     """
     if verbose:
         print("  Undirected projection...")
-    UG = G.to_undirected()  # computed once; three consumers below
+    # Summing projection, not G.to_undirected(): the latter lets one direction of
+    # a reciprocal pair overwrite the other's weight, losing 6.3% of all
+    # transaction weight. See `undirected_projection`.
+    UG = undirected_projection(G)  # computed once; three consumers below
 
     if verbose:
         print("  PageRank...")

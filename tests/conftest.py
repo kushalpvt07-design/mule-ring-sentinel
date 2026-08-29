@@ -47,7 +47,12 @@ EDGE_PATHS = {s: RAW_DIR / f"{s}_edges.csv" for s in SPLITS}
 FEATURE_PATHS = {s: PROCESSED_DIR / f"{s}_features.csv" for s in SPLITS}
 CONTEXT_PATH = RAW_DIR / "serving_context_edges.csv"
 
-REGENERATE = "python -m data.generator && python -m data.extractor"
+# Two commands run in sequence. Deliberately NOT joined with `&&`: Windows
+# PowerShell 5.1 — still the default shell on Windows — raises a ParserError on
+# `&&`, so a copy-pasted one-liner fails on the platform most likely to be
+# setting up a fresh clone. Presented as two separately quoted commands, which
+# every shell (cmd, PowerShell, POSIX) accepts.
+REGENERATE = "`python -m data.generator` then `python -m data.extractor`"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -70,7 +75,7 @@ def pytest_report_header(config) -> list[str]:
     ]
     if any("MISSING" in line for line in lines):
         lines.append(f"sentinel: tests needing the missing artefacts will SKIP "
-                     f"— regenerate with `{REGENERATE}`")
+                     f"— regenerate with {REGENERATE}")
     return lines
 
 
@@ -80,13 +85,13 @@ def pytest_report_header(config) -> list[str]:
 
 def _read_edges(path: Path) -> pd.DataFrame:
     if not path.exists():
-        pytest.skip(f"{path.relative_to(PROJECT_ROOT)} not found. Run `{REGENERATE}`.")
+        pytest.skip(f"{path.relative_to(PROJECT_ROOT)} not found. Run {REGENERATE}.")
     return pd.read_csv(path, parse_dates=["timestamp"])
 
 
 def _read_features(path: Path) -> pd.DataFrame:
     if not path.exists():
-        pytest.skip(f"{path.relative_to(PROJECT_ROOT)} not found. Run `{REGENERATE}`.")
+        pytest.skip(f"{path.relative_to(PROJECT_ROOT)} not found. Run {REGENERATE}.")
     return pd.read_csv(path)
 
 

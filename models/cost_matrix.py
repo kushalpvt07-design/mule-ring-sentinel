@@ -80,8 +80,17 @@ v2 → v3 CHANGES
    computing them directly (a) removes a heavyweight import from the dashboard's
    hot path, (b) makes the sweep O(n log n) once instead of O(n · steps), and
    (c) means this module and its tests run in any environment with numpy —
-   which is what let it be verified. Values match sklearn's, including its
-   tie-averaged ROC-AUC and `zero_division=0` conventions.
+   which is what let it be verified. Values match sklearn's wherever the metric
+   is defined, including its tie-averaged ROC-AUC.
+
+   ONE DELIBERATE DIVERGENCE: sklearn's `zero_division=0` is not followed. An
+   undefined metric is reported as `None` (JSON `null`), never 0.0 — see `_prf`.
+   0.0 precision is a measurement ("everything flagged was clean"); an empty
+   alert queue has made no measurement, and in a report whose whole purpose is
+   honest cost accounting, "not computable" must not be readable as "worst
+   possible". `roc_auc` and `average_precision` return NaN instead of None,
+   because they are consumed inside float arrays and per-archetype loops where a
+   float-typed sentinel is the only thing that survives — see their docstrings.
 
 4. OPERATIONAL LOAD IS REPORTED, AND SO IS THE CAPACITY-CONSTRAINED POINT.
    `alert_rate` and `alerts_per_1000` are on every report, because an alert
@@ -155,15 +164,22 @@ class ThresholdReport:
     `find_optimal_threshold`, which knows the cost-equivalent range the chosen
     threshold sits inside. A report produced by evaluating a threshold someone
     else handed us has no plateau to describe, so they stay None.
+
+    `precision`, `recall` and `f1` are `float | None` for the same reason: at a
+    threshold that flags nothing, or on a split with no positives, the quantity
+    has an empty denominator and there is no number to report. See `_prf`. The
+    counts (tp/fp/tn/fn) and the costs are always defined, so a degenerate
+    operating point still reports its full confusion matrix and its rupees —
+    which is what a reviewer actually needs to judge it.
     """
     threshold: float
     tp: int
     fp: int
     tn: int
     fn: int
-    precision: float
-    recall: float
-    f1: float
+    precision: float | None
+    recall: float | None
+    f1: float | None
     total_cost: float
     cost_per_prediction: float
     alert_rate: float
@@ -186,19 +202,19 @@ class ThresholdReport:
             "fp": int(self.fp),
             "tn": int(self.tn),
             "fn": int(self.fn),
-            "precision": round(float(self.precision), 4),
-            "recall": round(float(self.recall), 4),
-            "f1": round(float(self.f1), 4),
+            # _round_or_none, not round(float(...)): float(None) raises, and
+            # coercing a not-computable metric to 0.0 to keep the JSON tidy is
+            # exactly the misreporting this avoids.
+            "precision": _round_or_none(self.precision, 4),
+            "recall": _round_or_none(self.recall, 4),
+            "f1": _round_or_none(self.f1, 4),
             "total_cost": round(float(self.total_cost), 2),
             "cost_per_prediction": round(float(self.cost_per_prediction), 2),
             "alert_rate": round(float(self.alert_rate), 4),
             "alerts_per_1000_accounts": round(float(self.alerts_per_1000), 1),
-            "plateau_lo": (None if self.plateau_lo is None
-                           else round(float(self.plateau_lo), 6)),
-            "plateau_hi": (None if self.plateau_hi is None
-                           else round(float(self.plateau_hi), 6)),
-            "plateau_width": (None if self.plateau_width is None
-                              else round(float(self.plateau_width), 6)),
+            "plateau_lo": _round_or_none(self.plateau_lo, 6),
+            "plateau_hi": _round_or_none(self.plateau_hi, 6),
+            "plateau_width": _round_or_none(self.plateau_width, 6),
             "n_cost_equivalent_thresholds": int(self.n_equivalent),
         }
 
@@ -207,13 +223,67 @@ class ThresholdReport:
 # Metric primitives (sklearn-equivalent, numpy only)
 # ══════════════════════════════════════════════════════════════════
 
-def _prf(tp: int, fp: int, fn: int) -> tuple[float, float, float]:
-    """Precision, recall, F1 with sklearn's `zero_division=0` convention."""
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = (2 * precision * recall / (precision + recall)
-          if (precision + recall) > 0 else 0.0)
-    return float(precision), float(recall), float(f1)
+def _prf(
+    tp: int, fp: int, fn: int
+) -> tuple[float | None, float | None, float | None]:
+    """
+    Precision, recall and F1, with `None` where the quantity is NOT COMPUTABLE.
+
+    Deliberately NOT sklearn's `zero_division=0`. That convention reports 0.0 for
+    an empty alert queue, and 0.0 precision is a claim: "of the accounts this
+    model flagged, none were mules". When nothing was flagged there is no such
+    claim to make — the denominator is empty — and in a cost-sensitive report the
+    difference is the difference between "terrible model" and "no evidence".
+    `None` survives into metrics.json as JSON `null`, which no consumer can
+    average, plot or quote by accident; 0.0 silently can be.
+
+    Undefined exactly when:
+      precision   tp + fp == 0   nothing was flagged
+      recall      tp + fn == 0   the split contains no positives at all
+      F1          either of the above
+
+    F1 IS defined and 0.0 when precision and recall are both computable and both
+    zero: the queue was non-empty, the split had positives, and the model caught
+    none of them. That is a measured failure, not a missing measurement, and 0.0
+    is the limit of 2PR/(P+R) as both go to zero.
+    """
+    precision = tp / (tp + fp) if (tp + fp) > 0 else None
+    recall = tp / (tp + fn) if (tp + fn) > 0 else None
+    if precision is None or recall is None:
+        f1: float | None = None
+    elif precision + recall > 0:
+        f1 = 2 * precision * recall / (precision + recall)
+    else:
+        f1 = 0.0
+    return (
+        None if precision is None else float(precision),
+        None if recall is None else float(recall),
+        f1,
+    )
+
+
+def _round_or_none(value: float | None, digits: int) -> float | None:
+    """Round for JSON, passing `None` (not computable) straight through."""
+    return None if value is None else round(float(value), digits)
+
+
+def _fmt(value: float | None, spec: str = ".4f", missing: str = "n/a") -> str:
+    """Format a possibly-not-computable metric for a human-readable line."""
+    return missing if value is None else format(float(value), spec)
+
+
+def _none_if_nan(value: float) -> float | None:
+    """
+    NaN → None at the DataFrame/report boundary.
+
+    `sweep` returns a float-typed frame, so it encodes "not computable" as NaN —
+    the only float that can mean that. Reports and metrics.json use None, because
+    `json.dump` writes NaN as the bare token `NaN`, which is not valid JSON and
+    which a strict parser on the other end rejects (or, worse, a lenient one turns
+    back into a number).
+    """
+    v = float(value)
+    return None if np.isnan(v) else v
 
 
 def roc_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
@@ -224,6 +294,13 @@ def roc_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     when one class is absent, where sklearn raises — NaN is the more useful
     behaviour inside a per-archetype metrics loop, which will hit single-class
     slices.
+
+    NaN and not the `None` that `_prf` returns for its undefined cases: this
+    function's results go into float arrays (the 1,000 bootstrap replicates
+    below, `np.percentile` over them, per-archetype columns of a DataFrame) where
+    a None would upcast the array to object dtype and break every reducer.
+    tests/test_baselines.py pins the NaN. Callers that serialise it must map NaN
+    to None themselves.
 
     Fully vectorised, including the tie-averaging, because models/train.py calls
     this 1,000 times to bootstrap a confidence interval; a per-element Python
@@ -263,7 +340,9 @@ def average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
     which is the only region an analyst ever sees. Its trivial baseline is the
     positive rate itself (≈0.04), so the lift is legible without further context.
 
-    Returns NaN when no positives are present.
+    Returns NaN when no positives are present — including for empty input, where
+    there is likewise nothing to average over. NaN rather than None for the same
+    float-array reason as `roc_auc` above.
     """
     y = np.asarray(y_true).astype(int).ravel()
     s = np.asarray(y_score, dtype=float).ravel()
@@ -344,6 +423,16 @@ class CostEvaluator:
             threshold  tp fp tn fn  precision recall f1
             total_cost fp_cost_total fn_cost_total
             alert_rate n_flagged
+
+        `precision`, `recall` and `f1` are NaN where they are not computable —
+        precision on the "flag nothing" row (empty alert queue), recall and f1
+        on a split with no positives. NaN and not 0.0: the frame is float-typed,
+        so NaN is the only available "no measurement" marker, and a plotted 0.0
+        at the strict end of the curve reads as a cliff in model quality that
+        never happened. Consumers that turn these into JSON must map NaN to None
+        (`_none_if_nan`); pandas reducers skip NaN by default, so
+        `curve["f1"].idxmax()` already ignores the undefined rows rather than
+        ranking them as zero.
         """
         y = np.asarray(y_true).astype(int).ravel()
         s = np.asarray(y_proba, dtype=float).ravel()
@@ -388,10 +477,26 @@ class CostEvaluator:
         n_flagged = tp + fp
 
         with np.errstate(divide="ignore", invalid="ignore"):
-            precision = np.where(n_flagged > 0, tp / np.maximum(n_flagged, 1), 0.0)
-            recall = (tp / n_pos) if n_pos > 0 else np.zeros_like(tp, dtype=float)
+            # NaN, not 0.0, where the denominator is empty. `_prf` explains why
+            # at length; the difference here is only the sentinel, because a
+            # float column cannot hold None.
+            precision = np.where(n_flagged > 0,
+                                 tp / np.maximum(n_flagged, 1), np.nan)
+            recall = ((tp / n_pos) if n_pos > 0
+                      else np.full(tp.shape, np.nan, dtype=float))
             denom = precision + recall
-            f1 = np.where(denom > 0, 2 * precision * recall / np.maximum(denom, 1e-12), 0.0)
+            # F1 is 0.0 only where both components are DEFINED and both zero —
+            # a real, measured miss, and the limit of 2PR/(P+R). Where either is
+            # NaN there is nothing to average, so the NaN propagates. Written
+            # out rather than as np.where(denom > 0, ...) because NaN > 0 is
+            # False, which would have quietly sent undefined rows to the
+            # else-branch and published them as zeros.
+            f1 = np.full(tp.shape, np.nan, dtype=float)
+            defined = ~np.isnan(denom)
+            positive = defined & (denom > 0)
+            f1[positive] = (2 * precision[positive] * recall[positive]
+                            / denom[positive])
+            f1[defined & ~positive] = 0.0
 
         fn_total = fn * self.config.fn_cost
         fp_total = fp * self.config.fp_cost
@@ -417,17 +522,28 @@ class CostEvaluator:
         row: pd.Series,
         n: int,
     ) -> ThresholdReport:
-        """Build a report from a sweep row. Used by callers walking the curve."""
+        """
+        Build a report from a sweep row. Used by callers walking the curve.
+
+        The NaN → None boundary. Inside the sweep frame "not computable" has to
+        be NaN (float column); from here on it is None, because these reports are
+        what `as_dict()` serialises and `json.dump` writes NaN as the bare token
+        `NaN`, which is not valid JSON.
+        """
         total = float(row["total_cost"])
+        if n <= 0:
+            # Unreachable via sweep() (it rejects empty input), but this is a
+            # divisor and a silent 0.0 here would be a fabricated cost figure.
+            raise ValueError("cannot build a report over 0 predictions")
         return ThresholdReport(
             threshold=float(row["threshold"]),
             tp=int(row["tp"]), fp=int(row["fp"]),
             tn=int(row["tn"]), fn=int(row["fn"]),
-            precision=float(row["precision"]),
-            recall=float(row["recall"]),
-            f1=float(row["f1"]),
+            precision=_none_if_nan(row["precision"]),
+            recall=_none_if_nan(row["recall"]),
+            f1=_none_if_nan(row["f1"]),
             total_cost=total,
-            cost_per_prediction=total / n if n else 0.0,
+            cost_per_prediction=total / n,
             alert_rate=float(row["alert_rate"]),
             alerts_per_1000=float(row["alert_rate"]) * 1000.0,
         )
@@ -442,11 +558,36 @@ class CostEvaluator:
         Evaluate a FIXED threshold. This is the honest test-set call.
 
         Predicate is `score >= threshold`, matching the sweep and the API.
+
+        DEGENERATE INPUT IS REFUSED OR REPORTED AS UNDEFINED, NEVER AS ZERO.
+
+        Empty input raises. There is no evaluation of zero accounts: every rate
+        here has n in its denominator, and the previous `/ n if n else 0.0`
+        guards turned that into a report claiming ₹0.00 cost per prediction and a
+        0% alert rate — a clean bill of health for a measurement that never
+        happened. An empty array reaching this function means the caller sliced
+        wrongly (an archetype with no members, a split filter that matched
+        nothing), and it should hear about it here rather than three layers
+        downstream in metrics.json.
+
+        Single-class input does NOT raise: a split with no positives is a
+        legitimate thing to price (all cost is FP cost) and a slice with no
+        negatives likewise. What it cannot do is report a recall, so recall and
+        F1 come back None from `_prf`. Same for precision when the threshold
+        flags nothing — which is exactly the flag-nothing baseline, a policy we
+        deliberately price rather than exclude. Counts and rupees stay defined
+        throughout, so those reports remain fully usable for cost comparison.
         """
         y = np.asarray(y_true).astype(int).ravel()
         s = np.asarray(y_proba, dtype=float).ravel()
         if y.shape != s.shape:
             raise ValueError(f"shape mismatch: y_true {y.shape}, y_proba {s.shape}")
+        if y.size == 0:
+            raise ValueError(
+                "cannot evaluate a threshold over an empty array: every rate "
+                "reported here divides by n, and there is no honest value to "
+                "publish for 0 accounts. Check the caller's slice."
+            )
         if not np.isfinite(threshold):
             raise ValueError(f"threshold must be finite, got {threshold}")
 
@@ -458,14 +599,14 @@ class CostEvaluator:
         precision, recall, f1 = _prf(tp, fp, fn)
         total = fn * self.config.fn_cost + fp * self.config.fp_cost
         n = y.size
-        alert_rate = (tp + fp) / n if n else 0.0
+        alert_rate = (tp + fp) / n
 
         return ThresholdReport(
             threshold=float(threshold),
             tp=tp, fp=fp, tn=tn, fn=fn,
             precision=precision, recall=recall, f1=f1,
             total_cost=float(total),
-            cost_per_prediction=float(total / n) if n else 0.0,
+            cost_per_prediction=float(total / n),
             alert_rate=float(alert_rate),
             alerts_per_1000=float(alert_rate) * 1000.0,
         )
@@ -519,10 +660,31 @@ class CostEvaluator:
 
         thr = curve["threshold"].to_numpy()
 
+        # The floor of the loosest row's threshold interval, DERIVED FROM THE
+        # SCORES rather than assumed.
+        #
+        # Any threshold at or below the minimum observed score flags everything,
+        # so the bottom row's interval is unbounded below. `thr[-1]` IS that
+        # minimum (the sweep's last row), and one ulp below it is the reporting
+        # convention — chosen to mirror the `nextafter(max_score, +inf)` the sweep
+        # already uses for "flag nothing" at the top end, so both extremes get a
+        # comparable finite width instead of one of them getting an arbitrary one.
+        #
+        # This used to be hard-coded to 0.0, which silently assumes every score is
+        # a probability. They are not: `single_feature_rule_baseline` in
+        # models/train.py scores inverted features as `-x` (direction="low"), which
+        # is negative for every account. The 0.0 floor then sat ABOVE the entire
+        # plateau, so `plateau_width` came out NEGATIVE — published in metrics.json
+        # as if it meant something — and, worse, `max(runs, key=width)` below was
+        # choosing the "widest" run by comparing nonsense, i.e. the threshold that
+        # ends up in the baseline table was picked by a broken comparison. Half of
+        # the 36 rows in that table are `direction="low"`.
+        floor = float(np.nextafter(thr[-1], -np.inf))
+
         def bounds(run: tuple[int, int]) -> tuple[float, float]:
             """Threshold interval (lo, hi] realising this run of rows."""
             hi_i, lo_i = run
-            lo = float(thr[lo_i + 1]) if lo_i + 1 < thr.size else 0.0
+            lo = float(thr[lo_i + 1]) if lo_i + 1 < thr.size else floor
             return lo, float(thr[hi_i])
 
         hi_i, lo_i = max(runs, key=lambda r: bounds(r)[1] - bounds(r)[0])
@@ -617,9 +779,11 @@ class CostEvaluator:
 
     def sensitivity_to_cost_ratio(
         self,
-        y_true: np.ndarray,
-        y_proba: np.ndarray,
-        ratios: tuple[float, ...] = (2.0, 5.0, 10.0, 13.33, 25.0, 50.0),
+        y_val: np.ndarray,
+        proba_val: np.ndarray,
+        y_test: np.ndarray,
+        proba_test: np.ndarray,
+        ratios: tuple[float, ...] | None = None,
     ) -> pd.DataFrame:
         """
         How the operating point moves as the FN:FP cost ratio changes.
@@ -631,24 +795,73 @@ class CostEvaluator:
 
         Holds fp_cost fixed and varies fn_cost, since only the ratio affects the
         threshold.
+
+        THE SHIPPED ROW IS THE CONFIGURED RATIO, NOT A ROUNDED LITERAL
+        ─────────────────────────────────────────────────────────────
+        `ratios=None` builds the grid around `self.config.ratio`, so the row a
+        reader will compare against the headline is priced with the SAME fn_cost
+        the headline used. The default used to hard-code `13.33`, which is not the
+        configured ratio: 13.33 x 15,000 = 199,950, so every FN in that row was
+        priced 50 rupees light. At the shipped operating point (26 missed mules)
+        the row published 1,300 rupees less than the headline's 55,00,000 for what
+        is meant to be the same cost model — a small number that costs a reviewer
+        their trust in the whole table, since the one row they can check by hand
+        against the headline is the one that does not reconcile. The grid is also
+        de-duplicated, so configuring a ratio of exactly 10 or 25 does not emit
+        the same row twice.
+
+        WHY THIS TAKES FOUR ARRAYS AND NOT TWO
+        ──────────────────────────────────────
+        Until this fix the method took a single split and called
+        find_optimal_threshold() on it — and train.py handed it TEST. So every
+        row picked its threshold using test labels, which made the shipped-ratio
+        row a silent duplicate of oracle_threshold_diagnostic: it published a
+        total cost of ₹39,39,300 for the ratio whose honest cost is ₹55,00,000, a
+        ₹15,60,000 understatement. A table whose entire purpose is to show the
+        operating point was not cherry-picked had itself been cherry-picked, in a
+        project whose central claim is "the threshold is never selected on test".
+
+        Selection and reporting are therefore separate parameters now and cannot
+        be collapsed by accident. Each ratio's threshold is chosen on VALIDATION
+        and then evaluated once on TEST at that frozen value, which is the same
+        discipline the headline number follows. Column names carry their split
+        (`val_*` / `test_*`) so no figure here can be quoted without its
+        provenance attached.
         """
+        if ratios is None:
+            # A set, so a configured ratio that lands exactly on a spine value
+            # (10.0, 25.0, ...) collapses into it instead of emitting twice.
+            ratios = tuple(sorted({2.0, 5.0, 10.0, 25.0, 50.0,
+                                   float(self.config.ratio)}))
+
         rows = []
         for r in ratios:
             ev = CostEvaluator(
                 fn_cost=self.config.fp_cost * r,
                 fp_cost=self.config.fp_cost,
             )
-            rep = ev.find_optimal_threshold(y_true, y_proba)
+            # Selection: validation only.
+            chosen = ev.find_optimal_threshold(y_val, proba_val)
+            # Reporting: test, at the frozen threshold. Never re-optimised.
+            realised = ev.evaluate_at_threshold(y_test, proba_test,
+                                               chosen.threshold)
             rows.append({
                 "fn_fp_ratio": r,
+                # The rupee figure the row was actually priced with, and a flag on
+                # the row that must reconcile with the headline. Both are here so
+                # the check a reviewer would do by hand needs nothing but this
+                # table: fn_cost x fn + fp_cost x fp = test_total_cost.
+                "fn_cost": float(ev.config.fn_cost),
+                "is_configured_ratio": bool(r == float(self.config.ratio)),
                 "break_even_p": ev.break_even_probability,
-                "threshold": rep.threshold,
-                "plateau_width": rep.plateau_width,
-                "precision": rep.precision,
-                "recall": rep.recall,
-                "f1": rep.f1,
-                "alerts_per_1000": rep.alerts_per_1000,
-                "total_cost": rep.total_cost,
+                "val_threshold": chosen.threshold,
+                "val_plateau_width": chosen.plateau_width,
+                "val_total_cost": chosen.total_cost,
+                "test_precision": realised.precision,
+                "test_recall": realised.recall,
+                "test_f1": realised.f1,
+                "test_alerts_per_1000": realised.alerts_per_1000,
+                "test_total_cost": realised.total_cost,
             })
         return pd.DataFrame(rows)
 
@@ -705,8 +918,12 @@ class CostEvaluator:
             "",
             "  ── Cost-optimal operating point ──",
             thr_line,
-            f"  Precision / Recall:  {opt.precision:.4f} / {opt.recall:.4f}"
-            f"   (F1 {opt.f1:.4f})",
+            # _fmt, not :.4f — precision/recall/F1 are None at a degenerate
+            # operating point (see _prf), and format(None, '.4f') raises. A
+            # summary that crashes on the flag-nothing policy is a summary that
+            # cannot report the one case a reviewer most wants explained.
+            f"  Precision / Recall:  {_fmt(opt.precision)} / {_fmt(opt.recall)}"
+            f"   (F1 {_fmt(opt.f1)})",
             f"  Confusion:           TP {opt.tp}  FP {opt.fp}  "
             f"TN {opt.tn}  FN {opt.fn}",
             f"  Analyst load:        {opt.alerts_per_1000:.1f} alerts "
@@ -718,8 +935,8 @@ class CostEvaluator:
             f"  ── Capacity-constrained point ({alert_budget_per_1000:.0f}"
             f" alerts per 1,000) ──",
             f"  Threshold:           {budgeted.threshold:.4f}",
-            f"  Precision / Recall:  {budgeted.precision:.4f} / "
-            f"{budgeted.recall:.4f}   (F1 {budgeted.f1:.4f})",
+            f"  Precision / Recall:  {_fmt(budgeted.precision)} / "
+            f"{_fmt(budgeted.recall)}   (F1 {_fmt(budgeted.f1)})",
             f"  Analyst load:        {budgeted.alerts_per_1000:.1f} alerts "
             f"per 1,000 accounts",
             f"  Total cost:          ₹{budgeted.total_cost:,.0f}"

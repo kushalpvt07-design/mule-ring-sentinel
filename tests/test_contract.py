@@ -34,6 +34,15 @@ Two lessons, and a test for each:
      subsets, because a typo in `GRAPH_FEATURES` would silently mis-specify the
      graph-ablation baseline.
 
+Both are static, need no dependencies, and pass on a bare checkout — which is why
+one more check has been given a home here that does not obviously belong to the
+feature contract. The defense-only guarantee is the one whose failure disqualifies
+this project outright, and every test of it lived in tests/test_responder.py behind
+a module-level `pytest.importorskip("pydantic")`. Without pydantic installed, that
+suite skips in full and nothing checks the constraint at all. Section 5 parses the
+action names out of the source instead, so the floor of that guarantee is always
+enforced.
+
 Usage:
     pytest tests/test_contract.py -v
 """
@@ -81,9 +90,35 @@ DECLARED_SUBSETS = {
 SCAN_MIN_STRINGS = 5
 SCAN_MIN_FEATURE_NAMES = 4
 
+# What each subset's module needs before it can be imported at all. Held per
+# module because the subset test used to skip on xgboost and scikit-learn whatever
+# it was checking — neither of which graph_viz has ever imported, while the three
+# it does need went unmentioned. A test that skips on the wrong dependency is
+# either skipping when it could have run or erroring when it should have skipped.
+SUBSET_IMPORT_REQUIREMENTS: dict[str, tuple[tuple[str, str], ...]] = {
+    "models.train": (
+        ("xgboost", "models.train imports xgboost"),
+        ("sklearn", "models.train imports scikit-learn"),
+    ),
+    "dashboard.components.graph_viz": (
+        ("streamlit", "graph_viz is a Streamlit page"),
+        ("networkx", "graph_viz builds the graph with networkx"),
+        ("community", "graph_viz imports data.extractor, which uses python-louvain"),
+    ),
+}
+
 
 def _python_files() -> list[Path]:
-    files: list[Path] = []
+    """
+    Every module the hard-coded-list scan covers: the four packages, plus the
+    root-level modules.
+
+    Root modules were missed entirely before — `console.py` lives outside every
+    package, so a walk driven only by SOURCE_PACKAGES never opened it, and a scan
+    that can be evaded by moving a file one directory up is not a guard. Globbed
+    rather than named so the next root module is covered the day it lands.
+    """
+    files: list[Path] = sorted(PROJECT_ROOT.glob("*.py"))
     for package in SOURCE_PACKAGES:
         files += sorted((PROJECT_ROOT / package).rglob("*.py"))
     return [f for f in files if "__pycache__" not in f.parts]
@@ -225,15 +260,23 @@ class TestSingleSourceOfTruth:
         ("models.train", "GRAPH_FEATURES"),
         ("models.train", "NON_GRAPH_FEATURES"),
         ("models.train", "LOG1P_COLS"),
+        ("dashboard.components.graph_viz", "TOOLTIP_FEATURES"),
     ])
     def test_declared_subsets_really_are_subsets(self, module, name):
         """
         A typo in `GRAPH_FEATURES` would not raise anywhere — it would silently
         change which features the ablation baseline removes, and the reported
         "graph features are worth X" number would be measuring something else.
+
+        `TOOLTIP_FEATURES` was named in DECLARED_SUBSETS and then never checked, so
+        the exemption granted it was doing the opposite of its job: the scan above
+        stopped complaining about the literal and nothing took over. Its failure
+        mode is quieter but the same shape — a mistyped name reaches `frame[col]`
+        on the graph page and a tooltip is missing a value, or the page raises a
+        KeyError in front of whoever is demoing it.
         """
-        pytest.importorskip("xgboost", reason="models.train imports xgboost")
-        pytest.importorskip("sklearn", reason="models.train imports scikit-learn")
+        for dependency, reason in SUBSET_IMPORT_REQUIREMENTS[module]:
+            pytest.importorskip(dependency, reason=reason)
         import importlib
 
         values = getattr(importlib.import_module(module), name)
@@ -447,3 +490,165 @@ class TestTrainServeParity:
             f"training-time computation and the same edges routed through "
             f"merge_with_context: {drifted}"
         )
+
+
+# ══════════════════════════════════════════════════════════════════
+# 5. Defense-only, checked without importing anything
+# ══════════════════════════════════════════════════════════════════
+
+# Enforcement verbs, written out here and read from nowhere. Deliberately NOT
+# imported from api/responder.py: cases generated from the code under test can only
+# cover what that code already knows, which is precisely how `LOCK_ACCOUNT` passed
+# both rails for as long as it did — "BLOCK" is not a substring of "LOCK_ACCOUNT"
+# and nothing in the module said LOCK.
+ENFORCEMENT_VERBS = (
+    "BAN", "BLOCK", "FREEZE", "SUSPEND", "TERMINATE", "DISABLE", "REVOKE",
+    "SEIZE", "CLOSE", "LOCK", "QUARANTINE", "RESTRICT", "HALT", "BLACKLIST",
+    "DENY", "LIMIT", "REVERSE",
+)
+
+
+def _tree(relative_path: str) -> ast.Module:
+    return ast.parse((PROJECT_ROOT / relative_path).read_text(encoding="utf-8"))
+
+
+def _literal_strings(value: ast.expr | None) -> list[str] | None:
+    """
+    The string elements of a list/tuple/set literal, unwrapping one layer of
+    `frozenset(...)` or `set(...)` so an allowlist written as
+    `frozenset({"ALLOW", ...})` reads the same as a plain tuple.
+    """
+    if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+            and value.func.id in ("frozenset", "set", "tuple", "list")
+            and value.args):
+        return _literal_strings(value.args[0])
+    if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+        return [e.value for e in value.elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+    return None
+
+
+def _collection_named(tree: ast.Module, name: str) -> list[str]:
+    """
+    Every string in the collection assigned to `name`.
+
+    Raises when the name is absent rather than returning an empty list: a static
+    check with nothing to look at otherwise reports success, which is the failure
+    mode this whole section exists to avoid.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            continue
+        strings = _literal_strings(node.value)
+        if strings is not None:
+            return strings
+    raise AssertionError(
+        f"no collection literal named {name} found — this test cannot check a "
+        f"rail that has been renamed or computed instead of written out"
+    )
+
+
+def _enum_members(tree: ast.Module, class_name: str) -> dict[str, str]:
+    """Member name → value for a `class X(str, Enum)` body, without importing it."""
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name == class_name):
+            continue
+        members: dict[str, str] = {}
+        for stmt in node.body:
+            if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and isinstance(stmt.value, ast.Constant)
+                    and isinstance(stmt.value.value, str)):
+                members[stmt.targets[0].id] = stmt.value.value
+        assert members, f"{class_name} has no string members"
+        return members
+    raise AssertionError(f"class {class_name} not found")
+
+
+class TestActionsAreDefenseOnlyStatically:
+    """
+    "Anything offense-capable is disqualified" — checked on the source text, so it
+    holds on a bare checkout.
+
+    tests/test_responder.py covers the same constraint far more thoroughly, but its
+    first statement is `pytest.importorskip("pydantic")`, and a skipped module skips
+    every test in it. On a machine without pydantic installed the ONLY project
+    guarantee that carries a disqualification penalty went entirely unchecked, and
+    the suite still printed green. Parsing costs nothing and cannot be skipped, so
+    the floor of that guarantee lives here: no action name the repo ships reads as
+    enforcement, and the two places the permitted set is written agree.
+    """
+
+    def test_no_shipped_action_name_reads_as_enforcement(self):
+        """
+        Both the enum members and the responder's allowlist, names and values
+        alike — `LOCK_ACCOUNT = "REVIEW"` would be an enforcement action with an
+        innocent value, and vice versa.
+        """
+        members = _enum_members(_tree("api/schemas.py"), "ActionCode")
+        permitted = _collection_named(_tree("api/responder.py"),
+                                      "PERMITTED_ACTIONS")
+
+        candidates = set(members) | set(members.values()) | set(permitted)
+        offenders = [
+            (name, verb) for name in sorted(candidates)
+            for verb in ENFORCEMENT_VERBS if verb in name.upper()
+        ]
+        assert not offenders, (
+            "action names that read as enforcement, which is a disqualification "
+            f"criterion for this project: {offenders}. The Sentinel recommends "
+            "review; it does not act on accounts."
+        )
+
+    def test_the_enum_and_the_allowlist_name_the_same_actions(self):
+        """
+        The runtime sweep in api/responder.py requires these to match exactly, and
+        that sweep needs pydantic to run. Checked here as text so a stale allowlist
+        entry — still permitting a string the enum renamed away — is caught on any
+        checkout.
+        """
+        members = _enum_members(_tree("api/schemas.py"), "ActionCode")
+        permitted = _collection_named(_tree("api/responder.py"),
+                                      "PERMITTED_ACTIONS")
+        assert set(members.values()) == set(permitted), (
+            f"only in ActionCode: {sorted(set(members.values()) - set(permitted))}; "
+            f"only in PERMITTED_ACTIONS: "
+            f"{sorted(set(permitted) - set(members.values()))}"
+        )
+
+    def test_the_action_rail_still_fails_closed(self):
+        """
+        That `_validate_action` tests membership of the allowlist at all.
+
+        Shallow on purpose — it looks for the `not in PERMITTED_ACTIONS` comparison
+        and no further. The behaviour is tested properly in test_responder.py; what
+        cannot be tested there is the case where pydantic is missing, and the defect
+        worth catching without it is structural: reverting to blocklists alone,
+        which permits by default and let `LOCK_ACCOUNT` through.
+        """
+        tree = _tree("api/responder.py")
+        function = next(
+            (n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef) and n.name == "_validate_action"),
+            None)
+        assert function is not None, "api/responder.py has no _validate_action"
+
+        checks_allowlist = any(
+            isinstance(node, ast.Compare)
+            and any(isinstance(op, ast.NotIn) for op in node.ops)
+            and any(isinstance(c, ast.Name) and c.id == "PERMITTED_ACTIONS"
+                    for c in node.comparators)
+            for node in ast.walk(function)
+        )
+        assert checks_allowlist, (
+            "_validate_action no longer refuses actions outside PERMITTED_ACTIONS. "
+            "A blocklist permits by default and cannot enumerate every way of "
+            "saying 'stop this account'; this rail has to fail closed."
+        )
+

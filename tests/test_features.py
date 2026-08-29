@@ -283,8 +283,9 @@ class TestArithmeticAgainstAnIndependentImplementation:
     comes out wrong while still looking plausible.
     """
 
+    @classmethod
     @pytest.fixture(scope="class")
-    def reference(self, raw_edges) -> pd.DataFrame:
+    def reference(cls, raw_edges) -> pd.DataFrame:
         edges = raw_edges["test"]
         pairs = (edges.groupby(["sender", "receiver"], sort=False)
                  .agg(total_amount=("amount", "sum")).reset_index())

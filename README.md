@@ -6,8 +6,17 @@ Track 2 — AI Risk Manager.
 
 The loss class is **money-mule laundering rings**: accounts that receive fraud
 proceeds and pass them on in circles to break the audit trail. A single mule hop
-is unremarkable in isolation — the pattern only exists in the *shape* of the
-network, which is why this is a graph problem and not a per-transaction one.
+is unremarkable in isolation, so the design premise was that the pattern lives in
+the *shape* of the network.
+
+The ablation in [Results](#results) qualifies that premise rather than confirming
+it, and the qualified version is the more useful claim. Strip all five structural
+features and the remaining thirteen still rank almost as well — as a *ranking*
+problem this is not one that requires a graph. What the structural features buy is
+the alert queue: at effectively the same recall they cut false positives to a
+fraction, because circulation is what separates a mule from a merely busy account.
+So the honest framing is that graph structure is what makes the queue cheap enough
+for a human to work, not what makes the signal visible in the first place.
 
 The strongest action this system can emit is `HOLD_FOR_REVIEW`. It has no code
 path that can ban, block, freeze, suspend, terminate, disable, revoke, seize or
@@ -19,10 +28,109 @@ convention. See [Defense-only, by construction](#defense-only-by-construction).
 ## Results
 
 <!-- METRICS:BEGIN -->
-> **No metrics published yet.** `models/saved_models/metrics.json` is absent, so
-> this section is intentionally empty rather than filled with numbers nobody
-> measured. Run `python -m models.train` and then
-> `python -m models.report --write`.
+
+Held-out **test** split, threshold selected on **validation** (never on test). Model `sentinel_v3`, 18 features, trained 2026-08-27T09:15:43+00:00.
+
+| | |
+|---|---|
+| ROC-AUC | 0.9693 (95% CI 0.947–0.988) |
+| Average precision | 0.8037 |
+| Precision | 33.5% |
+| Recall | 87.1% |
+| F1 | 0.484 |
+| Operating threshold | 0.1836 |
+| Total cost on test | ₹64,10,000 |
+
+Costs are assumptions, not measurements: a missed mule is priced at ₹2,00,000 and a false alert at ₹15,000 — a ratio of 13.3333 : 1. Only the ratio sets the threshold. The break-even probability that follows from it is **6.98%**, which is also the break-even *precision* of the alert queue: any queue cleaner than that is cheaper to work than to ignore.
+
+### What it cost to pick the threshold honestly
+
+The operating threshold 0.1836 was chosen on validation, where it scored recall 91.2% at precision 37.5%. Applied unchanged to test it gives recall 87.1% at precision 33.5% — recall fell, precision fell, and neither was tuned to make that happen.
+
+Had the threshold been chosen *with test labels in hand* it would have been 0.5408 and cost ₹58,60,000 instead of ₹64,10,000. **That ₹5,50,000 difference — 9% of the reported total — is the price of not peeking**, and it is published because the alternative — quietly reporting the cheaper number — is the exact failure this repo already shipped once.
+
+The run flagged this risk before test was ever touched: the validation cost plateau spans 0.1834–0.1837, width 0.0004 — **narrow**, so the training run warned in advance that this threshold might be fitted to validation noise. Total cost is a step function of the threshold, so a narrow plateau means the minimum was a knife-edge rather than a basin, which is precisely when a validation-selected cutoff transfers poorly.
+
+### Calibration, and why the threshold is not the break-even p\*
+
+Break-even p\* is the correct score cutoff only for a *calibrated* model, and this one is deliberately not calibrated: `scale_pos_weight` trades calibration away to fight 4.3% prevalence, and the scores come out inflated. Mean predicted probability is 0.0872 against an actual rate of 0.0433; Brier score 0.0297, expected calibration error 0.0439.
+
+| score bin | accounts | mean predicted | observed rate |
+|---|---|---|---|
+| `[0.0, 0.2)` | 2555 | 0.0202 | 0.0063 |
+| `[0.2, 0.4)` | 90 | 0.2903 | 0.0778 |
+| `[0.4, 0.6)` | 53 | 0.5044 | 0.0943 |
+| `[0.6, 0.8)` | 54 | 0.7118 | 0.1481 |
+| `[0.8, 1.0)` | 114 | 0.9386 | 0.7719 |
+
+The model over-states risk in **every** bin, the top one included, so the scores are not probabilities. That is why p\* is used here as a statement about the **alert queue** — break-even precision — and never as a score cutoff. The cutoff is the empirical validation optimum. Reporting p\* as though it were the operating threshold would be arithmetically tidy and wrong.
+
+### Does the operating point survive a different cost ratio?
+
+The FN:FP ratio is the one number in the cost model nobody can verify, so a result quoted at a single ratio is not a result. Each row picks its threshold on validation and is then evaluated once on test at that frozen value — the same discipline as the headline.
+
+| FN:FP | break-even p\* | threshold (val) | test precision | test recall | test cost |
+|---|---|---|---|---|---|
+| 2.0 : 1 | 33.33% | 0.7363 | 69.7% | 74.2% | ₹15,60,000 |
+| 5.0 : 1 | 16.67% | 0.6614 | 60.9% | 76.6% | ₹30,90,000 |
+| 10.0 : 1 | 9.09% | 0.2261 | 36.4% | 86.3% | ₹53,55,000 |
+| 13.333333333333334 : 1 | 6.98% | 0.1836 | 33.5% | 87.1% | ₹64,10,000 |
+| 25.0 : 1 | 3.85% | 0.1471 | 31.2% | 90.3% | ₹82,05,000 |
+| 50.0 : 1 | 1.96% | 0.1028 | 26.6% | 93.5% | ₹1,08,00,000 |
+
+### Does the model earn its complexity?
+
+Every row is priced on the same cost model, with each baseline's own threshold also selected on validation. This is the table that decides whether a graph pipeline was worth building.
+
+| | precision | recall | F1 | alerts/1k | total cost |
+|---|---|---|---|---|---|
+| flag nothing | — | 0.0% | — | 0.0 | ₹2,48,00,000 |
+| flag everything | 4.3% | 100.0% | 0.083 | 1000.0 | ₹4,11,30,000 |
+| one-line rule: `cycle_participation >= 0.0524` | 16.4% | 91.9% | 0.278 | 242.5 | ₹1,07,15,000 |
+| logistic regression, same features | 24.6% | 80.7% | 0.377 | 141.7 | ₹93,90,000 |
+| XGBoost, no graph features | 46.7% | 79.0% | 0.587 | 73.3 | ₹68,80,000 |
+| **XGBoost, full model** | **33.5%** | **87.1%** | **0.484** | **112.4** | **₹64,10,000** |
+
+Against the identical model trained without them, graph features avoid ₹4,70,000 of cost and move average precision by +0.0189.
+
+That cost figure flatters them, and the reason is worth stating: with a miss priced at 13.3333× a false alert, total cost is nearly insensitive to precision — and precision is exactly where the graph features land. False positives **rise** from 112 to 214 (91% more) at higher recall (79.0% → 87.1%), growing the review queue from 73.3 to 112.4 alerts per 1,000 accounts. An analyst feels that; the cost model barely does.
+
+Read the other way, this ablation is also the strongest argument against the framing at the top of this README. 13 non-structural features reach test AUC 0.9586 on their own, against 0.9693 with the full set — 97.7% of the above-chance separation, so most of the separating signal is reachable without a graph at all. The structural features sharpen the queue; they do not find a fundamentally different population of mules. Anyone deciding whether to build this pipeline should weigh that.
+
+### What happens when the review queue is capped
+
+Every row above assumes an analyst queue of unlimited size. Cap it at 20 alerts per 1,000 accounts — a stated assumption, with the threshold that satisfies it chosen on validation like every other threshold here — and the model is pushed to the high-precision end of its own curve: threshold 0.9776, precision 98.0% at recall 39.5%, 17.4 alerts per 1,000 accounts, total test cost ₹1,50,15,000.
+
+On cost alone that loses to the one-line rule (₹1,07,15,000), and the inversion is a property of the cost model rather than a defect. The rule reaches recall 91.9% by issuing 242.5 alerts per 1,000 accounts — roughly 12× the capped budget, so it is not a policy the cap permits. With a miss priced at 13.3333× a false alert, misses dominate the total, and any policy free to flood the queue wins on cost by construction. Note the rule's queue is not economically absurd either — at 16.4% precision it sits above the 6.98% break-even, so it is worth working if you have the staff. The objection to it is capacity, not arithmetic.
+
+The defensible claim is therefore the joint one: cheaper than the alternatives *and* a queue small enough for a human to actually work. Cost in isolation, under a cap the winning baseline could never satisfy, is not a claim this project makes. A team whose binding constraint is reviews-per-day should re-derive its own operating point from its own budget.
+
+### Is the task actually hard?
+
+The strongest *single* feature on test is `cycle_participation` at direction-corrected AUC **0.8678**, against a leakage ceiling of 0.99. If any one column reached that ceiling the generator would be planting the label and every number above would be theatre — `tests/test_baselines.py` recomputes this from the shipped CSVs and fails the build if it ever does.
+
+### Recall by ring archetype
+
+Reported separately because one headline recall hides *which* laundering shapes the model misses, and the three archetypes are of deliberately unequal difficulty. Read the account column first: ring recall counts a ring as caught if *any* member is flagged, so it flatters a model whenever rings have several members, and a saturated metric is no evidence of a good one. Ring recall is still the operationally meaningful quantity — one alert brings an analyst to the whole ring.
+
+| archetype | accounts | account recall | rings | ring recall |
+|---|---|---|---|---|
+| `fast_cycle` | 36/36 | 100.0% | 8/8 | 100.0% |
+| `layered_fanin` | 24/25 | 96.0% | 6/6 | 100.0% |
+| `stealth_cycle` | 48/63 | 76.2% | 10/10 | 100.0% |
+| **all rings** | | | **24/24** | **100.0%** |
+
+### Data the numbers were measured on
+
+| split | accounts | mules | prevalence | rings |
+|---|---|---|---|---|
+| train | 3096 | 209 | 6.75% | 40 |
+| val | 2947 | 136 | 4.61% | 24 |
+| test | 2866 | 124 | 4.33% | 24 |
+
+Splits are consecutive equal-length time windows — no account's future is used to predict its past, and no ring appears in two splits.
+
+_Generated from `models/saved_models/metrics.json` by `python -m models.report --write`. Do not hand-edit._
 <!-- METRICS:END -->
 
 Nothing in that section is typed by hand. `python -m models.report --write`
@@ -74,6 +182,16 @@ zero `ring_id` overlap. The operating threshold is chosen on validation and
 applied unchanged to test. Organic accounts *do* recur across splits, which is
 realistic — the same person keeps banking — and is not leakage; what must not
 recur is a ring or a labelled mule, and `tests/test_leakage.py` asserts both.
+
+This claim held for the headline number and quietly failed elsewhere, which is
+worth recording rather than tidying away. The cost-ratio sensitivity table used
+to pick *each row's* threshold by optimising on test, so the row at the shipped
+ratio had become an unlabelled copy of the deliberate test-peeking diagnostic and
+understated cost there by 28%. The table now selects every row on validation and
+evaluates once on test at that frozen value, and
+`tests/test_baselines.py::TestSensitivityTableDoesNotPeekAtTest` fails the build
+if any published operating point is ever re-optimised on test again — including
+under renamed columns.
 
 ---
 
@@ -137,24 +255,37 @@ posts to the running API.
 
 ## Two things that are easy to get wrong, and how they are handled
 
-### The scoring threshold, and why it is not a tuned magic number
+### The scoring threshold, and the two different jobs one number is doing
 
 Flagging an account is worth it when the expected cost of flagging is below the
 expected cost of not flagging. For an account with probability *p* of being a
-mule, that is `(1 − p)·fp_cost < p·fn_cost`, so the cost-optimal cutoff is
+mule, that is `(1 − p)·fp_cost < p·fn_cost`, so the break-even probability is
 `p* = fp_cost / (fp_cost + fn_cost)` — derived from the cost assumptions, not
-fitted to a dataset. At the assumed ₹15,000 and ₹2,00,000 that is p\* ≈ 0.0698,
-and the same number read the other way is the **break-even precision of the alert
-queue**: about 7%. Any queue cleaner than 7% precision is cheaper to work than to
-ignore. That is a far more defensible thing to report than "we tuned the
-threshold to 0.42".
+fitted to a dataset. At the assumed ₹15,000 and ₹2,00,000 that is p\* ≈ 0.0698.
 
-The empirical sweep still runs, because the model is not perfectly calibrated and
-what actually happened is what matters; the sweep is exact rather than gridded
-(total cost is a step function of the threshold, changing only when the threshold
-crosses an observed score) and prefers the *centre of the widest cost plateau* to
-a knife-edge minimum. Both the analytic and empirical thresholds are printed so a
-calibration gap is visible instead of hidden.
+It is tempting to use that directly as the score cutoff, and this README used to
+imply it. That is only valid for a *calibrated* model, and this one is
+deliberately not calibrated: `scale_pos_weight` inflates scores to fight a ~4%
+prevalence, so a predicted 0.29 corresponds to a much lower observed rate. The
+reliability table in the Results block shows the model over-stating risk in every
+bin but the top one. Feeding p\* to an uncalibrated score would flag a large
+multiple of the accounts it should.
+
+So the number does one job and not the other. As a statement about the **alert
+queue** it stands unmodified: break-even precision is about 7%, and any queue
+cleaner than that is cheaper to work than to ignore — which is a far more
+defensible thing to report than a tuned cutoff, and it is the figure to compare
+the Results block's precision against. As a **score cutoff** it is not used at
+all. The cutoff is chosen empirically on validation and frozen before test.
+
+That empirical sweep is exact rather than gridded (total cost is a step function
+of the threshold, changing only when the threshold crosses an observed score) and
+it prefers the *centre of the widest cost plateau* to a knife-edge minimum. It
+also publishes the plateau's width and warns when it is narrow, because a narrow
+plateau is the signature of a threshold fitted to validation noise. On this run
+the warning fired, and the Results block reports what it cost on test rather than
+burying it: the gap between the frozen threshold and the one test labels would
+have chosen is stated in rupees.
 
 ### Feature stability, which is the requirement that actually costs something
 
@@ -359,11 +490,34 @@ features over the merged graph. That is honest about what it costs and fine at
 this scale, but it is not an incremental online system, and PageRank over a
 merged graph is the dominant cost as the graph grows.
 
-**Calibration is assumed, not verified.** The break-even threshold argument
-presumes reasonably calibrated probabilities. The empirical sweep is used instead
-precisely because that presumption is shaky, and both numbers are printed so the
-gap is visible — but no reliability diagram or isotonic calibration step exists
-yet.
+**Calibration is measured, and it is poor — deliberately.** An earlier version of
+this section said calibration was "assumed, not verified"; that is no longer true,
+and the verification is unflattering. `scale_pos_weight` inflates scores to fight a
+low positive rate, so the outputs are useful *rankings* and bad *probabilities* —
+the reliability table in [Results](#results) shows the direction and size of the
+bias. Two consequences are load-bearing. The threshold cannot be derived from
+break-even probability and is instead chosen empirically. And no score from this
+model should be read to a customer, an analyst or an auditor as "an X% chance this
+is a mule". Fixing it properly means an isotonic or Platt step fitted on
+validation, which does not exist yet.
+
+**The operating threshold transfers imperfectly, and the run said so in advance.**
+The cost-optimal threshold sits on a plateau under 1pp wide, which the selector
+flags as possibly fitted to noise; the same threshold then costs materially more on
+test than on validation. Both figures are published side by side in
+[Results](#results) rather than only the favourable one. That gap is the price of
+not peeking, and it is the number to watch on any future data — a wide plateau
+would be evidence the operating point is robust, and this one is not wide.
+
+**Under a tight analyst-capacity budget the model can lose to the one-line rule.**
+The headline comparison gives every policy the same cost model but no queue limit.
+Cap the queue near the model's own alert rate and the picture inverts: the model
+becomes very precise and much less sensitive, while the single-feature rule keeps
+buying recall with a queue an order of magnitude larger, and on this cost ratio
+missed mules dominate. Both operating points are published. The practical reading
+is that this system is justified by cost *and* by queue size together, and a team
+whose real constraint is a hard cap on reviews per day should re-derive its own
+operating point rather than inherit this one.
 
 ---
 

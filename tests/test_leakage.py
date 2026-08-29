@@ -102,10 +102,16 @@ class TestTemporalOrder:
     def test_split_boundaries_do_not_overlap(self, raw_edges, earlier, later):
         e_max = raw_edges[earlier]["timestamp"].max()
         l_min = raw_edges[later]["timestamp"].min()
-        assert l_min >= e_max, (
-            f"TEMPORAL LEAKAGE: '{later}' starts at {l_min}, before '{earlier}' "
-            f"ends at {e_max} (overlap {e_max - l_min}). The model would be "
-            f"trained on transactions it is later scored against."
+        # Strict. `>=` permitted `l_min == e_max`, which is one transaction — the
+        # boundary one — sitting in both windows at once. The generator assigns it
+        # to the later split by construction (`searchsorted(side="right")` on the
+        # interior boundaries), so equality here is not a tie to be tolerated, it
+        # means the splits were cut somewhere other than where that rule says.
+        assert l_min > e_max, (
+            f"TEMPORAL LEAKAGE: '{later}' starts at {l_min}, at or before "
+            f"'{earlier}' ends at {e_max} (overlap {e_max - l_min}). A boundary "
+            f"timestamp belongs to the later split, so this is at least one "
+            f"transaction the model is both trained on and scored against."
         )
 
     def test_train_val_test_are_strictly_ordered(self, raw_edges):

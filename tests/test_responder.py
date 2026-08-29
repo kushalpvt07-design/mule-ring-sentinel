@@ -31,8 +31,29 @@ not the account. It is now `contributing_factors: list[ContributingFactor]`, the
 per-account SHAP attributions. Both the parameter name and the element type
 changed, and this file now builds real ContributingFactor objects.
 
+─────────────────────────────────────────────────────────────────────────────
+WHY THE TEST CASES NO LONGER COME FROM api/responder.py
+─────────────────────────────────────────────────────────────────────────────
+The bypass test used to be parametrized over the module's own blocklist:
+
+    @pytest.mark.parametrize("verb", FORBIDDEN_VERBS)
+
+Its cases were therefore generated from the code under test, so it could only
+check verbs that code already knew about. That is why it stayed green for as long
+as `LOCK_ACCOUNT` passed both rails: "BLOCK" is not a substring of "LOCK_ACCOUNT",
+and nothing in the module said LOCK. The cases now come from
+`ENFORCEMENT_ACTION_NAMES` below, written in this file from the outside. The sizes
+of both blocklists are asserted directly as well, because emptying one yields an
+empty parameter set and pytest reports that as a SKIP, not a failure — deleting a
+rail by accident would have turned this class green too.
+
 Everything here needs pydantic (api.schemas is a pydantic model) but no model,
 data or network — so it runs on a bare checkout the moment pydantic is installed.
+The one check that must not depend on pydantic — that no shipped action name reads
+as enforcement — therefore cannot live in this file at all: the module-level
+`importorskip` below deletes the whole suite, including it. It lives in
+tests/test_contract.py as `TestActionsAreDefenseOnlyStatically`, which parses the
+source with `ast` and imports nothing.
 
 Usage:
     pytest tests/test_responder.py -v
@@ -40,24 +61,72 @@ Usage:
 
 from __future__ import annotations
 
+from enum import Enum
+
 import pytest
 
 # api.schemas is built on pydantic; importing api.responder pulls it in. Skip the
 # whole module cleanly where pydantic is absent rather than erroring at collection.
 pytest.importorskip("pydantic", reason="api.schemas is a pydantic model")
 
-from api.responder import (  # noqa: E402  (after importorskip, intentionally)
+import api.responder as responder  # noqa: E402  (after importorskip, intentionally)
+from api.responder import (  # noqa: E402
     FORBIDDEN_ACTIONS,
     FORBIDDEN_VERBS,
+    PERMITTED_ACTIONS,
     DefenseOnlyViolation,
     _validate_action,
     build_node_response,
     classify_risk,
     critical_cutoff,
     determine_action,
+    medium_cutoff,
     validate_response_batch,
 )
 from api.schemas import ActionCode, ContributingFactor, NodeRiskScore, RiskLevel  # noqa: E402
+
+# The cost model's break-even probability, p* = fp_cost / (fp_cost + fn_cost) at
+# ₹15,000 and ₹2,00,000. It is the floor of the step-up band. Written out here
+# rather than read from metrics.json so these tests describe the tiering rule
+# itself and not whatever the last training run happened to publish.
+BREAK_EVEN = 0.069767
+
+# The operating threshold metrics.json ships for sentinel_v3, used where a test
+# needs to reproduce the real geometry of the bands rather than a round number.
+SHIPPED_THRESHOLD = 0.5908352434635162
+
+# Enforcement action names, written from the outside. Not one of these is read
+# from api/responder.py — that is the entire point (see the header). `LOCK_ACCOUNT`
+# is first because it is the name that used to pass both rails.
+ENFORCEMENT_ACTION_NAMES = (
+    "LOCK_ACCOUNT",
+    "QUARANTINE_ACCOUNT",
+    "RESTRICT_TRANSFERS",
+    "HALT_PAYOUTS",
+    "BLACKLIST_VPA",
+    "DENY_TRANSACTION",
+    "LIMIT_WITHDRAWALS",
+    "REVERSE_TRANSACTION",
+    "DISABLE_VPA",
+    "REVOKE_MANDATE",
+    "SEIZE_BALANCE",
+    "CLOSE_ACCOUNT",
+    "BAN_USER",
+    "BLOCK_ACCOUNT",
+    "FREEZE_FUNDS",
+    "SUSPEND_ACCOUNT",
+    "TERMINATE_USER",
+)
+
+# Every action a score is allowed to reach, with human review as the ceiling.
+# Held as a literal so wiring a new, stronger member of ActionCode into
+# `determine_action` fails this file instead of passing it. FLAG_FOR_REVIEW exists
+# in the enum but no tier maps to it, so it is deliberately absent.
+REACHABLE_ACTIONS = frozenset({
+    "ALLOW",
+    "REQUIRE_ADDITIONAL_AUTH",
+    "HOLD_FOR_REVIEW",
+})
 
 
 def _factor(feature: str, contribution: float) -> ContributingFactor:
@@ -78,9 +147,24 @@ def _factor(feature: str, contribution: float) -> ContributingFactor:
 class TestDefenseOnlyConstraint:
     """The hard product constraint, checked from several directions."""
 
-    @pytest.mark.parametrize("name", ["BAN_USER", "BLOCK_ACCOUNT", "FREEZE_FUNDS"])
-    def test_named_enforcement_actions_are_forbidden(self, name):
-        assert name in FORBIDDEN_ACTIONS
+    def test_the_rails_have_not_been_emptied(self):
+        """
+        Sizes, asserted directly.
+
+        Every other test in this class is parametrized, and an empty parameter set
+        is a SKIP in pytest rather than a failure — so emptying `FORBIDDEN_VERBS`
+        would have made this class green instead of red. The counts are floors, not
+        equalities: adding a verb is welcome, losing one is a regression in a rail.
+        `PERMITTED_ACTIONS` is pinned exactly, because widening it is the one way
+        past the primary rail.
+        """
+        assert len(PERMITTED_ACTIONS) == 4, (
+            f"PERMITTED_ACTIONS holds {sorted(PERMITTED_ACTIONS)}. The allowlist "
+            f"is the primary defense-only rail; a fifth entry means some new "
+            f"action can leave the API, and that is the change to justify."
+        )
+        assert len(FORBIDDEN_ACTIONS) >= 7
+        assert len(FORBIDDEN_VERBS) >= 17
 
     @pytest.mark.parametrize("forbidden", sorted(FORBIDDEN_ACTIONS))
     def test_every_listed_forbidden_action_raises(self, forbidden):
@@ -92,57 +176,154 @@ class TestDefenseOnlyConstraint:
             with pytest.raises(DefenseOnlyViolation):
                 _validate_action(spelling)
 
-    @pytest.mark.parametrize("verb", FORBIDDEN_VERBS)
-    def test_an_unlisted_action_that_reads_as_enforcement_is_caught(self, verb):
+    @pytest.mark.parametrize("name", ENFORCEMENT_ACTION_NAMES)
+    def test_an_action_that_reads_as_enforcement_is_refused(self, name):
         """
-        The blocklist only catches names someone thought of. `DISABLE_VPA` or
-        `REVOKE_MANDATE` are not in FORBIDDEN_ACTIONS, yet they are enforcement.
-        The substring rail catches them by verb — this is the check that makes
-        the guarantee hold against actions nobody has invented yet.
-        """
-        invented = f"{verb}_SOMETHING"
-        assert invented not in FORBIDDEN_ACTIONS
-        with pytest.raises(DefenseOnlyViolation, match="enforcement"):
-            _validate_action(invented)
+        THE REGRESSION, and the reason the rail is now an allowlist.
 
-    def test_every_action_in_the_enum_passes(self):
+        `LOCK_ACCOUNT` was in neither `FORBIDDEN_ACTIONS` nor caught by the
+        substring scan — the banned verb is "BLOCK", and "BLOCK" is not a substring
+        of "LOCK_ACCOUNT" — so the single guarantee this module exists to make was
+        broken by a name a reviewer would spot instantly. These names are held in
+        this file, so the test can fail; which rail catches them is not asserted,
+        only that the action does not get out and that the message names it.
         """
-        The enum is swept at import time, so this cannot even reach a failing
-        assert — importing api.responder would already have raised. Kept as the
-        readable statement of intent: no shipped ActionCode is an enforcement verb.
-        """
-        for action in ActionCode:
-            _validate_action(action.value)
+        with pytest.raises(DefenseOnlyViolation) as excinfo:
+            _validate_action(name)
+        assert name in str(excinfo.value)
 
-    def test_no_score_anywhere_produces_a_forbidden_action(self):
-        """The end-to-end guarantee across the whole score range and both edges."""
-        for score in (0.0, 0.01, 0.1, 0.3, 0.5, 0.7, 0.9, 0.99, 1.0):
-            response = build_node_response("test@upi", score, threshold=0.5)
-            assert response.action.value not in FORBIDDEN_ACTIONS
-            for verb in FORBIDDEN_VERBS:
-                assert verb not in response.action.value.upper()
+    def test_an_advisory_sounding_invention_is_also_refused(self):
+        """
+        Fail closed, not just fail on enforcement.
+
+        A blocklist permits by default, so `ESCALATE_TO_FIU` — plausible, not on
+        any list, and not this service's to send — would have passed. The allowlist
+        refuses it for the honest reason: it is not one of the four actions this
+        API is allowed to emit, and no rail can be relied on to recognise the
+        wording of an action nobody has invented yet.
+        """
+        with pytest.raises(DefenseOnlyViolation, match="not one of the permitted"):
+            _validate_action("ESCALATE_TO_FIU")
+
+    def test_the_import_time_sweep_would_reject_a_forbidden_member(self,
+                                                                   monkeypatch):
+        """
+        The sweep, made observable.
+
+        Asserting that the shipped enum passes the sweep is vacuous — importing
+        api.responder would already have raised, so the assert is unreachable. The
+        only way to test a guard is to give it something bad, so a stand-in enum
+        carrying `LOCK_ACCOUNT` is patched in and the sweep is required to refuse
+        it. This fails if the allowlist check is ever inverted back into a
+        blocklist, which is exactly the defect that shipped.
+        """
+        class ForgedActionCode(str, Enum):
+            ALLOW = "ALLOW"
+            LOCK_ACCOUNT = "LOCK_ACCOUNT"
+
+        monkeypatch.setattr(responder, "ActionCode", ForgedActionCode)
+        with pytest.raises(DefenseOnlyViolation, match="LOCK_ACCOUNT"):
+            responder._assert_action_enum_is_defense_only()
+
+    def test_the_sweep_notices_an_allowlist_that_has_drifted(self, monkeypatch):
+        """
+        The other direction: the allowlist naming actions the enum no longer has.
+
+        `PERMITTED_ACTIONS` is a deliberate hand-written copy of the enum — that
+        independence is what makes the sweep a real check rather than a tautology —
+        and a copy is only worth having if it is required to stay in step. Here the
+        enum has shrunk to one member and every member still passes, so only the
+        equality check can catch it. It matters beyond tidiness: rename an action
+        and a stale allowlist goes on permitting the old string.
+        """
+        class NarrowedActionCode(str, Enum):
+            ALLOW = "ALLOW"
+
+        monkeypatch.setattr(responder, "ActionCode", NarrowedActionCode)
+        with pytest.raises(DefenseOnlyViolation, match="drifted"):
+            responder._assert_action_enum_is_defense_only()
+
+    @pytest.mark.parametrize("score", [0.0, 0.01, BREAK_EVEN, 0.1, 0.3, 0.5,
+                                       0.7, 0.9, 0.99, 1.0])
+    def test_the_strongest_action_any_score_can_reach_is_human_review(self, score):
+        """
+        The end-to-end product claim, as an upper bound rather than a
+        non-membership check.
+
+        `action.value not in FORBIDDEN_ACTIONS` could not fail: the value came from
+        an enum whose every member was screened at import. What CAN fail is the
+        mapping — point CRITICAL at some future stronger action and the set of
+        actions reachable from a score changes, which this notices.
+        """
+        response = build_node_response(
+            "test@upi", score, threshold=0.5, break_even_probability=BREAK_EVEN)
+        assert response.action.value in REACHABLE_ACTIONS
+        assert response.action != ActionCode.FLAG_FOR_REVIEW, (
+            "FLAG_FOR_REVIEW is in the enum but no tier maps to it. If that "
+            "changed deliberately, REACHABLE_ACTIONS is where to say so."
+        )
 
 
 # ══════════════════════════════════════════════════════════════════
-# 2. Tiering: the boundaries, and the two regressions v3 fixed
+# 2. Tiering: the boundaries, and the regressions each one fixed
 # ══════════════════════════════════════════════════════════════════
 
 class TestRiskTiering:
     """
-    Tiers are threshold-relative. CRITICAL is the midpoint from the operating
-    threshold to certainty, not a fixed 0.85 and not `threshold * 1.5`.
+    Tiers are anchored to two numbers, and to different ones on purpose. CRITICAL
+    is the midpoint from the operating threshold to certainty — not a fixed 0.85
+    and not `threshold * 1.5`. The step-up floor is the cost model's break-even
+    probability — not a fraction of the threshold, which is the number the cost
+    model has nothing to say about.
     """
 
     @pytest.mark.parametrize("score,expected", [
-        (0.05, RiskLevel.LOW),       # below 0.6 * threshold
-        (0.20, RiskLevel.LOW),
-        (0.35, RiskLevel.MEDIUM),    # in [0.30, 0.50)
-        (0.50, RiskLevel.HIGH),      # in [0.50, 0.75)
-        (0.85, RiskLevel.CRITICAL),  # >= 0.75 = 0.5 + (1-0.5)/2
+        (0.05, RiskLevel.LOW),           # below p* = 0.069767
+        (BREAK_EVEN, RiskLevel.MEDIUM),  # the floor itself is inclusive
+        (0.20, RiskLevel.MEDIUM),        # was LOW under `threshold * 0.6`
+        (0.35, RiskLevel.MEDIUM),
+        (0.50, RiskLevel.HIGH),          # in [0.50, 0.75)
+        (0.85, RiskLevel.CRITICAL),      # >= 0.75 = 0.5 + (1-0.5)/2
         (0.99, RiskLevel.CRITICAL),
     ])
     def test_classification_at_threshold_half(self, score, expected):
-        assert classify_risk(score, threshold=0.5) == expected
+        assert classify_risk(score, 0.5, BREAK_EVEN) == expected
+
+    def test_no_score_above_break_even_is_ever_allowed(self):
+        """
+        THE REGRESSION, at the real operating point.
+
+        The step-up floor was `threshold * 0.6` = 0.3545 at the shipped threshold
+        of 0.5908, so every score in [0.0698, 0.3545) came back LOW and ALLOW —
+        including 0.2665, the cutoff the test-set oracle picked, and 0.2903, the
+        mean predicted probability of the [0.2, 0.4) reliability bin. Above p* the
+        cost model prices an account as worth more than nothing, and ALLOW is
+        nothing.
+        """
+        for score in (BREAK_EVEN, 0.1, 0.2665, 0.2903, 0.3544, 0.35450, 0.5):
+            level = classify_risk(score, SHIPPED_THRESHOLD, BREAK_EVEN)
+            assert level == RiskLevel.MEDIUM, (
+                f"score {score} at the shipped threshold tiered {level.value}"
+            )
+            assert determine_action(level) == ActionCode.REQUIRE_ADDITIONAL_AUTH
+
+    def test_the_step_up_floor_is_the_break_even_probability(self):
+        """
+        Stated directly, because it is an economic claim and not a tuning choice:
+        p* = fp_cost / (fp_cost + fn_cost) = 15,000 / 2,15,000.
+        """
+        assert medium_cutoff(SHIPPED_THRESHOLD, BREAK_EVEN) == BREAK_EVEN
+        assert BREAK_EVEN == pytest.approx(15_000 / (15_000 + 200_000), abs=1e-6)
+
+    def test_the_step_up_band_cannot_invert_under_a_low_override(self):
+        """
+        A caller may override the threshold to below p*. The floor is then the
+        threshold itself, leaving the band empty rather than inverted — a MEDIUM
+        floor above the HIGH floor would put scores in a band they are above.
+        """
+        assert medium_cutoff(0.05, BREAK_EVEN) == 0.05
+        assert classify_risk(0.06, 0.05, BREAK_EVEN) == RiskLevel.HIGH
+        assert classify_risk(0.04, 0.05, BREAK_EVEN) == RiskLevel.LOW
 
     def test_critical_cutoff_is_the_midpoint_to_certainty(self):
         for t in (0.07, 0.2, 0.5, 0.9):
@@ -152,6 +333,21 @@ class TestRiskTiering:
         cutoffs = [critical_cutoff(t) for t in (0.05, 0.1, 0.3, 0.6, 0.9)]
         assert cutoffs == sorted(cutoffs)
 
+    def test_the_tiers_are_ordered_across_the_whole_score_range(self):
+        """
+        One sweep, because the three boundaries are now set by two independent
+        numbers and a mistake in either would show up as a tier that goes
+        backwards. Scores rise, so tiers must never fall.
+        """
+        rank = {RiskLevel.LOW: 0, RiskLevel.MEDIUM: 1,
+                RiskLevel.HIGH: 2, RiskLevel.CRITICAL: 3}
+        for threshold in (0.07, SHIPPED_THRESHOLD, 0.95):
+            ranks = [rank[classify_risk(s / 1000.0, threshold, BREAK_EVEN)]
+                     for s in range(0, 1001)]
+            assert ranks == sorted(ranks), (
+                f"tiers are not monotone in the score at threshold {threshold}"
+            )
+
     def test_a_zero_threshold_is_rejected_not_all_critical(self):
         """
         THE REGRESSION. The old first branch was `score >= min(threshold*1.5,
@@ -160,18 +356,28 @@ class TestRiskTiering:
         error, so it can never again mark the entire population CRITICAL.
         """
         with pytest.raises(ValueError, match="threshold"):
-            classify_risk(0.0, threshold=0.0)
+            classify_risk(0.0, 0.0, BREAK_EVEN)
 
     @pytest.mark.parametrize("bad", [-0.1, 1.5, 2.0])
     def test_thresholds_outside_the_unit_interval_are_rejected(self, bad):
         with pytest.raises(ValueError, match="threshold"):
-            classify_risk(0.5, threshold=bad)
+            classify_risk(0.5, bad, BREAK_EVEN)
+
+    @pytest.mark.parametrize("bad", [0.0, -0.1, 1.5])
+    def test_a_break_even_that_is_not_a_probability_is_rejected(self, bad):
+        """
+        The floor has to come from somewhere real. Zero would put every non-zero
+        score into the step-up band, which is the mirror image of the zero-threshold
+        defect above, so it is refused rather than defaulted.
+        """
+        with pytest.raises(ValueError, match="break_even_probability"):
+            classify_risk(0.5, 0.5, bad)
 
     @pytest.mark.parametrize("bad", [-0.01, 1.01, 5.0])
     def test_scores_outside_the_unit_interval_are_rejected(self, bad):
         """A raw margin fed in as a probability is a bug worth catching loudly."""
         with pytest.raises(ValueError, match="risk_score"):
-            classify_risk(bad, threshold=0.5)
+            classify_risk(bad, 0.5, BREAK_EVEN)
 
     def test_the_reported_score_and_its_tier_cannot_contradict(self):
         """
@@ -181,9 +387,12 @@ class TestRiskTiering:
         from the number actually reported.
         """
         threshold = 0.0698
-        response = build_node_response("edge@upi", 0.06979994, threshold=threshold)
+        response = build_node_response(
+            "edge@upi", 0.06979994, threshold=threshold,
+            break_even_probability=BREAK_EVEN)
         assert response.risk_score == round(0.06979994, 6)
-        assert response.risk_level == classify_risk(response.risk_score, threshold)
+        assert response.risk_level == classify_risk(
+            response.risk_score, threshold, BREAK_EVEN)
 
 
 class TestRiskLevelToAction:
@@ -209,11 +418,11 @@ class TestBuildNodeResponse:
             node_id="suspect@upi",
             risk_score=0.95,
             threshold=0.5,
+            break_even_probability=BREAK_EVEN,
             contributing_factors=factors,
         )
         assert response.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL)
         assert response.action == ActionCode.HOLD_FOR_REVIEW
-        assert response.action.value not in FORBIDDEN_ACTIONS
         # The factors are the account's own, passed straight through — not a
         # global top-3 list. Two in, two out, same features.
         assert len(response.contributing_factors) == 2
@@ -221,7 +430,9 @@ class TestBuildNodeResponse:
             "pagerank", "fan_in_concentration"]
 
     def test_low_score_allows_and_needs_no_factors(self):
-        response = build_node_response("legit@upi", 0.05, threshold=0.5)
+        response = build_node_response(
+            "legit@upi", 0.05, threshold=0.5,
+            break_even_probability=BREAK_EVEN)
         assert response.risk_level == RiskLevel.LOW
         assert response.action == ActionCode.ALLOW
         assert response.contributing_factors == []
@@ -240,17 +451,20 @@ class TestBatchValidationCatchesForgery:
 
     def test_batch_of_honest_responses_passes(self):
         responses = [
-            build_node_response("a@upi", 0.9, threshold=0.5),
-            build_node_response("b@upi", 0.1, threshold=0.5),
-            build_node_response("c@upi", 0.5, threshold=0.5),
+            build_node_response("a@upi", 0.9, threshold=0.5,
+                                break_even_probability=BREAK_EVEN),
+            build_node_response("b@upi", 0.1, threshold=0.5,
+                                break_even_probability=BREAK_EVEN),
+            build_node_response("c@upi", 0.5, threshold=0.5,
+                                break_even_probability=BREAK_EVEN),
         ]
-        assert len(validate_response_batch(responses, threshold=0.5)) == 3
+        assert len(validate_response_batch(responses, 0.5, BREAK_EVEN)) == 3
 
     def test_a_critical_score_wearing_an_allow_is_rejected(self):
         """
         The alert-suppression bug the validator exists to stop. ALLOW is a
-        permitted action, so a forbidden-action screen alone lets this through;
-        only re-deriving the tier from the score catches it.
+        permitted action, so an action screen alone lets this through; only
+        re-deriving the tier from the score catches it.
         """
         forged = NodeRiskScore(
             node_id="mule@upi",
@@ -261,13 +475,13 @@ class TestBatchValidationCatchesForgery:
             seen_in_context=False,
         )
         with pytest.raises(DefenseOnlyViolation, match="does not follow"):
-            validate_response_batch([forged], threshold=0.5)
+            validate_response_batch([forged], 0.5, BREAK_EVEN)
 
     def test_a_correct_tier_with_a_downgraded_action_is_rejected(self):
         """
         Subtler: the TIER is right for the score, but the action was swapped for a
-        weaker one. Screening actions against the forbidden set passes (ALLOW is
-        fine); re-deriving the action from the tier is what catches the downgrade.
+        weaker one. Screening the action passes (ALLOW is permitted); re-deriving
+        the action from the tier is what catches the downgrade.
         """
         forged = NodeRiskScore(
             node_id="mule2@upi",
@@ -278,7 +492,7 @@ class TestBatchValidationCatchesForgery:
             seen_in_context=False,
         )
         with pytest.raises(DefenseOnlyViolation, match="does not follow"):
-            validate_response_batch([forged], threshold=0.5)
+            validate_response_batch([forged], 0.5, BREAK_EVEN)
 
     def test_validation_is_evaluated_at_the_batch_threshold(self):
         """
@@ -287,7 +501,23 @@ class TestBatchValidationCatchesForgery:
         the batch is re-checked at 0.95, where 0.6 falls to MEDIUM — proving the
         threshold argument is actually used, not ignored.
         """
-        response = build_node_response("x@upi", 0.6, threshold=0.5)  # HIGH at 0.5
-        validate_response_batch([response], threshold=0.5)           # consistent
+        response = build_node_response("x@upi", 0.6, threshold=0.5,
+                                       break_even_probability=BREAK_EVEN)
+        validate_response_batch([response], 0.5, BREAK_EVEN)      # consistent
         with pytest.raises(DefenseOnlyViolation):
-            validate_response_batch([response], threshold=0.95)      # now MEDIUM
+            validate_response_batch([response], 0.95, BREAK_EVEN)  # now MEDIUM
+
+    def test_validation_is_evaluated_at_the_batch_break_even_floor(self):
+        """
+        The same argument for the other boundary, which nothing checked before it
+        existed. A score of 0.2 is MEDIUM at p* = 0.0698 and LOW at p* = 0.5, so
+        re-validating the same response under a different cost model must raise —
+        otherwise the floor could be ignored inside the validator and no test would
+        notice.
+        """
+        response = build_node_response("y@upi", 0.2, threshold=0.5,
+                                       break_even_probability=BREAK_EVEN)
+        assert response.risk_level == RiskLevel.MEDIUM
+        validate_response_batch([response], 0.5, BREAK_EVEN)      # consistent
+        with pytest.raises(DefenseOnlyViolation, match="does not follow"):
+            validate_response_batch([response], 0.5, 0.5)

@@ -25,8 +25,24 @@ DESIGN RULES for anything added to FEATURE_COLS
 3. SCALE-FREE WHERE POSSIBLE, AND WINDOW-STABLE ALWAYS.
    Prefer bounded ratios over raw magnitudes. `community_size` was dropped in
    v3: it is a raw count that grows with the graph, and empirically it scored
-   test AUC 0.10 — i.e. it had become an inverted proxy for "am I in the giant
+   AUC 0.10 — i.e. it had become an inverted proxy for "am I in the giant
    organic blob", which is a property of the sample, not of fraud.
+
+   WHICH SPLIT SAID SO — AND THE ADMISSION THAT GOES WITH IT.
+   That 0.10 was originally measured on TEST, and this file used to cite it as
+   "test AUC 0.10". Dropping a feature on the strength of a test-split number is
+   selection on test: it makes the final evaluation partly a measurement of
+   choices that were themselves tuned against it, which is the exact discipline
+   the rest of this repo refuses to break (see models/cost_matrix.py on
+   threshold selection, and `sensitivity_to_cost_ratio`'s v3 note). The decision
+   stands, because the argument for it is a priori — a count that grows with the
+   graph is not comparable across windows regardless of what it scores — but the
+   number is no longer offered as the reason, and cannot now be re-measured on
+   validation because the column is not emitted any more. Feature-level
+   decisions from here on are made on VALIDATION (`FEATURE_DECISION_SPLIT`
+   below); the historical provenance is recorded rather than quietly deleted,
+   because a repo whose selling point is honest metrics does not get to launder
+   its own history.
 
    `in_amount_sum` and `out_amount_sum` are the two deliberate exceptions. They
    stay because the cost model in models/cost_matrix.py is denominated in rupees
@@ -48,9 +64,28 @@ DESIGN RULES for anything added to FEATURE_COLS
 
 4. NO FEATURE MAY ENCODE THE LABEL.
    The generator must not be able to plant a feature that separates classes by
-   construction. This is checked adversarially in tests/test_baselines.py,
-   which fails the build if any single feature reaches AUC >= 0.99 on the test
-   split. That guard is what keeps the reported metrics meaningful.
+   construction. The ceiling is `LEAKAGE_AUC_CEILING` (0.99) on the
+   direction-corrected single-feature AUC, and it is SCREENED ON VALIDATION —
+   `FEATURE_DECISION_SPLIT`. models/train.py's `single_feature_rule_baseline`
+   takes `screen_split` for exactly this and defaults it to validation, so the
+   number that can veto a feature never comes from test.
+
+   Why validation and not test: this ceiling is a decision gate. Reading it on
+   test and then acting on it — dropping a column, regenerating the data —
+   consumes the one evaluation the split exists for, and does so repeatedly,
+   which is how a "held-out" number becomes a fitted one. Validation is already
+   spent on early stopping and threshold selection, so spending it here costs
+   nothing that has not already been spent.
+
+   ADMISSION: through v3 this rule read "AUC >= 0.99 on the test split", and the
+   guard in tests/test_baselines.py still measures the shipped TEST table,
+   because its job is different — it is a post-hoc audit of published data
+   ("does the dataset in this repo match the claim in metrics.json?"), not an
+   input to any choice, and metrics.json's `strongest_single_feature_test_auc`
+   is the figure it reconciles against. Both numbers are now reported with the
+   split in their name. On the shipped v3 data the strongest single feature is
+   `cycle_participation` at 0.8485 on validation and 0.8708 on test — the gate
+   fires on the first of those.
 
 5. STABLE UNDER GRAPH CHANGES THAT DO NOT TOUCH THE ACCOUNT.
    Adding an unrelated account, or a transaction between two strangers, must not
@@ -88,8 +123,10 @@ DESIGN RULES for anything added to FEATURE_COLS
 v2 → v3 CHANGES
 ─────────────────────────────────────────────────────────────────────────────
 DROPPED
-  community_size    Raw count, scale-dependent (rule 3). Test AUC 0.10 — an
-                    inverted proxy for organic-blob membership.
+  community_size    Raw count, scale-dependent (rule 3). AUC 0.10 — an
+                    inverted proxy for organic-blob membership. (That figure was
+                    read on test; see rule 3. The scale argument, not the
+                    figure, is what carries the decision.)
   net_flow          Redundant. `in_amount_sum - out_amount_sum` is a linear
                     combination of two features already in the list, and
                     `flow_passthrough` already expresses the pass-through
@@ -116,12 +153,22 @@ ADDED
 
 KEPT BUT NO LONGER LOAD-BEARING
   repeat_ratio      Still informative, but the v2 generator made it a
-                    giveaway (test AUC 0.9989) by drawing organic
+                    giveaway (AUC 0.9989) by drawing organic
                     counterparties i.i.d., so legitimate accounts essentially
                     never paid anyone twice. Real users repeat constantly. The
                     v3 generator gives organic accounts recurring
                     relationships, which is what moves this feature from
-                    "artifact" to "signal".
+                    "artifact" to "signal": on v3 data it scores 0.6315 on
+                    validation (0.6632 on test), comfortably below the rule-4
+                    ceiling.
+
+                    Provenance, stated rather than tidied away: the 0.9989 was
+                    a TEST-split reading, and it is the number that triggered
+                    the v2 → v3 generator rewrite — a dataset-level decision
+                    made on test. It cannot be re-measured on validation now
+                    because the v2 data no longer exists; the two v3 figures
+                    above are the ones that can be, and the validation one is
+                    what rule 4 screens.
 """
 
 from __future__ import annotations
@@ -160,6 +207,32 @@ FEATURE_COLS: list[str] = [
 ]
 
 TARGET_COL = "is_mule"
+
+# ──────────────────────────────────────────────────────────────────
+# Which split is allowed to decide things (design rules 3 and 4)
+# ──────────────────────────────────────────────────────────────────
+
+# The split any FEATURE-LEVEL decision must be measured on: dropping a column,
+# demoting one, or firing the leakage gate below. Test is reserved for the single
+# final evaluation, and a feature set chosen against test turns that evaluation
+# into a partial measurement of its own selection — the same failure as tuning a
+# threshold on test, just one level up and harder to see.
+#
+# It lives here, next to the contract, because the contract IS the accumulated
+# result of those decisions; a constant in models/train.py would be invisible to
+# anyone reading the list of features to find out how it was chosen.
+FEATURE_DECISION_SPLIT = "val"
+
+# Rule 4's ceiling on direction-corrected single-feature AUC. Above this, one
+# column essentially solves the task and the generator planted the label rather
+# than the model learning it, so every downstream metric is theatre.
+#
+# Declared here rather than in models/train.py so the number the contract cites
+# and the number the code enforces cannot drift: train.py imports it (and keeps
+# re-exporting the name `LEAKAGE_AUC_CEILING`, which tests/test_baselines.py
+# imports to assert agreement), and `single_feature_rule_baseline(screen_split=)`
+# defaults to FEATURE_DECISION_SPLIT above.
+LEAKAGE_AUC_CEILING = 0.99
 
 # Analyst-facing descriptions. api/main.py returns these alongside per-node
 # SHAP attributions so a reviewer sees "money in ≈ money out" rather than

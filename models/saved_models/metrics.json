@@ -1,0 +1,964 @@
+{
+  "roc_auc": 0.9693360156231619,
+  "optimal_threshold": 0.18356411904096603,
+  "precision": 0.3354,
+  "recall": 0.871,
+  "f1": 0.4843,
+  "total_cost": 6410000.0,
+  "feature_importance": {
+    "in_degree": 0.021666552871465683,
+    "out_degree": 0.03734293952584267,
+    "degree_ratio": 0.0360909141600132,
+    "degree_balance": 0.04394171014428139,
+    "in_amount_sum": 0.04506184533238411,
+    "out_amount_sum": 0.11020827293395996,
+    "flow_passthrough": 0.030513644218444824,
+    "pagerank": 0.044858481734991074,
+    "clustering_coefficient": 0.026911525055766106,
+    "cycle_participation": 0.20789022743701935,
+    "reciprocity": 0.04091935604810715,
+    "fan_in_concentration": 0.031339872628450394,
+    "txn_velocity": 0.029438335448503494,
+    "burst_ratio": 0.050808463245630264,
+    "amount_cv": 0.07338893413543701,
+    "counterparty_amount_cv": 0.1120043620467186,
+    "repeat_ratio": 0.02910798415541649,
+    "community_internal_ratio": 0.028506582602858543
+  },
+  "model_version": "sentinel_v3",
+  "model_file": "sentinel_v3.xgb",
+  "trained_at": "2026-08-27T09:15:43+00:00",
+  "n_features": 18,
+  "feature_cols": [
+    "in_degree",
+    "out_degree",
+    "degree_ratio",
+    "degree_balance",
+    "in_amount_sum",
+    "out_amount_sum",
+    "flow_passthrough",
+    "pagerank",
+    "clustering_coefficient",
+    "cycle_participation",
+    "reciprocity",
+    "fan_in_concentration",
+    "txn_velocity",
+    "burst_ratio",
+    "amount_cv",
+    "counterparty_amount_cv",
+    "repeat_ratio",
+    "community_internal_ratio"
+  ],
+  "n_train_accounts": 3096,
+  "hyperparameters": {
+    "max_depth": 4,
+    "min_child_weight": 5.0,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "reg_lambda": 2.0,
+    "n_estimators": 500,
+    "eval_metric": "aucpr",
+    "importance_type": "gain",
+    "tree_method": "hist",
+    "random_state": 42,
+    "n_jobs": -1,
+    "verbosity": 0,
+    "early_stopping_rounds": 30,
+    "best_iteration": 191
+  },
+  "threshold_selected_on": "validation",
+  "roc_auc_ci_95": [
+    0.9474100394187659,
+    0.9877926054396371
+  ],
+  "average_precision": 0.803679290390711,
+  "cost_config": {
+    "fn_cost": 200000.0,
+    "fp_cost": 15000.0,
+    "fn_fp_ratio": 13.3333,
+    "break_even_probability": 0.069767,
+    "alert_budget_per_1000": 20.0
+  },
+  "dataset": {
+    "train": {
+      "n_accounts": 3096,
+      "n_positives": 209,
+      "prevalence": 0.067506,
+      "n_rings": 40,
+      "positives_by_archetype": {
+        "fast_cycle": 67,
+        "layered_fanin": 40,
+        "stealth_cycle": 102
+      }
+    },
+    "val": {
+      "n_accounts": 2947,
+      "n_positives": 136,
+      "prevalence": 0.046149,
+      "n_rings": 24,
+      "positives_by_archetype": {
+        "fast_cycle": 36,
+        "layered_fanin": 28,
+        "stealth_cycle": 72
+      }
+    },
+    "test": {
+      "n_accounts": 2866,
+      "n_positives": 124,
+      "prevalence": 0.043266,
+      "n_rings": 24,
+      "positives_by_archetype": {
+        "fast_cycle": 36,
+        "layered_fanin": 25,
+        "stealth_cycle": 63
+      }
+    }
+  },
+  "split_integrity": {
+    "rings_disjoint": true,
+    "positives_disjoint": true,
+    "recurring_legitimate_accounts": {
+      "train|val": 2887,
+      "train|test": 2808,
+      "val|test": 2809
+    },
+    "recruited_from_earlier_window": {
+      "val_from_train": {
+        "n_accounts": 78,
+        "share_of_later_positives": 0.5735
+      },
+      "test_from_train": {
+        "n_accounts": 67,
+        "share_of_later_positives": 0.5403
+      },
+      "test_from_val": {
+        "n_accounts": 67,
+        "share_of_later_positives": 0.5403
+      }
+    },
+    "ex_mules_returning_to_service": {
+      "train_into_val": {
+        "n_accounts": 0
+      },
+      "train_into_test": {
+        "n_accounts": 0
+      },
+      "val_into_test": {
+        "n_accounts": 0
+      }
+    },
+    "min_recruited_mule_rate": 0.15
+  },
+  "feature_importance_mean_abs_shap": {
+    "in_degree": 0.0018298221749056328,
+    "out_degree": 0.018905970436780502,
+    "degree_ratio": 0.02167824274667569,
+    "degree_balance": 0.026680239948968076,
+    "in_amount_sum": 0.08384728041965829,
+    "out_amount_sum": 0.17550139456618266,
+    "flow_passthrough": 0.02065035537258245,
+    "pagerank": 0.044482856776616155,
+    "clustering_coefficient": 0.011131332693144558,
+    "cycle_participation": 0.20355205013265726,
+    "reciprocity": 0.08219010703285183,
+    "fan_in_concentration": 0.042313194580071,
+    "txn_velocity": 0.013462283671225431,
+    "burst_ratio": 0.0609012539724455,
+    "amount_cv": 0.05225039793314725,
+    "counterparty_amount_cv": 0.09243348207491922,
+    "repeat_ratio": 0.027498694434737906,
+    "community_internal_ratio": 0.02069104103243048
+  },
+  "validation": {
+    "auc": 0.9779464080189173,
+    "average_precision": 0.8386738033091959,
+    "cost_optimal": {
+      "threshold": 0.183564,
+      "tp": 124,
+      "fp": 207,
+      "tn": 2604,
+      "fn": 12,
+      "precision": 0.3746,
+      "recall": 0.9118,
+      "f1": 0.531,
+      "total_cost": 5505000.0,
+      "cost_per_prediction": 1868.0,
+      "alert_rate": 0.1123,
+      "alerts_per_1000_accounts": 112.3,
+      "plateau_lo": 0.183384,
+      "plateau_hi": 0.183744,
+      "plateau_width": 0.000361,
+      "n_cost_equivalent_thresholds": 1
+    },
+    "capacity_constrained": {
+      "threshold": 0.977612,
+      "tp": 57,
+      "fp": 1,
+      "tn": 2810,
+      "fn": 79,
+      "precision": 0.9828,
+      "recall": 0.4191,
+      "f1": 0.5876,
+      "total_cost": 15815000.0,
+      "cost_per_prediction": 5366.47,
+      "alert_rate": 0.0197,
+      "alerts_per_1000_accounts": 19.7,
+      "plateau_lo": null,
+      "plateau_hi": null,
+      "plateau_width": null,
+      "n_cost_equivalent_thresholds": 1
+    }
+  },
+  "test": {
+    "auc": 0.9693360156231619,
+    "auc_ci_95": [
+      0.9474100394187659,
+      0.9877926054396371
+    ],
+    "auc_ci_95_method": "cluster bootstrap, 1000 rounds, resampling 24 rings and each non-member account as a singleton",
+    "auc_ci_95_iid_accounts_diagnostic": {
+      "ci": [
+        0.9536894037921483,
+        0.9819831471452869
+      ],
+      "warning": "DIAGNOSTIC ONLY \u2014 assumes ring members are independent observations, which they are not. Recorded to show the size of the understatement; never quote this interval."
+    },
+    "average_precision": 0.803679290390711,
+    "average_precision_trivial": 0.043266,
+    "at_selected_threshold": {
+      "threshold": 0.183564,
+      "tp": 108,
+      "fp": 214,
+      "tn": 2528,
+      "fn": 16,
+      "precision": 0.3354,
+      "recall": 0.871,
+      "f1": 0.4843,
+      "total_cost": 6410000.0,
+      "cost_per_prediction": 2236.57,
+      "alert_rate": 0.1124,
+      "alerts_per_1000_accounts": 112.4,
+      "plateau_lo": null,
+      "plateau_hi": null,
+      "plateau_width": null,
+      "n_cost_equivalent_thresholds": 1
+    },
+    "at_capacity_threshold": {
+      "threshold": 0.977612,
+      "tp": 49,
+      "fp": 1,
+      "tn": 2741,
+      "fn": 75,
+      "precision": 0.98,
+      "recall": 0.3952,
+      "f1": 0.5632,
+      "total_cost": 15015000.0,
+      "cost_per_prediction": 5239.01,
+      "alert_rate": 0.0174,
+      "alerts_per_1000_accounts": 17.4,
+      "plateau_lo": null,
+      "plateau_hi": null,
+      "plateau_width": null,
+      "n_cost_equivalent_thresholds": 1
+    },
+    "oracle_threshold_diagnostic": {
+      "threshold": 0.54077,
+      "tp": 101,
+      "fp": 84,
+      "tn": 2658,
+      "fn": 23,
+      "precision": 0.5459,
+      "recall": 0.8145,
+      "f1": 0.6537,
+      "total_cost": 5860000.0,
+      "cost_per_prediction": 2044.66,
+      "alert_rate": 0.0645,
+      "alerts_per_1000_accounts": 64.5,
+      "plateau_lo": 0.539316,
+      "plateau_hi": 0.542223,
+      "plateau_width": 0.002907,
+      "n_cost_equivalent_thresholds": 1,
+      "cost_of_not_peeking_at_test": 550000.0,
+      "warning": "DIAGNOSTIC ONLY \u2014 this threshold was chosen using test labels. Never quote these numbers as performance."
+    },
+    "recall_breakdown": {
+      "by_archetype_accounts": {
+        "fast_cycle": {
+          "n_accounts": 36,
+          "detected": 36,
+          "account_recall": 1.0,
+          "n_mule_accounts": 36,
+          "accounts_flagged": 36,
+          "accounts_missed": 0,
+          "denominator": "labelled mule accounts attributed to this archetype",
+          "mean_score": 0.9715,
+          "median_score": 0.9959
+        },
+        "layered_fanin": {
+          "n_accounts": 25,
+          "detected": 24,
+          "account_recall": 0.96,
+          "n_mule_accounts": 25,
+          "accounts_flagged": 24,
+          "accounts_missed": 1,
+          "denominator": "labelled mule accounts attributed to this archetype",
+          "mean_score": 0.8645,
+          "median_score": 0.9729
+        },
+        "stealth_cycle": {
+          "n_accounts": 63,
+          "detected": 48,
+          "account_recall": 0.7619,
+          "n_mule_accounts": 63,
+          "accounts_flagged": 48,
+          "accounts_missed": 15,
+          "denominator": "labelled mule accounts attributed to this archetype",
+          "mean_score": 0.6326,
+          "median_score": 0.8102
+        }
+      },
+      "by_archetype_rings": {
+        "fast_cycle": {
+          "n_rings": 8,
+          "rings_with_an_alert": 8,
+          "rings_with_no_alert": 0,
+          "ring_recall": 1.0,
+          "mean_share_of_ring_flagged": 1.0,
+          "denominator": "rings of this archetype in the split; a ring counts as detected if at least one attributed member is flagged"
+        },
+        "layered_fanin": {
+          "n_rings": 6,
+          "rings_with_an_alert": 6,
+          "rings_with_no_alert": 0,
+          "ring_recall": 1.0,
+          "mean_share_of_ring_flagged": 0.9667,
+          "denominator": "rings of this archetype in the split; a ring counts as detected if at least one attributed member is flagged"
+        },
+        "stealth_cycle": {
+          "n_rings": 10,
+          "rings_with_an_alert": 10,
+          "rings_with_no_alert": 0,
+          "ring_recall": 1.0,
+          "mean_share_of_ring_flagged": 0.7865,
+          "denominator": "rings of this archetype in the split; a ring counts as detected if at least one attributed member is flagged"
+        }
+      },
+      "overall_ring_recall": 1.0,
+      "n_rings": 24,
+      "rings_with_an_alert": 24,
+      "rings_with_no_alert": 0,
+      "n_mule_accounts": 124,
+      "accounts_flagged": 108,
+      "accounts_missed": 16,
+      "overall_account_recall": 0.871,
+      "denominators": {
+        "account_recall": "flagged mule accounts / labelled mule accounts in the split",
+        "ring_recall": "rings with >= 1 flagged member / distinct ring_ids in the split",
+        "warning": "different denominators \u2014 never subtract or average across the two levels. Ring recall saturates with ring size, so it is the operationally useful figure and the flattering one at once."
+      },
+      "ring_attribution": {
+        "rule": "data.extractor.label_nodes keeps the FIRST ring each account appears in, so ring_id/ring_type is an attribution, not full membership",
+        "consequence": "an account in two rings is counted under one of them; a ring detected only through such an account can read as escaped, and archetype account counts can be short or long by those accounts. Measured on shipped v3 test data: 4 of 119 positives are in two rings, 2 of them across archetypes, and 4 of 24 rings show one fewer member than the generator built."
+      }
+    },
+    "calibration": {
+      "brier_score": 0.029664,
+      "expected_calibration_error": 0.0439,
+      "mean_predicted_probability": 0.0872,
+      "actual_prevalence": 0.0433,
+      "reliability": [
+        {
+          "bin": "[0.0, 0.2)",
+          "n": 2555,
+          "mean_predicted": 0.0202,
+          "observed_rate": 0.0063
+        },
+        {
+          "bin": "[0.2, 0.4)",
+          "n": 90,
+          "mean_predicted": 0.2903,
+          "observed_rate": 0.0778
+        },
+        {
+          "bin": "[0.4, 0.6)",
+          "n": 53,
+          "mean_predicted": 0.5044,
+          "observed_rate": 0.0943
+        },
+        {
+          "bin": "[0.6, 0.8)",
+          "n": 54,
+          "mean_predicted": 0.7118,
+          "observed_rate": 0.1481
+        },
+        {
+          "bin": "[0.8, 1.0)",
+          "n": 114,
+          "mean_predicted": 0.9386,
+          "observed_rate": 0.7719
+        }
+      ],
+      "note": "scale_pos_weight inflates scores on purpose; the operating threshold is chosen empirically on validation, not from p*."
+    }
+  },
+  "baselines": {
+    "trivial": {
+      "flag_nothing": {
+        "test_precision": null,
+        "test_recall": 0.0,
+        "test_f1": null,
+        "test_total_cost": 24800000.0,
+        "test_alerts_per_1000": 0.0
+      },
+      "flag_everything": {
+        "test_precision": 0.0433,
+        "test_recall": 1.0,
+        "test_f1": 0.0829,
+        "test_total_cost": 41130000.0,
+        "test_alerts_per_1000": 1000.0
+      },
+      "cheapest_trivial_policy_cost": 24800000.0
+    },
+    "best_single_feature_rule_by_cost": {
+      "selected_on": "validation",
+      "criterion": "cost",
+      "rule": "cycle_participation >= 0.0524",
+      "feature": "cycle_participation",
+      "direction": "high",
+      "threshold_on_score": 0.052381,
+      "test_precision": 0.164,
+      "test_recall": 0.9194,
+      "test_f1": 0.2784,
+      "test_total_cost": 10715000.0,
+      "test_alerts_per_1000": 242.5,
+      "top_10_rules": [
+        {
+          "feature": "cycle_participation",
+          "direction": "high",
+          "rule": "cycle_participation >= 0.0524",
+          "threshold_on_score": 0.052381,
+          "val_cost": 12225000.0,
+          "val_f1": 0.250229990800368,
+          "screen_auc": 0.8745330843116329,
+          "test_auc": 0.867816345497753,
+          "test_precision": 0.164,
+          "test_recall": 0.9194,
+          "test_f1": 0.2784,
+          "test_total_cost": 10715000.0,
+          "test_alerts_per_1000": 242.5
+        },
+        {
+          "feature": "counterparty_amount_cv",
+          "direction": "low",
+          "rule": "counterparty_amount_cv <= 1.2444",
+          "threshold_on_score": -1.244439,
+          "val_cost": 15170000.0,
+          "val_f1": 0.25029797377830754,
+          "screen_auc": 0.7944917027643501,
+          "test_auc": 0.769078962847933,
+          "test_precision": 0.1306,
+          "test_recall": 0.75,
+          "test_f1": 0.2225,
+          "test_total_cost": 15485000.0,
+          "test_alerts_per_1000": 248.4
+        },
+        {
+          "feature": "amount_cv",
+          "direction": "low",
+          "rule": "amount_cv <= 1.2580",
+          "threshold_on_score": -1.258035,
+          "val_cost": 15805000.0,
+          "val_f1": 0.25096030729833546,
+          "screen_auc": 0.7960794776822149,
+          "test_auc": 0.7757199830592222,
+          "test_precision": 0.1271,
+          "test_recall": 0.6774,
+          "test_f1": 0.214,
+          "test_total_cost": 16655000.0,
+          "test_alerts_per_1000": 230.6
+        },
+        {
+          "feature": "out_amount_sum",
+          "direction": "high",
+          "rule": "out_amount_sum >= 165691.7200",
+          "threshold_on_score": 165691.72,
+          "val_cost": 16545000.0,
+          "val_f1": 0.23282887077997674,
+          "screen_auc": 0.7914207838952017,
+          "test_auc": 0.7702524646478907,
+          "test_precision": 0.1271,
+          "test_recall": 0.7258,
+          "test_f1": 0.2163,
+          "test_total_cost": 16070000.0,
+          "test_alerts_per_1000": 247.0
+        },
+        {
+          "feature": "in_amount_sum",
+          "direction": "high",
+          "rule": "in_amount_sum >= 292727.6000",
+          "threshold_on_score": 292727.6,
+          "val_cost": 17770000.0,
+          "val_f1": 0.2186421173762946,
+          "screen_auc": 0.7436462845543768,
+          "test_auc": 0.7454354015199642,
+          "test_precision": 0.1248,
+          "test_recall": 0.7016,
+          "test_f1": 0.2119,
+          "test_total_cost": 16550000.0,
+          "test_alerts_per_1000": 243.2
+        },
+        {
+          "feature": "pagerank",
+          "direction": "high",
+          "rule": "pagerank >= 0.0001",
+          "threshold_on_score": 0.000143,
+          "val_cost": 20590000.0,
+          "val_f1": 0.17537942664418213,
+          "screen_auc": 0.7541721597924121,
+          "test_auc": 0.7863903202277593,
+          "test_precision": 0.0976,
+          "test_recall": 0.871,
+          "test_f1": 0.1756,
+          "test_total_cost": 18170000.0,
+          "test_alerts_per_1000": 385.9
+        },
+        {
+          "feature": "burst_ratio",
+          "direction": "high",
+          "rule": "burst_ratio >= 0.1277",
+          "threshold_on_score": 0.127717,
+          "val_cost": 20910000.0,
+          "val_f1": 0.27586206896551724,
+          "screen_auc": 0.6426577834976039,
+          "test_auc": 0.6919763652619938,
+          "test_precision": 0.248,
+          "test_recall": 0.25,
+          "test_f1": 0.249,
+          "test_total_cost": 20010000.0,
+          "test_alerts_per_1000": 43.6
+        },
+        {
+          "feature": "out_degree",
+          "direction": "low",
+          "rule": "out_degree <= 3.5000",
+          "threshold_on_score": -3.5,
+          "val_cost": 22375000.0,
+          "val_f1": 0.17638691322901848,
+          "screen_auc": 0.6361118086508883,
+          "test_auc": 0.6360512105597516,
+          "test_precision": 0.0998,
+          "test_recall": 0.4839,
+          "test_f1": 0.1655,
+          "test_total_cost": 20915000.0,
+          "test_alerts_per_1000": 209.7
+        },
+        {
+          "feature": "repeat_ratio",
+          "direction": "high",
+          "rule": "repeat_ratio >= 4.5442",
+          "threshold_on_score": 4.544156,
+          "val_cost": 22480000.0,
+          "val_f1": 0.1794871794871795,
+          "screen_auc": 0.6738992822315693,
+          "test_auc": 0.6530390461400908,
+          "test_precision": 0.0876,
+          "test_recall": 0.3306,
+          "test_f1": 0.1385,
+          "test_total_cost": 23005000.0,
+          "test_alerts_per_1000": 163.3
+        },
+        {
+          "feature": "degree_ratio",
+          "direction": "low",
+          "rule": "degree_ratio <= 1.5357",
+          "threshold_on_score": -1.535714,
+          "val_cost": 23945000.0,
+          "val_f1": 0.15328467153284672,
+          "screen_auc": 0.6915426789712683,
+          "test_auc": 0.7063363214983177,
+          "test_precision": 0.0992,
+          "test_recall": 0.5242,
+          "test_f1": 0.1669,
+          "test_total_cost": 20650000.0,
+          "test_alerts_per_1000": 228.5
+        }
+      ],
+      "leakage_screen": {
+        "split": "val",
+        "feature": "cycle_participation",
+        "auc": 0.8745,
+        "raw_auc": 0.8745,
+        "inverted": false,
+        "ceiling": 0.99,
+        "note": "Decision gate, measured on the split named above so that acting on it does not spend the test split. Compare with strongest_single_feature_test_auc, which is descriptive only."
+      },
+      "strongest_single_feature_test_auc": {
+        "feature": "cycle_participation",
+        "auc": 0.8678,
+        "raw_auc": 0.8678,
+        "inverted": false,
+        "ceiling": 0.99
+      }
+    },
+    "best_single_feature_rule_by_f1": {
+      "selected_on": "validation",
+      "criterion": "f1",
+      "rule": "cycle_participation >= 0.4516",
+      "feature": "cycle_participation",
+      "direction": "high",
+      "threshold_on_score": 0.451613,
+      "test_precision": 0.2145,
+      "test_recall": 0.4758,
+      "test_f1": 0.2957,
+      "test_total_cost": 16240000.0,
+      "test_alerts_per_1000": 96.0,
+      "top_10_rules": [
+        {
+          "feature": "cycle_participation",
+          "direction": "high",
+          "rule": "cycle_participation >= 0.4516",
+          "threshold_on_score": 0.451613,
+          "val_cost": 16020000.0,
+          "val_f1": 0.30210325047801145,
+          "screen_auc": 0.8745330843116329,
+          "test_auc": 0.867816345497753,
+          "test_precision": 0.2145,
+          "test_recall": 0.4758,
+          "test_f1": 0.2957,
+          "test_total_cost": 16240000.0,
+          "test_alerts_per_1000": 96.0
+        },
+        {
+          "feature": "out_amount_sum",
+          "direction": "high",
+          "rule": "out_amount_sum >= 305563.0600",
+          "threshold_on_score": 305563.06,
+          "val_cost": 17280000.0,
+          "val_f1": 0.28023032629558536,
+          "screen_auc": 0.7914207838952017,
+          "test_auc": 0.7702524646478907,
+          "test_precision": 0.1543,
+          "test_recall": 0.4677,
+          "test_f1": 0.232,
+          "test_total_cost": 17970000.0,
+          "test_alerts_per_1000": 131.2
+        },
+        {
+          "feature": "burst_ratio",
+          "direction": "high",
+          "rule": "burst_ratio >= 0.1379",
+          "threshold_on_score": 0.137931,
+          "val_cost": 21400000.0,
+          "val_f1": 0.27888446215139445,
+          "screen_auc": 0.6426577834976039,
+          "test_auc": 0.6919763652619938,
+          "test_precision": 0.2762,
+          "test_recall": 0.2339,
+          "test_f1": 0.2533,
+          "test_total_cost": 20140000.0,
+          "test_alerts_per_1000": 36.6
+        },
+        {
+          "feature": "amount_cv",
+          "direction": "low",
+          "rule": "amount_cv <= 1.1247",
+          "threshold_on_score": -1.124724,
+          "val_cost": 16030000.0,
+          "val_f1": 0.26686656671664166,
+          "screen_auc": 0.7960794776822149,
+          "test_auc": 0.7757199830592222,
+          "test_precision": 0.14,
+          "test_recall": 0.621,
+          "test_f1": 0.2285,
+          "test_total_cost": 16495000.0,
+          "test_alerts_per_1000": 191.9
+        },
+        {
+          "feature": "counterparty_amount_cv",
+          "direction": "low",
+          "rule": "counterparty_amount_cv <= 1.1687",
+          "threshold_on_score": -1.168661,
+          "val_cost": 15440000.0,
+          "val_f1": 0.26373626373626374,
+          "screen_auc": 0.7944917027643501,
+          "test_auc": 0.769078962847933,
+          "test_precision": 0.1322,
+          "test_recall": 0.629,
+          "test_f1": 0.2185,
+          "test_total_cost": 16880000.0,
+          "test_alerts_per_1000": 205.9
+        },
+        {
+          "feature": "in_amount_sum",
+          "direction": "high",
+          "rule": "in_amount_sum >= 320103.7900",
+          "threshold_on_score": 320103.79,
+          "val_cost": 18085000.0,
+          "val_f1": 0.22601839684625494,
+          "screen_auc": 0.7436462845543768,
+          "test_auc": 0.7454354015199642,
+          "test_precision": 0.1304,
+          "test_recall": 0.6371,
+          "test_f1": 0.2164,
+          "test_total_cost": 16905000.0,
+          "test_alerts_per_1000": 211.4
+        },
+        {
+          "feature": "repeat_ratio",
+          "direction": "high",
+          "rule": "repeat_ratio >= 5.2727",
+          "threshold_on_score": 5.272727,
+          "val_cost": 22840000.0,
+          "val_f1": 0.19487179487179487,
+          "screen_auc": 0.6738992822315693,
+          "test_auc": 0.6530390461400908,
+          "test_precision": 0.1235,
+          "test_recall": 0.25,
+          "test_f1": 0.1653,
+          "test_total_cost": 21900000.0,
+          "test_alerts_per_1000": 87.6
+        },
+        {
+          "feature": "pagerank",
+          "direction": "high",
+          "rule": "pagerank >= 0.0002",
+          "threshold_on_score": 0.000168,
+          "val_cost": 20805000.0,
+          "val_f1": 0.17786187322611163,
+          "screen_auc": 0.7541721597924121,
+          "test_auc": 0.7863903202277593,
+          "test_precision": 0.1068,
+          "test_recall": 0.7984,
+          "test_f1": 0.1884,
+          "test_total_cost": 17420000.0,
+          "test_alerts_per_1000": 323.4
+        },
+        {
+          "feature": "out_degree",
+          "direction": "low",
+          "rule": "out_degree <= 3.0000",
+          "threshold_on_score": -3.0,
+          "val_cost": 22375000.0,
+          "val_f1": 0.17638691322901848,
+          "screen_auc": 0.6361118086508883,
+          "test_auc": 0.6360512105597516,
+          "test_precision": 0.0998,
+          "test_recall": 0.4839,
+          "test_f1": 0.1655,
+          "test_total_cost": 20915000.0,
+          "test_alerts_per_1000": 209.7
+        },
+        {
+          "feature": "degree_ratio",
+          "direction": "low",
+          "rule": "degree_ratio <= 1.5000",
+          "threshold_on_score": -1.5,
+          "val_cost": 23945000.0,
+          "val_f1": 0.15328467153284672,
+          "screen_auc": 0.6915426789712683,
+          "test_auc": 0.7063363214983177,
+          "test_precision": 0.0992,
+          "test_recall": 0.5242,
+          "test_f1": 0.1669,
+          "test_total_cost": 20650000.0,
+          "test_alerts_per_1000": 228.5
+        }
+      ],
+      "leakage_screen": {
+        "split": "val",
+        "feature": "cycle_participation",
+        "auc": 0.8745,
+        "raw_auc": 0.8745,
+        "inverted": false,
+        "ceiling": 0.99,
+        "note": "Decision gate, measured on the split named above so that acting on it does not spend the test split. Compare with strongest_single_feature_test_auc, which is descriptive only."
+      },
+      "strongest_single_feature_test_auc": {
+        "feature": "cycle_participation",
+        "auc": 0.8678,
+        "raw_auc": 0.8678,
+        "inverted": false,
+        "ceiling": 0.99
+      }
+    },
+    "logistic_regression": {
+      "selected_on": "validation",
+      "threshold": 0.415494,
+      "test_auc": 0.8975,
+      "test_average_precision": 0.421,
+      "test_precision": 0.2463,
+      "test_recall": 0.8065,
+      "test_f1": 0.3774,
+      "test_total_cost": 9390000.0,
+      "test_alerts_per_1000": 141.7,
+      "preprocessing": "log1p on non-negative columns with train skew >= 1.5, then train-fit z-score",
+      "log1p_columns": [
+        "burst_ratio",
+        "clustering_coefficient",
+        "community_internal_ratio",
+        "cycle_participation",
+        "degree_ratio",
+        "in_amount_sum",
+        "in_degree",
+        "out_amount_sum",
+        "out_degree",
+        "pagerank",
+        "repeat_ratio",
+        "txn_velocity"
+      ],
+      "coefficients_standardised": {
+        "in_degree": -2.9995,
+        "in_amount_sum": 2.1355,
+        "degree_ratio": -1.9654,
+        "out_amount_sum": 1.8446,
+        "community_internal_ratio": -1.6112,
+        "cycle_participation": 0.9962,
+        "repeat_ratio": -0.9287,
+        "fan_in_concentration": -0.8352,
+        "txn_velocity": 0.6989,
+        "flow_passthrough": 0.6769,
+        "burst_ratio": 0.5722,
+        "out_degree": -0.3049,
+        "clustering_coefficient": -0.2933,
+        "reciprocity": -0.2071,
+        "degree_balance": 0.1969,
+        "counterparty_amount_cv": -0.1441,
+        "amount_cv": -0.1376,
+        "pagerank": 0.0692
+      }
+    },
+    "xgboost_without_graph_features": {
+      "selected_on": "validation",
+      "features_removed": [
+        "pagerank",
+        "clustering_coefficient",
+        "cycle_participation",
+        "reciprocity",
+        "community_internal_ratio"
+      ],
+      "n_features": 13,
+      "threshold": 0.350016,
+      "test_auc": 0.9586,
+      "test_average_precision": 0.7848,
+      "test_precision": 0.4667,
+      "test_recall": 0.7903,
+      "test_f1": 0.5868,
+      "test_total_cost": 6880000.0,
+      "test_alerts_per_1000": 73.3
+    },
+    "graph_feature_value": {
+      "cost_avoided_vs_no_graph": 470000.0,
+      "average_precision_gain": 0.0189
+    }
+  },
+  "cost_ratio_sensitivity": [
+    {
+      "fn_fp_ratio": 2.0,
+      "fn_cost": 30000.0,
+      "is_configured_ratio": false,
+      "break_even_p": 0.3333333333333333,
+      "val_threshold": 0.7363332211971283,
+      "val_plateau_width": 0.009032189846038818,
+      "val_total_cost": 1380000.0,
+      "test_precision": 0.696969696969697,
+      "test_recall": 0.7419354838709677,
+      "test_f1": 0.71875,
+      "test_alerts_per_1000": 46.05722260990928,
+      "test_total_cost": 1560000.0
+    },
+    {
+      "fn_fp_ratio": 5.0,
+      "fn_cost": 75000.0,
+      "is_configured_ratio": false,
+      "break_even_p": 0.16666666666666666,
+      "val_threshold": 0.6614137887954712,
+      "val_plateau_width": 0.0006831884384155273,
+      "val_total_cost": 2850000.0,
+      "test_precision": 0.6089743589743589,
+      "test_recall": 0.7661290322580645,
+      "test_f1": 0.6785714285714285,
+      "test_alerts_per_1000": 54.43126308443824,
+      "test_total_cost": 3090000.0
+    },
+    {
+      "fn_fp_ratio": 10.0,
+      "fn_cost": 150000.0,
+      "is_configured_ratio": false,
+      "break_even_p": 0.09090909090909091,
+      "val_threshold": 0.22614964097738266,
+      "val_plateau_width": 0.0006807595491409302,
+      "val_total_cost": 4770000.0,
+      "test_precision": 0.36394557823129253,
+      "test_recall": 0.8629032258064516,
+      "test_f1": 0.5119617224880384,
+      "test_alerts_per_1000": 102.58199581297976,
+      "test_total_cost": 5355000.0
+    },
+    {
+      "fn_fp_ratio": 13.333333333333334,
+      "fn_cost": 200000.0,
+      "is_configured_ratio": true,
+      "break_even_p": 0.06976744186046512,
+      "val_threshold": 0.18356411904096603,
+      "val_plateau_width": 0.0003607124090194702,
+      "val_total_cost": 5505000.0,
+      "test_precision": 0.33540372670807456,
+      "test_recall": 0.8709677419354839,
+      "test_f1": 0.48430493273542596,
+      "test_alerts_per_1000": 112.35170969993023,
+      "test_total_cost": 6410000.0
+    },
+    {
+      "fn_fp_ratio": 25.0,
+      "fn_cost": 375000.0,
+      "is_configured_ratio": false,
+      "break_even_p": 0.038461538461538464,
+      "val_threshold": 0.14705049246549606,
+      "val_plateau_width": 0.0037968605756759644,
+      "val_total_cost": 7275000.0,
+      "test_precision": 0.31197771587743733,
+      "test_recall": 0.9032258064516129,
+      "test_f1": 0.46376811594202894,
+      "test_alerts_per_1000": 125.26168876482905,
+      "test_total_cost": 8205000.0
+    },
+    {
+      "fn_fp_ratio": 50.0,
+      "fn_cost": 750000.0,
+      "is_configured_ratio": false,
+      "break_even_p": 0.0196078431372549,
+      "val_threshold": 0.10283855721354485,
+      "val_plateau_width": 0.0008107200264930725,
+      "val_total_cost": 10290000.0,
+      "test_precision": 0.26605504587155965,
+      "test_recall": 0.9354838709677419,
+      "test_f1": 0.41428571428571426,
+      "test_alerts_per_1000": 152.12840195394278,
+      "test_total_cost": 10800000.0
+    }
+  ],
+  "cross_validation": {
+    "grouping": "ring_id (positives) + per-account singletons (negatives)",
+    "n_folds": 5,
+    "n_rounds_per_fold": 192,
+    "fold_auc": [
+      0.9806936143441334,
+      0.9636678200692042,
+      0.9650558220144291,
+      0.9812391681109185,
+      0.9676043194240768
+    ],
+    "fold_average_precision": [
+      0.9432137140064748,
+      0.8280407284951029,
+      0.7921437075978102,
+      0.8804464397298809,
+      0.8476800575799451
+    ],
+    "mean_auc": 0.9716521487925525,
+    "std_auc": 0.007711095816467524,
+    "mean_average_precision": 0.8583049294818428,
+    "std_average_precision": 0.051197392923859095
+  }
+}

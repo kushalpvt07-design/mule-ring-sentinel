@@ -141,6 +141,18 @@ NUM_ACCOUNTS = 3000
 # This is the only remaining unstructured organic component.
 ONE_OFF_EDGES = 10_000
 
+# Exponent of the rank-based Zipf law that decides which accounts strangers pay.
+# 1.1 is chosen to keep the head of the old distribution (top account 16.4% of
+# one-off volume vs 16.7% before) while restoring the tail: 90% of the mass now
+# spans 840 accounts instead of 225. See `_one_off_popularity` for the full
+# before/after table and why the previous `np.random.zipf(a=1.8)` was not a Zipf
+# popularity law at all.
+ONE_OFF_POPULARITY_EXPONENT = 1.1
+
+# Rounds of resampling for one-off draws where sender == receiver. At a 2.3%
+# collision rate this clears completely in one or two; eight is free insurance.
+_ONE_OFF_RESAMPLE_TRIES = 8
+
 TIME_START = datetime(2025, 1, 1)
 TIME_END = datetime(2025, 6, 30)
 
@@ -186,6 +198,14 @@ NUM_MULE_RINGS = sum(RINGS_PER_SPLIT.values())  # derived, never hand-maintained
 # partitioned per split so no account can be mule-labelled twice. Sized for the
 # worst case: a layered_fanin ring consumes up to 40 feeders.
 HIJACK_POOL_SIZE = {"train": 800, "val": 550, "test": 550}
+
+# Fraction of each pool that must survive ring generation. Accounts are consumed
+# (see `_seat_ring`), and an exhausted pool starves only the LATE rings — which
+# turns ring_id into a predictor of fan-in count. Expected demand is ~507 of 800
+# on train and ~304 of 550 on val/test, so ~37% and ~45% survive; a 10% floor
+# leaves room for the tails of size_range and fan_in_range without letting a
+# genuinely over-subscribed configuration through.
+MIN_POOL_HEADROOM_FRACTION = 0.10
 
 # Population mix. Percentages of NUM_ACCOUNTS.
 ROLE_MIX = {
@@ -259,6 +279,19 @@ _HOUR_WEIGHTS = np.array([
 _HOUR_WEIGHTS /= _HOUR_WEIGHTS.sum()
 _HOURS = np.arange(24)
 
+# Acceptance ceiling for the diurnal rejection sampler below. Dividing by the
+# max makes the highest-weight hour accept with probability 1.
+_HOUR_WEIGHT_MAX = float(_HOUR_WEIGHTS.max())
+
+# Tries before the rejection sampler gives up and returns its last uniform draw.
+# Mean acceptance probability over a full day is 0.486, so a burst spanning any
+# reasonable stretch of clock exhausts 24 tries with probability ~5e-8. A burst
+# confined to the small hours accepts far more rarely and will sometimes fall
+# through — which is the correct outcome, not a failure: inside a 3-hour window
+# at 03:00 the profile is nearly flat, so a uniform draw is already the right
+# answer.
+_DIURNAL_TRIES = 24
+
 
 def _daytime_hour() -> int:
     """An hour-of-day drawn from the diurnal UPI profile."""
@@ -273,22 +306,148 @@ def _random_timestamp(start: datetime, end: datetime) -> datetime:
     return start + timedelta(seconds=random.randint(0, delta_s - 1))
 
 
+def _diurnal_in_span(start: datetime, end: datetime) -> datetime:
+    """
+    A timestamp in [start, end) whose hour follows the diurnal profile, for spans
+    too short to contain whole days.
+
+    `_diurnal_timestamp` picks a day and then an hour, which needs the span to
+    cover at least one full day. A burst window is 2-72 hours, so that approach
+    cannot be used: most candidate hours simply are not in the span. Rejection
+    sampling is used instead — draw uniformly, accept in proportion to the hour's
+    weight — which yields exactly the diurnal profile CONDITIONED on the span,
+    and the conditional profile is the honest target when some hours are
+    genuinely unreachable.
+
+    WHY THIS EXISTS: `_ring_timestamp`'s burst branch called `_random_timestamp`
+    directly, so bursting rings were uniform over the clock while all organic
+    traffic was diurnal. That is a label planted in hour-of-day. Measured on the
+    shipped data, the share of edges landing in 00:00-05:59 is
+
+        organic       3.70%      (profile says 1.84%)
+        stealth_cycle 2.20%      ← the one archetype with burst_hours=None
+        ring overall 14.43%
+        fast_cycle   16.58%
+        fan_in       18.75%
+        layered_fanin 24.35%
+
+    — a four-to-sixfold enrichment of night activity on exactly the bursting
+    archetypes, and none at all on the archetype that already went through
+    `_diurnal_timestamp`. No current feature reads hour-of-day directly, which is
+    the only reason `TestDatasetIsNotWatermarked` never caught it; `burst_ratio`
+    buckets by absolute clock hour and so reads it only indirectly. Any future
+    hour-of-day feature would have scored near-perfect AUC on a generator
+    artefact.
+
+    WHAT THIS DOES *NOT* FIX — READ BEFORE ADDING AN HOUR-OF-DAY FEATURE
+    ───────────────────────────────────────────────────────────────────
+    Conditioning on the span is the right target but it is not the same as
+    matching the unconditional profile, and on a full regenerate the residual is
+    still visible:
+
+        organic     3.69%   in 00:00-05:59
+        ring overall 6.62%  (was 14.43%)
+        fan_in       3.59%  (was 18.75%)
+        fast_cycle   9.66%  (was 16.58%)  ← the residual
+
+    `fast_cycle` burns 2-12 hours. A burst whose origin lands at 02:00 has no
+    daytime hour to be rejected *into* — every hour in its span is a night hour,
+    so the sampler correctly returns the conditional profile and the conditional
+    profile is nocturnal. Longer-burst archetypes (`fan_in`, `layered_fanin`)
+    always straddle a daytime stretch and so land on organic's figure. Fixing
+    this would mean rejecting burst ORIGINS that fall in the small hours, and the
+    block above measures what that does: it overshoots to 1.19%, i.e. it makes
+    fast rings *more* diurnal than real traffic. That is the same watermark with
+    its sign flipped, and a 3.4x deficit is no more honest than a 2.6x surplus.
+
+    So this is left as measured, not papered over. It is not currently
+    exploitable — no feature reads hour-of-day, and `burst_ratio` counts
+    transactions per bucket without caring which bucket — but a 2.6x night
+    enrichment on one archetype IS a real residual signal, and the first
+    `hour_of_day` or `night_share` feature anyone adds will find it. If that
+    feature is wanted, the generator needs a burst-origin model whose CONDITIONAL
+    hour profile is organic's, which is a different and harder change than
+    reweighting either draw alone.
+    """
+    ts = _random_timestamp(start, end)
+    for _ in range(_DIURNAL_TRIES):
+        if random.random() < _HOUR_WEIGHTS[ts.hour] / _HOUR_WEIGHT_MAX:
+            return ts
+        ts = _random_timestamp(start, end)
+    return ts
+
+
 def _diurnal_timestamp(start: datetime, end: datetime) -> datetime:
     """
     A random timestamp in [start, end) whose *hour* follows the diurnal profile.
 
     Used for one-off traffic so the unstructured component does not flatten the
     hour distribution that `burst_ratio` reads.
+
+    THE ALIGNMENT DEFECT THIS FIXES
+    ───────────────────────────────
+    The day grid used to be anchored on `start` itself rather than on midnight,
+    and the day count used floor division:
+
+        span_days = max(1, int((end - start).total_seconds() // 86400))
+        day = start + timedelta(days=random.randrange(span_days))
+        ts = day.replace(hour=_daytime_hour(), ...)
+
+    Two silent failures follow whenever `start` is not midnight or the span is
+    not a whole number of days — neither of which this function is entitled to
+    assume, because both are consequences of TIME_START / TIME_END /
+    SPLIT_FRACTIONS, and it is also called with an arbitrary ring window.
+
+      1. THE REAL ONE — floor division dropped the final partial day, and the day
+         grid was anchored on `start` rather than midnight, so the tail of the
+         window was unreachable. Measured over 60,000 draws on the window
+         [2025-01-01 07:12, 2025-03-02 19:03) — 60.8 days — the share of draws
+         landing in the window's final 24 hours was 0.47% where 1/60.8 = 1.64%
+         is correct: a 3.5x under-representation, with the whole of the last
+         calendar day drawing nothing at all. The same window under this
+         implementation gives 1.67%.
+
+      2. THE SMALL ONE — `day` inherited `start`'s TIME OF DAY, so
+         `.replace(hour=h, ...)` produced an instant on the right date but before
+         `start` whenever h < start.hour. Those draws failed the range check and
+         fell through to `_random_timestamp`, which is UNIFORM. Worth fixing on
+         principle in a function whose purpose is to not flatten the hour
+         distribution, but it is quantitatively minor: only the first of ~60
+         candidate days can trigger it, so the measured hour profile barely
+         moved (L1 distance from `_HOUR_WEIGHTS` 0.0138 before, 0.0188 after).
+         The direction of that number is not an improvement and is not claimed
+         as one — rejecting out-of-window draws instead of replacing them with
+         uniform ones yields the diurnal profile CONDITIONED on the window, and
+         on a ragged window that genuinely differs from the unconditional
+         profile, because the hours cut off at each end are unreachable.
+
+    Today's configuration hides both: TIME_START is midnight, the range is 180
+    days, and 180/3 = 60 gives day-aligned whole-day windows. Move TIME_END to
+    2025-06-16 and the bias appears with no test failing. `assert_window_grid`
+    now asserts the alignment this used to assume.
+
+    The grid is anchored on the midnight of `start`'s date and the day count is
+    rounded UP, so every calendar day touching the window is a candidate and
+    `.replace(hour=...)` means what it says. Draws landing outside the window —
+    only possible on the two ragged end days — are retried rather than replaced
+    by a uniform draw, which yields the diurnal profile conditioned on the
+    window. On day-aligned windows nothing is ever rejected.
     """
-    span_days = max(1, int((end - start).total_seconds() // 86400))
-    day = start + timedelta(days=random.randrange(span_days))
-    ts = day.replace(
-        hour=_daytime_hour(),
-        minute=random.randrange(60),
-        second=random.randrange(60),
-        microsecond=0,
-    )
-    return ts if start <= ts < end else _random_timestamp(start, end)
+    first_midnight = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    span_s = (end - first_midnight).total_seconds()
+    n_days = max(1, int(-(-span_s // 86_400)))    # ceil: keep the last part-day
+
+    for _ in range(_DIURNAL_TRIES):
+        day = first_midnight + timedelta(days=random.randrange(n_days))
+        ts = day.replace(
+            hour=_daytime_hour(),
+            minute=random.randrange(60),
+            second=random.randrange(60),
+            microsecond=0,
+        )
+        if start <= ts < end:
+            return ts
+    return _random_timestamp(start, end)
 
 
 def build_split_windows(
@@ -839,6 +998,52 @@ def _one_off_amount() -> float:
     return round(amount, 2)
 
 
+def _one_off_popularity(n_accounts: int) -> np.ndarray:
+    """
+    A Zipf-LAW popularity vector over `n_accounts`, normalised to sum to 1.
+
+    THE DEFECT THIS REPLACES
+    ────────────────────────
+    `np.random.zipf(a=1.8, size=n).astype(float)` then normalised. That is not a
+    Zipf popularity law — it is one i.i.d. DRAW from a Zipf random variable per
+    account, and `zipf(a=1.8)` has infinite variance (its tail index is 0.8, so
+    even the mean diverges). A handful of accounts draw values in the thousands
+    or millions and, after normalising, own essentially all the mass.
+
+    Measured over 3,000 accounts, the old vector against the fix (rank-based,
+    exponent 1.1):
+
+                                        old zipf(1.8)    rank Zipf s=1.1
+        top account's share                    16.7%              16.4%
+        top 5 accounts' share                  53.8%                 —
+        top 14 accounts' share                 67.7%              48.1%
+        accounts holding 90% of the mass         225                840
+        distinct senders in 10,000 draws         957              1,472
+        self-pair collision rate                4.02%              2.29%
+
+    So 10,000 one-off transactions were being spread over 957 accounts, with
+    two-thirds of all of it flowing through fourteen. The head is deliberately
+    preserved — 16.4% vs 16.7% for the top account, so legitimate fan-in hubs
+    still form and `fan_in_concentration` still has something to measure — while
+    the tail becomes an actual tail instead of 2,000 accounts that never appear.
+
+    That mattered beyond realism. ONE_OFF_EDGES exists to be "the unstructured
+    long tail: paying a stranger once and never again"; a distribution that
+    routes everything through fourteen accounts produces repeated pairs, not
+    strangers, and `repeat_ratio` reads repeated pairs. Concentrating the
+    unstructured component is how it stops being unstructured.
+
+    The vector is shuffled so popularity is independent of account id and
+    therefore of role: the merchant skew is applied separately and explicitly by
+    the 45% `to_merchant` branch, and having rank silently track `all_accounts`
+    order would double-count it.
+    """
+    ranks = np.arange(1, n_accounts + 1, dtype=float)
+    popularity = 1.0 / ranks ** ONE_OFF_POPULARITY_EXPONENT
+    np.random.shuffle(popularity)
+    return popularity / popularity.sum()
+
+
 def emit_one_off(
     pop: Population,
     n_edges: int,
@@ -854,8 +1059,7 @@ def emit_one_off(
     accounts = np.array(pop.all_accounts)
     merchants = np.array(pop.by_role["merchant"] or pop.all_accounts)
 
-    popularity = np.random.zipf(a=1.8, size=len(accounts)).astype(float)
-    popularity /= popularity.sum()
+    popularity = _one_off_popularity(len(accounts))
 
     senders = np.random.choice(accounts, size=n_edges, p=popularity)
 
@@ -867,6 +1071,35 @@ def emit_one_off(
         np.random.choice(accounts, size=n_edges, p=popularity),
     )
 
+    # RESAMPLE self-pairs, do not drop them. `keep = senders != receivers` was
+    # the old behaviour, and combined with the degenerate popularity vector it
+    # made ONE_OFF_EDGES a number the module states and then misses by an amount
+    # nobody could predict. Over 200 seeds the old self-pair rate ranged from
+    # 0.36% to 54.51% (median 7.47%, mean 13.01%) — because a collision needs
+    # sender == receiver and the old vector put up to half its mass on ONE
+    # account. So a declared 10,000 one-off edges arrived as anywhere between
+    # 4,549 and 9,964, and which of those you got was a property of the RNG
+    # state, not of any parameter. With the rank-based law the rate is 1.83% to
+    # 2.58% (median 2.21%), and resampling closes even that.
+    #
+    # The loss was also not uniform across accounts: it fell hardest on exactly
+    # the popular accounts the long tail exists to create, since those are the
+    # ones likeliest to collide with themselves.
+    for _ in range(_ONE_OFF_RESAMPLE_TRIES):
+        clash = senders == receivers
+        n_clash = int(clash.sum())
+        if not n_clash:
+            break
+        receivers[clash] = np.where(
+            np.random.random(n_clash) < 0.45,
+            np.random.choice(merchants, size=n_clash),
+            np.random.choice(accounts, size=n_clash, p=popularity),
+        )
+
+    # Residual guarantee. At a 2.3% per-draw collision rate the loop above leaves
+    # nothing after eight rounds, but `assert_structural_sanity` treats a
+    # self-loop as a hard failure, so the invariant is enforced rather than
+    # assumed.
     keep = senders != receivers
     senders, receivers = senders[keep], receivers[keep]
 
@@ -1053,13 +1286,36 @@ def _ring_timestamp(
     Bursting archetypes draw from a per-ring burst; stealth archetypes draw from
     the whole window, which is exactly what makes them hard to see with a
     velocity rule.
+
+    Both branches respect the diurnal hour profile. The burst branch used to call
+    `_random_timestamp` and so was uniform over the clock, which enriched night
+    hours on bursting rings by 4-6x against organic traffic and planted a label
+    in hour-of-day — see `_diurnal_in_span`. Bursting is about compressing many
+    transactions into a short span, not about laundering at 3am; the two are
+    independent and only the first is intended here.
+
+    The burst ORIGIN stays uniform over the window, deliberately. Measured over
+    simulated rings at the real archetype parameters, the 00:00-05:59 share and
+    the L1 distance from `_HOUR_WEIGHTS` come out:
+
+        fast_cycle     origin uniform / within uniform   26.64%   0.675  ← was
+                       origin uniform / within diurnal    3.40%   0.384  ← now
+                       origin diurnal / within diurnal    1.19%   0.538
+        layered_fanin  origin uniform / within uniform   20.43%   0.600  ← was
+                       origin uniform / within diurnal    1.94%   0.175  ← now
+                       origin diurnal / within diurnal    1.51%   0.334
+
+    against 3.70% for shipped organic traffic. Drawing the origin diurnally too
+    compounds the weighting and overshoots — it pushes rings BELOW organic night
+    activity, which is the same leak with its sign flipped. One diurnal draw, not
+    two.
     """
     if arch.burst_hours is None or burst_origin is None:
         return _diurnal_timestamp(window_start, window_end)
 
     span_h = random.randint(*arch.burst_hours)
     burst_end = min(burst_origin + timedelta(hours=span_h), window_end)
-    return _random_timestamp(burst_origin, burst_end)
+    return _diurnal_in_span(burst_origin, burst_end)
 
 
 def _seat_ring(
@@ -1073,6 +1329,40 @@ def _seat_ring(
 
     Returns (ring_nodes, updated_mule_counter). Hijacked seats come from the
     split's pool; the rest are purpose-built accounts.
+
+    CONSUMES from `hijack_pool` — a seated account is removed, so it cannot be
+    seated again by a later ring or drawn as a fan-in feeder.
+
+    THE DEFECT THIS FIXES
+    ─────────────────────
+    `seen` is local to one ring, so it only ever prevented seating the same
+    account twice *within* a ring (which would wire a self-loop). Across rings
+    the pool was sampled with replacement, and the pool is shared by every ring
+    in the split. Measured on the shipped data:
+
+        train  8 of 196 ring members (4.1%) sit in more than one ring
+        val    2 of 110 (1.8%)
+        test   4 of 119 (3.4%)
+        train  42 of 335 fan-in feeders (12.5%) are ring MEMBERS of another ring
+        train  78 feeders feed more than one ring
+
+    `ring_id` is the GroupKFold grouping key in models/train.py. A grouping key
+    that repeats an entity across groups does not group — the same account lands
+    in a fold's train and validation halves, which is precisely the leakage
+    GroupKFold is there to prevent, and the CV numbers derived from it are
+    optimistic by an unmeasured amount.
+
+    The feeder overlap is a second, separate problem: `ring_member_nodes`
+    excludes fan-in feeders "by design" because a feeder is a victim, not a mule.
+    An account that is a feeder for ring A and a member of ring B is labelled a
+    mule (correctly, via B) while carrying `fan_in` edges attributed to A, so its
+    label is right for a reason that has nothing to do with half its traffic.
+
+    Prevention rather than relabelling, because the alternative — making the
+    label unambiguous by picking a winner per account — leaves `ring_id`
+    many-to-one on entities and so still cannot be a grouping key. Capacity is
+    not a constraint: expected demand is ~102 hijacked members plus ~405 feeders
+    against a train pool of 800, and ~304 against 550 for val and test.
     """
     size = random.randint(*arch.size_range)
     nodes: list[str] = []
@@ -1080,8 +1370,10 @@ def _seat_ring(
 
     for _ in range(size):
         if hijack_pool and random.random() < arch.hijack_prob:
-            candidate = random.choice(hijack_pool)
-            # Seating one account twice would wire a self-loop at node[i]→[i+1].
+            candidate = hijack_pool.pop(random.randrange(len(hijack_pool)))
+            # Consumption makes a repeat impossible; the guard stays because a
+            # self-loop at node[i]→node[i+1] is the failure it prevents and
+            # `assert_structural_sanity` treats that as fatal.
             if candidate not in seen:
                 nodes.append(candidate)
                 seen.add(candidate)
@@ -1158,11 +1450,21 @@ def generate_mule_rings_for_split(
        organic feature profiles into the positive class and was a large part of
        why precision sat at 0.499. The fan-in *topology* is still present for
        the model to learn; only the wrong node label is gone.
+
+    3. Every pool account is used at most ONCE across the whole split — as a
+       hijacked ring member, or as a fan-in feeder, or not at all. `_seat_ring`
+       and the feeder sampler both consume from the pool, which is what makes
+       `ring_id` a valid GroupKFold key; see `_seat_ring` for the measurements
+       from when it was not. The pool is copied here so the caller's list is not
+       silently emptied as a side effect.
     """
     prefix = MULE_PREFIX[split]
     mule_counter = 0
     records: list[dict] = []
     fresh_mules: list[str] = []
+
+    pool_size = len(hijack_pool)
+    hijack_pool = list(hijack_pool)   # consumed below; do not mutate the caller's
 
     for local in range(num_rings):
         ring_id = ring_id_offset + local
@@ -1214,9 +1516,15 @@ def generate_mule_rings_for_split(
         # ── Fan-in: outside accounts feeding the ring's entry point ──
         entry = ring_nodes[0]
         n_feeders = random.randint(*arch.fan_in_range)
-        pool = [a for a in hijack_pool if a not in set(ring_nodes)]
-        if pool:
-            feeders = random.sample(pool, min(n_feeders, len(pool)))
+        # Feeders are CONSUMED from the live pool, so one account cannot feed two
+        # rings and no ring member can be a feeder anywhere. `_seat_ring` has
+        # already removed this ring's own hijacked seats, which is what the old
+        # `a not in set(ring_nodes)` filter was for.
+        if hijack_pool:
+            feeders = random.sample(
+                hijack_pool, min(n_feeders, len(hijack_pool)))
+            taken = set(feeders)
+            hijack_pool[:] = [a for a in hijack_pool if a not in taken]
             for feeder in feeders:
                 for _ in range(random.randint(1, 3)):
                     records.append({
@@ -1236,8 +1544,28 @@ def generate_mule_rings_for_split(
                     })
 
     # ── Camouflage traffic for purpose-built mule accounts ──
+    # The REMAINING pool, not the original: every account still in it is
+    # guaranteed to be neither a ring member nor a feeder, which is exactly what
+    # "a thin civilian transaction history" requires. Passing the full pool would
+    # let a purpose-built mule's "ordinary spending" land on another ring's
+    # member and quietly create ring-to-ring edges labelled is_mule=0.
     records += _emit_camouflage(
         fresh_mules, hijack_pool, window_start, window_end
+    )
+
+    # Pool exhaustion would not raise — `_seat_ring` falls through to
+    # purpose-built accounts and the feeder sampler silently takes `len(pool)`
+    # instead of `n_feeders`. Both degrade LATE rings only, so the artefact is a
+    # correlation between ring_id and fan-in count, i.e. a leak the model can
+    # find and no assertion would report. Fail here instead.
+    assert len(hijack_pool) >= pool_size * MIN_POOL_HEADROOM_FRACTION, (
+        f"HIJACK POOL NEARLY EXHAUSTED for split '{split}': "
+        f"{len(hijack_pool)} of {pool_size} accounts left after "
+        f"{num_rings} rings (headroom floor is "
+        f"{MIN_POOL_HEADROOM_FRACTION:.0%}). Later rings were starved of "
+        f"hijacked seats and feeders while earlier ones were not, which makes "
+        f"ring_id predictive of fan-in count. Raise HIJACK_POOL_SIZE['{split}'] "
+        f"or lower RINGS_PER_SPLIT['{split}']."
     )
 
     if not records:
@@ -1385,6 +1713,28 @@ def assert_equal_window_lengths(
 
     v2's 60/18/22 fractions produced 108 / 32 / 39 day windows — a 3.4x spread.
     This assertion is why SPLIT_FRACTIONS is now equal thirds.
+
+    WHAT THIS CHECK CANNOT SEE, and why `assert_window_grid` exists
+    ──────────────────────────────────────────────────────────────
+    Only that the three lengths agree. `build_split_windows` derives the first
+    two windows as `total_s * SPLIT_FRACTIONS[split]` and lets the last absorb
+    the remainder, so with equal fractions the spread is sub-second BY
+    CONSTRUCTION for any TIME_START and TIME_END whatsoever. The one thing this
+    assertion can therefore report is somebody editing SPLIT_FRACTIONS — real,
+    but a small fraction of what has to hold. It says nothing about whether the
+    windows are contiguous, whether they cover the range, or whether they are
+    day-aligned, and `_diurnal_timestamp` silently depends on the last of those.
+
+    The 1.5-day tolerance stays as it is, and the reason is worth recording so
+    nobody "tightens" it: the same constant is imported by tests/test_leakage.py
+    and mirrored in api/main.py, where it is applied to the EMPIRICAL span of an
+    emitted CSV (`max(timestamp) - min(timestamp)`). There, 1.5 days is the right
+    order of magnitude, because the first and last transaction in a window do not
+    land on its boundaries. Here the quantity is construction-exact, so the same
+    number is enormously loose — 1.5 days on a 60-day window is a 2.5% multiplier
+    on every count feature, the exact effect the paragraph above calls
+    unacceptable. One constant cannot be right for both, so this check keeps the
+    shared tolerance and `assert_window_grid` supplies the exactness.
     """
     lengths = {
         s: (end - start).total_seconds() / 86_400.0
@@ -1394,10 +1744,83 @@ def assert_equal_window_lengths(
     assert spread <= WINDOW_LENGTH_TOLERANCE_DAYS, (
         "UNEQUAL OBSERVATION WINDOWS: "
         + ", ".join(f"{s}={d:.1f}d" for s, d in lengths.items())
-        + f" (spread {spread:.1f}d > {WINDOW_LENGTH_TOLERANCE_DAYS}d). "
+        + f" (spread {spread:.4f}d > {WINDOW_LENGTH_TOLERANCE_DAYS}d). "
         "Every count/sum feature scales with window length, so the splits "
         "would not be comparable. Fix SPLIT_FRACTIONS."
     )
+
+
+def assert_window_grid(
+    windows: dict[str, tuple[datetime, datetime]],
+    time_start: datetime,
+    time_end: datetime,
+) -> None:
+    """
+    The structural properties of the split grid that equal length does not imply.
+
+    Four claims are made elsewhere in this module and none of them was checked:
+
+      1. CONTIGUOUS AND NON-OVERLAPPING — `build_split_windows` promises
+         "train.end == val.start and val.end == test.start". A gap loses edges
+         silently: `split_for_timestamp` returns the last split for anything it
+         cannot place, so transactions in a hole would be filed as test.
+
+      2. FULL COVERAGE of [time_start, time_end). Organic emitters draw
+         timestamps from the whole range and only then get assigned a split, so
+         any instant the grid does not cover is data generated and mislabelled.
+
+      3. DAY-ALIGNED boundaries. `_diurnal_timestamp` builds a day grid and
+         `burst_ratio` buckets by absolute clock hour; a window starting at 07:12
+         gives each split a different phase of the diurnal cycle at its edges and
+         a different partial day at each end. That is a distribution shift in
+         `burst_ratio` and `txn_velocity` that the length check cannot detect,
+         because the lengths still agree.
+
+      4. WHOLE NUMBERS OF DAYS, for the same reason: two windows can be equally
+         long to the second and still cover different fractions of a day.
+
+    All four hold today only because TIME_START is midnight and 180 days divides
+    by three. Both are one edit away from not holding, and the failure is silent
+    in every case — which is what makes them worth asserting rather than
+    documenting.
+    """
+    ordered = [windows[s] for s in SPLITS]
+
+    assert ordered[0][0] == time_start, (
+        f"WINDOW GRID: first window starts at {ordered[0][0]}, not "
+        f"{time_start}. Traffic before it would be generated and then filed "
+        f"into whichever split `split_for_timestamp` falls back to."
+    )
+    assert ordered[-1][1] == time_end, (
+        f"WINDOW GRID: last window ends at {ordered[-1][1]}, not {time_end}."
+    )
+
+    for (s_prev, s_next), (prev, nxt) in zip(
+            zip(SPLITS, SPLITS[1:]), zip(ordered, ordered[1:])):
+        assert prev[1] == nxt[0], (
+            f"WINDOW GRID: '{s_prev}' ends at {prev[1]} but '{s_next}' starts "
+            f"at {nxt[0]}. Windows must be contiguous and non-overlapping — a "
+            f"gap loses edges to the fallback split, an overlap puts the same "
+            f"instant in two splits."
+        )
+
+    for split, (start, end) in windows.items():
+        assert start.hour == start.minute == start.second == 0 and \
+               start.microsecond == 0, (
+            f"WINDOW GRID: '{split}' starts at {start}, which is not midnight. "
+            f"`_diurnal_timestamp` grids by calendar day and `burst_ratio` "
+            f"buckets by absolute clock hour, so an unaligned window gives this "
+            f"split a different phase of the diurnal cycle than the others. "
+            f"Choose TIME_START, TIME_END and SPLIT_FRACTIONS so every boundary "
+            f"lands on a midnight."
+        )
+        span_s = (end - start).total_seconds()
+        assert span_s % 86_400 == 0, (
+            f"WINDOW GRID: '{split}' spans {span_s / 86_400:.4f} days, not a "
+            f"whole number. Equal length is not enough — two windows can match "
+            f"to the second and still cover different fractions of a day, which "
+            f"moves every count feature by that fraction."
+        )
 
 
 def assert_structural_sanity(splits: dict[str, pd.DataFrame]) -> None:
@@ -1512,6 +1935,7 @@ def main() -> None:
 
     windows = build_split_windows(TIME_START, TIME_END)
     assert_equal_window_lengths(windows)
+    assert_window_grid(windows, TIME_START, TIME_END)
     plan = build_archetype_plan()
 
     print(banner("UPI Mule-Ring Sentinel: Data Generator (v3)"))

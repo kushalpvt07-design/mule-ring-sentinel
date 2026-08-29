@@ -51,10 +51,12 @@ that matters.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 import pandas as pd
+import requests
 import streamlit as st
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -81,6 +83,11 @@ from models.features import MODEL_VERSION, TARGET_COL  # noqa: E402
 # its transactions inside this range or the API drops the context graph.
 CONTEXT_WINDOW = ("2025-03-02", "2025-04-30")
 DEMO_TIMESTAMP = "2025-04-15T14:30:00"
+
+# The API endpoint the Score Demo posts to. Overridable via the API_URL
+# environment variable so the dashboard can reach a remote backend or a Docker
+# container instead of a local `uvicorn`, without editing this file.
+API_URL = os.getenv("API_URL", "http://localhost:8000/score")
 
 SPLITS = (("train", "Train"), ("val", "Validation"), ("test", "Test"))
 
@@ -419,21 +426,15 @@ def page_score_demo(data: dict) -> None:
     if not submitted:
         return
 
-    try:
-        import requests
-    except ImportError:
-        st.error("The `requests` package is not installed. `pip install requests`.")
-        return
-
     payload = {"transactions": [{
         "sender": sender, "receiver": receiver,
         "amount": amount, "timestamp": timestamp,
     }]}
 
     try:
-        resp = requests.post("http://localhost:8000/score", json=payload, timeout=10)
+        resp = requests.post(API_URL, json=payload, timeout=10)
     except requests.ConnectionError:
-        st.error("Cannot reach the API on port 8000. Is `uvicorn` running?")
+        st.error(f"Cannot reach the API at {API_URL}. Is `uvicorn` running?")
         return
     except requests.Timeout:
         st.error("The API did not respond within 10s.")
@@ -448,7 +449,12 @@ def page_score_demo(data: dict) -> None:
 
     # Surface the context health BEFORE the scores, because a score computed on a
     # dropped context is not wrong-looking, it is just wrong.
-    if not context.get("window_comparable", True):
+    #
+    # Defaulting to False, not True: a missing or renamed key means the API did not
+    # tell us the window is comparable, and the honest reading of silence on a
+    # correctness flag is "not established". Failing open here suppressed the
+    # warning in exactly the case where nobody knew anything.
+    if not context.get("window_comparable", False):
         st.warning(
             "The API reports the observation window is not comparable to the "
             "trained window, so scale-dependent features may be off. "
@@ -460,7 +466,12 @@ def page_score_demo(data: dict) -> None:
 
     threshold_used = result.get("threshold_used")
     fingerprint = context.get("partition_fingerprint")
-    caption = f"Threshold {threshold_used:.4f}" if threshold_used is not None else ""
+    # Six decimals, matching the precision the API rounds scores to before it
+    # tiers them. Re-rounding to four here would undo that: 0.069799 printed as
+    # 0.0698 beside a threshold also printed as 0.0698, with a tier computed from
+    # neither displayed number — the self-contradicting response api/responder.py
+    # rounds first specifically to prevent.
+    caption = f"Threshold {threshold_used:.6f}" if threshold_used is not None else ""
     if fingerprint:
         caption += f" · partition `{fingerprint}`"
     if caption:
@@ -475,7 +486,7 @@ def page_score_demo(data: dict) -> None:
         st.markdown(
             f"**{node.get('node_id')}** — "
             f"<span style='color:{colour}'>{risk}</span> "
-            f"(risk {node.get('risk_score', 0):.4f}) → {node.get('action')}"
+            f"(risk {node.get('risk_score', 0):.6f}) → {node.get('action')}"
             f"{seen_note}",
             unsafe_allow_html=True,
         )

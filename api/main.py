@@ -93,7 +93,10 @@ KNOWN LIMITATIONS — read before quoting a latency figure
 • Scores are only comparable to the reported metrics when the observation window
   matches the trained one, because `in_amount_sum`, `out_amount_sum` and
   `txn_velocity` all scale with how long an account was watched. The window is
-  enforced per request and `context.window_comparable` says whether it holds.
+  enforced per request and `context.window_comparable` says whether it holds. A
+  request whose window keeps NO historical context is refused with 422 rather than
+  scored: the graph features are constants at that point, and a tier derived from
+  them is a threshold calibrated on a 60-day graph applied to a handful of edges.
 
 • An account with no history in the context graph is scored on the submitted
   transactions alone, so its graph features are weak by construction. Those
@@ -107,6 +110,8 @@ import json
 import time
 import uuid
 from contextlib import asynccontextmanager
+
+from console import enable_utf8_stdout, hr
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -210,6 +215,7 @@ class ServiceState:
         self.model_file: str | None = None
         self.threshold: float | None = None
         self.threshold_source: str = "none"
+        self.break_even_probability: float | None = None
         self.contract_verified: bool = False
         self.context_edges: pd.DataFrame | None = None
         self.reference_partition: dict[str, int] | None = None
@@ -224,6 +230,7 @@ class ServiceState:
             self.model is not None
             and self.contract_verified
             and self.threshold is not None
+            and self.break_even_probability is not None
             and self.context_edges is not None
             and self.reference_partition is not None
         )
@@ -298,6 +305,47 @@ def load_metrics() -> tuple[float | None, str, dict]:
     return threshold, "metrics.json", metrics
 
 
+def read_break_even_probability(metrics: dict) -> float | None:
+    """
+    Read the cost model's break-even probability p* out of metrics.json.
+
+    Loaded alongside the threshold because api/responder.py needs both: the
+    threshold is where an alert starts, p* is where an account stops being cheap
+    enough to ignore, and the step-up band is the space between them. Hard-coding
+    0.0698 here would put a second copy of a cost assumption into the serving
+    path, which is the same mistake as the local feature list that made this file
+    serve a v1 model against v3's threshold.
+
+    If the explicit key is absent it is recomputed as `fp / (fp + fn)` from the
+    same block. That is p*'s definition rather than a default, so it cannot
+    disagree with the costs metrics.json publishes. Returns None if neither is
+    available, and the service then declines to score instead of inventing a tier
+    boundary.
+    """
+    cost = metrics.get("cost_config")
+    if not isinstance(cost, dict):
+        return None
+
+    raw = cost.get("break_even_probability")
+    if raw is None:
+        fn_cost, fp_cost = cost.get("fn_cost"), cost.get("fp_cost")
+        if fn_cost is None or fp_cost is None:
+            print("  metrics.json cost_config carries neither "
+                  "'break_even_probability' nor the costs it follows from.")
+            return None
+        total = float(fn_cost) + float(fp_cost)
+        if total <= 0.0:
+            return None
+        raw = float(fp_cost) / total
+
+    break_even = float(raw)
+    if not (0.0 < break_even <= 1.0):
+        print(f"  metrics.json gives a break-even probability of {break_even}, "
+              f"which is not a probability.")
+        return None
+    return break_even
+
+
 def load_context_edges() -> pd.DataFrame | None:
     """
     Load the historical graph context, labels excluded by construction.
@@ -370,9 +418,10 @@ async def lifespan(app: FastAPI):
     # would let a contract-failing model be served.
     STATE.reset()
 
-    print("─" * 62)
-    print("UPI Mule-Ring Sentinel — starting up")
-    print("─" * 62)
+    enable_utf8_stdout()
+    print(hr())
+    print("UPI Mule-Ring Sentinel -- starting up")
+    print(hr())
 
     # ── model ──
     if MODEL_PATH.exists():
@@ -399,7 +448,7 @@ async def lifespan(app: FastAPI):
         print(f"  model MISSING at {MODEL_PATH}")
 
     # ── threshold ──
-    threshold, source, _ = load_metrics()
+    threshold, source, metrics = load_metrics()
     STATE.threshold, STATE.threshold_source = threshold, source
     if threshold is None:
         problems.append(
@@ -409,6 +458,23 @@ async def lifespan(app: FastAPI):
         print("  threshold UNAVAILABLE")
     else:
         print(f"  threshold: {threshold:.4f} (from {source})")
+
+    # ── break-even probability: the floor of the step-up band ──
+    # Required, not optional. Without it api/responder.py would have no economic
+    # basis for the ALLOW/step-up line, and the fraction-of-threshold rule it
+    # replaced returned ALLOW across a band the cost model prices as reviewable.
+    STATE.break_even_probability = read_break_even_probability(metrics)
+    if STATE.break_even_probability is None:
+        problems.append(
+            "No break-even probability. metrics.json must carry a 'cost_config' "
+            "block with 'break_even_probability', or the 'fn_cost' and 'fp_cost' "
+            "it follows from. It sets the floor of the step-up band, and a "
+            "guessed floor means answering ALLOW on accounts the cost model says "
+            "are worth a challenge. Run `python -m models.train`.")
+        print("  break-even probability UNAVAILABLE")
+    else:
+        print(f"  break-even p*: {STATE.break_even_probability:.6f} "
+              f"(step-up floor; the alert cutoff stays the threshold above)")
 
     # ── context graph ──
     try:
@@ -472,9 +538,9 @@ async def lifespan(app: FastAPI):
               f"{STATE.trained_window_days:.1f} days")
 
     STATE.degraded_reason = "\n".join(problems) if problems else None
-    print("─" * 62)
-    print("  READY" if STATE.ready else "  DEGRADED — /score will return 503")
-    print("─" * 62)
+    print(hr())
+    print("  READY" if STATE.ready else "  DEGRADED -- /score will return 503")
+    print(hr())
 
     yield
 
@@ -683,7 +749,12 @@ async def health_check():
         model_loaded=STATE.model is not None,
         model_version=STATE.model_version,
         model_file=STATE.model_file,
-        optimal_threshold=STATE.threshold if STATE.threshold is not None else 0.0,
+        # None, not 0.0. Publishing 0.0 for "unavailable" named the one value
+        # `classify_risk` refuses outright — a threshold of 0 flags every account
+        # — while the schema's own default for the field was 0.5, so the service
+        # had two contradictory sentinels for the same missing number and neither
+        # said "missing". `optimal_threshold: float | None` says it once.
+        optimal_threshold=STATE.threshold,
         threshold_source=STATE.threshold_source,
         n_features=len(FEATURE_COLS),
         feature_contract_verified=STATE.contract_verified,
@@ -712,6 +783,7 @@ async def score_transactions(request: ScoringRequest):
 
     model = STATE.model
     threshold = STATE.threshold
+    break_even = STATE.break_even_probability
     threshold_source = "metrics.json"
     if request.threshold_override is not None:
         # `or` was wrong here: it treats 0.0 as absent. The schema now rejects 0
@@ -722,6 +794,23 @@ async def score_transactions(request: ScoringRequest):
     submitted = submitted_to_frame(request.transactions)
     merged, diag = merge_with_context(
         submitted, STATE.context_edges, STATE.trained_window_days)
+
+    # The trim dropped every historical edge, so features would be computed on the
+    # submitted transactions alone: PageRank collapses to ~1/n, clustering and
+    # cycle participation to 0. A tier and an action derived from that are a
+    # threshold calibrated on a 60-day graph applied to a 4-edge one — well-formed
+    # and meaningless. Any present-day timestamp lands here, because the context
+    # file ends 2025-04-30, so this is the common case rather than the exotic one.
+    #
+    # Refused with 422 rather than returned as a 200 with `risk_level` and
+    # `action` suppressed: both are required fields on NodeRiskScore, and a
+    # response the caller must inspect for absent fields degrades exactly as
+    # quietly as the warning string that used to be the only signal. Refusing is
+    # also what this endpoint already does in the other two states it cannot score
+    # honestly in — 503 when a prerequisite is missing, 500 when the extractor has
+    # diverged from the contract.
+    if diag["n_context_used"] == 0:
+        raise HTTPException(status_code=422, detail="\n".join(diag["warnings"]))
 
     # ── features, from the same code path that produced the training set ──
     # The frozen reference partition goes in, so community membership is not
@@ -772,13 +861,14 @@ async def score_transactions(request: ScoringRequest):
             # with position only because the frame was freshly built.
             risk_score=float(probabilities[i]),
             threshold=threshold,
+            break_even_probability=break_even,
             contributing_factors=factors[i],
             seen_in_context=node in context_accounts,
         ))
 
     # Final safety validation — re-derives tier and action from the score, so a
     # response cannot reach the caller with a downgraded action.
-    node_scores = validate_response_batch(node_scores, threshold)
+    node_scores = validate_response_batch(node_scores, threshold, break_even)
 
     risk_counts: dict[str, int] = {}
     for ns in node_scores:
