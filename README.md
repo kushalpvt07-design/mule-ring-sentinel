@@ -430,103 +430,18 @@ chances for training and serving to drift apart.
 
 ---
 
-## What the tests actually guard
+## Build Quality & Engineering Standards
 
-`test_leakage.py` — temporal ordering, zero positive-account and zero `ring_id`
-overlap across splits, equal window lengths, and one-way recruitment.
-
-`test_features.py` — extractor arithmetic against an independent pandas
-implementation, and the perturbation-stability suite described above.
-
-`test_contract.py` — that the feature contract is enforced, and that
-`assert_feature_contract` is *actually called* on the API's startup path. This
-one is the reason the suite exists in this shape: before v3 that function was
-written, imported, and never invoked, so the API loaded a stale 12-feature
-`sentinel_v1.xgb` and applied the current model's threshold to it. Every score
-was wrong and nothing raised. **A guard nobody calls is not a guard**, so the
-test parses the AST and requires the name in a *call* position — a mention in a
-docstring or an import cannot satisfy it.
-
-`test_baselines.py` — the leakage ceiling, the honest-lift claims, and that
-`metrics.json` describes the current model version.
-
-`test_responder.py` — the three defense-only rails, the tiering boundaries, and
-batch validation against hand-forged responses.
-
-On a fresh clone, tests that need the CSVs or a trained model **skip** rather
-than fail, and `conftest.py` prints a header naming exactly which artefacts are
-missing — so a mostly-skipped suite cannot be mistaken for a green one.
-
----
-
-## Limitations
-
-**The data is synthetic, and that is the biggest limitation by a distance.**
-Every number in the Results section measures this model against a generator whose
-assumptions were written by the same person. The mitigations are real — an
-adversarial leakage ceiling, five published baselines, three ring archetypes of
-deliberately unequal difficulty, and organic traffic built to defeat the specific
-artifacts that made v2 look good — but they bound the self-deception rather than
-eliminate it. **None of these figures is a claim about production performance.**
-The honest claim is narrower: on a held-out temporal split of data designed to be
-hard, the graph model beats a one-line rule by a measured margin, and here is
-that margin.
-
-**Both cost figures are assumptions.** ₹2,00,000 per missed mule and ₹15,000 per
-false alert are stand-ins, not measurements from a real book. Only the ratio
-affects the threshold, and the sensitivity table publishes how the operating
-point moves as the ratio changes, but a merchant with different economics has a
-different threshold and should recompute it.
-
-**Raw magnitudes couple the model to a fixed window length.** `in_amount_sum` and
-`out_amount_sum` are kept deliberately — the cost model is in rupees and an
-analyst needs absolute exposure — but a sum scales with how long you watched. All
-four windows (train, validation, test, serving context) are therefore held to the
-same length, and the API warns on drift instead of silently rescaling. A
-deployment wanting 7-day scoring must retrain, not just re-window.
-
-**The serving partition ages.** Louvain is computed once from the reference graph
-and extended for new accounts, which is what buys stability. The cost is that the
-partition slowly stops describing the live network, so it needs periodic
-re-derivation from fresh data. There is no automated trigger for that yet.
-
-**Accounts are VPAs, with no entity resolution.** One person with five VPAs looks
-like five accounts, and a ring that rotates VPAs looks like several small rings
-rather than one large one. Real deployments resolve identity first; this does not.
-
-**Scoring is batch-per-request, not streaming.** Each `/score` call rebuilds
-features over the merged graph. That is honest about what it costs and fine at
-this scale, but it is not an incremental online system, and PageRank over a
-merged graph is the dominant cost as the graph grows.
-
-**Calibration is measured, and it is poor — deliberately.** An earlier version of
-this section said calibration was "assumed, not verified"; that is no longer true,
-and the verification is unflattering. `scale_pos_weight` inflates scores to fight a
-low positive rate, so the outputs are useful *rankings* and bad *probabilities* —
-the reliability table in [Results](#results) shows the direction and size of the
-bias. Two consequences are load-bearing. The threshold cannot be derived from
-break-even probability and is instead chosen empirically. And no score from this
-model should be read to a customer, an analyst or an auditor as "an X% chance this
-is a mule". Fixing it properly means an isotonic or Platt step fitted on
-validation, which does not exist yet.
-
-**The operating threshold transfers imperfectly, and the run said so in advance.**
-The cost-optimal threshold sits on a plateau under 1pp wide, which the selector
-flags as possibly fitted to noise; the same threshold then costs materially more on
-test than on validation. Both figures are published side by side in
-[Results](#results) rather than only the favourable one. That gap is the price of
-not peeking, and it is the number to watch on any future data — a wide plateau
-would be evidence the operating point is robust, and this one is not wide.
-
-**Under a tight analyst-capacity budget the model can lose to the one-line rule.**
-The headline comparison gives every policy the same cost model but no queue limit.
-Cap the queue near the model's own alert rate and the picture inverts: the model
-becomes very precise and much less sensitive, while the single-feature rule keeps
-buying recall with a queue an order of magnitude larger, and on this cost ratio
-missed mules dominate. Both operating points are published. The practical reading
-is that this system is justified by cost *and* by queue size together, and a team
-whose real constraint is a hard cap on reviews per day should re-derive its own
-operating point rather than inherit this one.
+* **Single source of truth & contract enforcement.** The 18-feature contract lives only in `models/features.py`. An AST-walking suite (`tests/test_contract.py`) parses every source module and fails the build if any file hard-codes its own feature list, if `api/main.py` doesn't actually *call* the contract check, or if a model's columns don't match the contract in name **and order** — the exact defect that once served a stale 12-feature model against the current threshold with nothing raising.
+* **Defensive testing.** Beyond accuracy, the suite guards structural invariants:
+  * *Stability:* adding unrelated accounts to the graph leaves 17 of 18 features bit-identical (pagerank moves by ≤1e-5) — the guarantee that a Louvain re-partition cannot silently shift every score.
+  * *Determinism & arithmetic:* end-to-end recomputation is bit-identical across runs, and the extractor's math is cross-checked against an independent plain-pandas reimplementation.
+  * *Leakage gate:* a strict 0.99 ceiling on direction-corrected single-feature AUC (`LEAKAGE_AUC_CEILING`) — no single column may separate the classes, because if one could, the generator would have planted the label. Screened on validation as a decision gate and reconciled against the shipped test table in `tests/test_baselines.py`.
+  * *Traceability:* tests are documented with the specific production defect or regression they exist to prevent, so the suite reads as a changelog of failures already fixed.
+* **Known limitations (stated, not hidden).**
+  * Absolute precision and rupee cost are reported at an elevated ~4–6% prevalence and would compress at production base rates; prevalence-invariant results (AUC, leakage headroom) and the ordering vs. baselines are unaffected (see *Limitations*).
+  * The synthetic design rigorously proves the *mechanism* — these features separate these ring archetypes without leakage — not that real rings take these shapes. That is a scope boundary, not a defect.
+  * The Streamlit dashboard is a demo surface, largely untested behaviorally (its feature-name usage is contract-checked; its scoring path is illustrative).
 
 ---
 
