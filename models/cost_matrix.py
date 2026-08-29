@@ -365,6 +365,424 @@ def average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════
+# Are the probabilities believable as probabilities?
+# ══════════════════════════════════════════════════════════════════
+
+def brier_score(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """
+    Mean squared error between predicted probability and outcome.
+
+    Reported alongside AUC because the two answer different questions and this
+    project only ever answered the first. AUC asks whether the RANKING is right;
+    Brier asks whether the NUMBER is right. A model can rank perfectly (AUC 1.0)
+    while every probability it emits is wrong by 40 points, and the moment anyone
+    reads a score as "a 90% chance this account is a mule" — which the dashboard
+    invites and `scale_pos_weight` guarantees is false — the ranking metric stops
+    covering the claim being made.
+
+    Returns NaN for empty input: there is no mean to take.
+    """
+    y = np.asarray(y_true).astype(float).ravel()
+    p = np.asarray(y_prob, dtype=float).ravel()
+    if y.shape != p.shape:
+        raise ValueError(f"shape mismatch: y_true {y.shape}, y_prob {p.shape}")
+    if y.size == 0:
+        return float("nan")
+    return float(np.mean((p - y) ** 2))
+
+
+def reliability_table(
+    y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10
+) -> pd.DataFrame:
+    """
+    Predicted probability versus observed frequency, in equal-width bins.
+
+    Equal-width and not equal-count on purpose. Quantile bins would spread this
+    model's scores — which pile up near zero — into a table that looks well
+    populated everywhere and hides that the interesting region above p=0.5 holds
+    a handful of accounts. Equal width shows the pile-up, and `n` is published per
+    row so a reader can see which rows carry any weight.
+
+    Empty bins are KEPT, with `observed_frequency` as None rather than 0.0: a bin
+    no account landed in has no observed frequency, and 0.0 there would draw a
+    reliability curve diving to the floor through regions where nothing was ever
+    predicted. Same null-versus-zero rule as `_prf`.
+
+    Bin edges are [0, 1/n, ..., 1] and each bin is left-closed, right-open, so a
+    score sitting exactly on an edge lands in the higher bin. The last bin is
+    closed on both sides, so a predicted probability of exactly 1.0 falls in it
+    instead of falling out of the table.
+    """
+    y = np.asarray(y_true).astype(int).ravel()
+    p = np.asarray(y_prob, dtype=float).ravel()
+    if y.shape != p.shape:
+        raise ValueError(f"shape mismatch: y_true {y.shape}, y_prob {p.shape}")
+    if n_bins < 1:
+        raise ValueError(f"n_bins must be >= 1, got {n_bins}")
+    if p.size and (p.min() < 0.0 or p.max() > 1.0):
+        raise ValueError(
+            f"y_prob must lie in [0, 1] to be binned as probabilities; got "
+            f"[{p.min():.4g}, {p.max():.4g}]. Margin-space scores need a "
+            "sigmoid first."
+        )
+
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    # Digitize against the INTERIOR edges only: that yields 0..n_bins-1 directly,
+    # with p == 1.0 landing in the last bin because no interior edge exceeds it.
+    # The clip is belt-and-braces against a floating-point edge case, not logic.
+    idx = np.clip(np.digitize(p, edges[1:-1], right=False), 0, n_bins - 1)
+
+    rows = []
+    for b in range(n_bins):
+        in_bin = idx == b
+        n = int(in_bin.sum())
+        rows.append({
+            "bin_lower": float(edges[b]),
+            "bin_upper": float(edges[b + 1]),
+            "n": n,
+            "mean_predicted": float(p[in_bin].mean()) if n else None,
+            "observed_frequency": float(y[in_bin].mean()) if n else None,
+        })
+    return pd.DataFrame(rows)
+
+
+def expected_calibration_error(
+    y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10
+) -> float | None:
+    """
+    Σ (nₖ/N)·|mean predicted − observed frequency| over non-empty bins.
+
+    The single number that says how far the probabilities are from meaning what
+    they say, weighted so a badly-calibrated bin holding four accounts cannot
+    outweigh a well-calibrated one holding four thousand.
+
+    Returns None for empty input. Not a substitute for the table above — ECE is a
+    weighted average and averages hide direction, so a model over-confident at
+    the top and under-confident at the bottom can post a flattering ECE. Both are
+    published; the table is the one to read.
+    """
+    table = reliability_table(y_true, y_prob, n_bins)
+    populated = table[table["n"] > 0]
+    total = int(populated["n"].sum())
+    if total == 0:
+        return None
+    gap = (populated["mean_predicted"] - populated["observed_frequency"]).abs()
+    return float((populated["n"] / total * gap).sum())
+
+
+def _sigmoid(a: np.ndarray) -> np.ndarray:
+    """
+    Logistic function, branched so neither tail overflows.
+
+    `1/(1+exp(-a))` is correct mathematically and noisy in practice: at a ≈ -750
+    `exp(-a)` overflows to inf, which yields the right answer (0.0) after emitting
+    a RuntimeWarning per call. Real logits reach ±14 here, well short of that, but
+    the calibrated map is applied to clipped scores whose logits are set by `eps`
+    and a caller is free to tighten it. Evaluating each tail with the form that
+    cannot overflow keeps a training log free of warnings that mean nothing.
+    """
+    a = np.asarray(a, dtype=float)
+    out = np.empty_like(a)
+    pos = a >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-a[pos]))
+    e = np.exp(a[~pos])
+    out[~pos] = e / (1.0 + e)
+    return out
+
+
+@dataclass(frozen=True)
+class PlattScaler:
+    """
+    A fitted 1-D logistic map from raw score to calibrated probability.
+
+    `slope`/`intercept` act on the LOG-ODDS of the raw score, not the score
+    itself: sigmoid(slope · logit(p) + intercept). Fitting on the logit rather
+    than the raw probability is what makes the map monotone AND leaves an
+    already-calibrated model at slope 1, intercept 0, so the fitted parameters
+    are readable as "how wrong were the probabilities, and in which direction".
+    """
+    slope: float
+    intercept: float
+    n_fit: int
+    n_positive_fit: int
+    converged: bool
+    n_iterations: int
+    eps: float
+
+    def transform(self, y_prob: np.ndarray) -> np.ndarray:
+        """Apply the fitted map. Monotone, so it cannot change any ranking."""
+        p = np.clip(np.asarray(y_prob, dtype=float).ravel(), self.eps,
+                    1.0 - self.eps)
+        z = np.log(p / (1.0 - p))
+        return _sigmoid(self.slope * z + self.intercept)
+
+    def as_dict(self) -> dict:
+        return {
+            "method": "platt_scaling_on_logits",
+            "slope": round(float(self.slope), 6),
+            "intercept": round(float(self.intercept), 6),
+            "fit_on": "validation",
+            "n_fit": int(self.n_fit),
+            "n_positive_fit": int(self.n_positive_fit),
+            "converged": bool(self.converged),
+            "n_iterations": int(self.n_iterations),
+        }
+
+
+def fit_platt_scaling(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    *,
+    eps: float = 1e-6,
+    max_iter: int = 100,
+    tol: float = 1e-10,
+    ridge: float = 1e-8,
+) -> PlattScaler:
+    """
+    Two-parameter Platt calibration, fitted by Newton-IRLS in numpy.
+
+    WHY PLATT AND NOT ISOTONIC
+    ──────────────────────────
+    Isotonic regression is the more flexible calibrator and the wrong choice here.
+    It fits a step function with as many degrees of freedom as the data allows,
+    and the fitting set is one validation split with roughly 136 positives — few
+    enough that isotonic would carve those positives into steps and calibrate to
+    the noise in them. Platt has two parameters and cannot overfit 136 positives
+    in any interesting way. With more positives the trade reverses.
+
+    WHY THIS IS A DIAGNOSTIC AND NOT A CHANGE TO THE MODEL
+    ─────────────────────────────────────────────────────
+    The map is strictly increasing in the score whenever `slope > 0`, so in exact
+    arithmetic it cannot reorder any two accounts: ROC-AUC, average precision, and
+    the ranking the alert queue is built from are all invariant. In float64 the
+    honest statement is slightly weaker — it is monotone NON-decreasing, because
+    compressing logits can round two adjacent scores onto the same double. On a
+    200k-row check that merged 212 pairs out of 200,000 and inverted none; ROC-AUC
+    was identical to all sixteen digits and average precision moved by 1e-16,
+    which is summation noise. So: it can create a tie, it cannot swap a pair.
+
+    What it does change is the NUMBER attached to a rank, which is why it is
+    reported next to Brier and ECE and deliberately NOT wired into the serving
+    path: the shipped threshold was selected on the raw scale, and re-scaling
+    scores under a threshold chosen for the old scale would silently move the
+    operating point.
+
+    TARGET SMOOTHING
+    ────────────────
+    Fitted against Platt's smoothed targets, (n₊+1)/(n₊+2) for positives and
+    1/(n₋+2) for negatives, rather than hard 0/1. Without it, a validation split
+    that happens to be perfectly separable at some score drives the slope to
+    infinity — the fit diverges on exactly the data that looks best.
+
+    Raises ValueError on a single-class fitting split: there is nothing to
+    calibrate against and the returned map would be an artefact of the smoothing
+    constants alone.
+
+    One identifiability note: if every score in the fitting split is identical,
+    `slope` and `intercept` are individually arbitrary — only their combination
+    `slope·z + intercept` is determined, and the ridge term picks one of the
+    infinitely many equivalent pairs. That is harmless because `transform` only
+    ever uses the combination, but it means the reported slope should not be read
+    as meaningful on a degenerate split.
+    """
+    y = np.asarray(y_true).astype(int).ravel()
+    p = np.asarray(y_prob, dtype=float).ravel()
+    if y.shape != p.shape:
+        raise ValueError(f"shape mismatch: y_true {y.shape}, y_prob {p.shape}")
+    if not (0.0 < eps < 0.5):
+        raise ValueError(f"eps must lie in (0, 0.5), got {eps}")
+    n_pos = int(y.sum())
+    n_neg = int(y.size - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        raise ValueError(
+            f"cannot fit a calibrator on a single-class split "
+            f"({n_pos} positive, {n_neg} negative): the fitted map would encode "
+            "the target-smoothing constants and nothing about the model."
+        )
+
+    # Clipping before the logit is what keeps a score of exactly 0.0 or 1.0 from
+    # becoming an infinite feature. The same eps is stored on the scaler so
+    # `transform` clips identically at apply time.
+    p_clipped = np.clip(p, eps, 1.0 - eps)
+    z = np.log(p_clipped / (1.0 - p_clipped))
+    target = np.where(y == 1, (n_pos + 1.0) / (n_pos + 2.0),
+                      1.0 / (n_neg + 2.0))
+
+    X = np.column_stack([z, np.ones_like(z)])
+
+    def nll(par: np.ndarray) -> float:
+        """
+        Negative log-likelihood against the smoothed targets.
+
+        Written with `logaddexp` rather than `log(mu)` because the logits reach
+        ±14 on real scores, where `mu` rounds to exactly 0.0 or 1.0 and `log`
+        of it is -inf. `logaddexp(0, -a)` is the same quantity computed without
+        ever forming the probability.
+        """
+        a = X @ par
+        return float(np.sum(target * np.logaddexp(0.0, -a)
+                            + (1.0 - target) * np.logaddexp(0.0, a)))
+
+    params = np.array([1.0, 0.0])            # start at the identity map
+    loss = nll(params)
+    converged, used = False, 0
+    for used in range(1, max_iter + 1):
+        mu = _sigmoid(X @ params)
+        w = np.clip(mu * (1.0 - mu), 1e-12, None)     # keep the Hessian invertible
+        grad = X.T @ (mu - target)
+        hess = X.T @ (X * w[:, None]) + ridge * np.eye(2)
+        step = np.linalg.solve(hess, grad)
+
+        # THE DAMPING IS NOT OPTIONAL. Undamped Newton diverges on this problem:
+        # measured on a 200k-row calibration check, the full step oscillated and
+        # then blew the slope up to 3e10 by iteration five, on input whose correct
+        # slope is 0.5. The Hessian was well conditioned throughout (cond ≈ 3) —
+        # the direction was right and the length was wrong, which is exactly what
+        # a line search fixes and what no amount of extra ridge would have. With
+        # backtracking the same fit lands on slope 0.4979 in seven iterations.
+        descent = float(grad @ step)         # > 0 whenever `step` descends
+        scale, accepted = 1.0, False
+        for _ in range(60):
+            candidate = params - scale * step
+            candidate_loss = nll(candidate)
+            # Armijo: demand a decrease proportional to the step actually taken,
+            # so a step that merely fails to make things worse is not accepted.
+            if candidate_loss <= loss - 1e-4 * scale * descent:
+                accepted = True
+                break
+            scale *= 0.5
+        if not accepted:
+            # No downhill step remains at machine precision: this IS the optimum,
+            # not a failure. Reporting it as non-convergence would put a false
+            # warning in metrics.json on a perfectly good fit.
+            converged = True
+            break
+
+        moved = float(np.max(np.abs(scale * step)))
+        params, loss = candidate, candidate_loss
+        if moved < tol:
+            converged = True
+            break
+
+    return PlattScaler(
+        slope=float(params[0]), intercept=float(params[1]),
+        n_fit=int(y.size), n_positive_fit=n_pos,
+        converged=converged, n_iterations=int(used), eps=float(eps),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# Projecting a measured operating point onto a different base rate
+# ══════════════════════════════════════════════════════════════════
+
+def precision_at_prevalence(
+    tpr: float, fpr: float, prevalence: float
+) -> float | None:
+    """
+    The precision this operating point would show at a different base rate.
+
+        P(π) = π·TPR / (π·TPR + (1 − π)·FPR)
+
+    WHY THIS IS ARITHMETIC AND NOT A NEW EXPERIMENT
+    ───────────────────────────────────────────────
+    TPR and FPR are measured *within* a class, so neither depends on how many of
+    each class exists: both are properties of where the threshold falls in the
+    two class-conditional score distributions. Precision is not — its
+    denominator is the alert queue, which at low base rates is almost entirely
+    majority class. That asymmetry is the entire reason a fraud precision figure
+    measured at ~4% prevalence cannot be quoted at a production base rate of a
+    fraction of a percent, and the reason the correction needs no retraining.
+
+    WHAT IT ASSUMES, WHICH IS WHERE A REVIEWER SHOULD PUSH
+    ─────────────────────────────────────────────────────
+    That the two class-conditional score distributions are UNCHANGED at the new
+    base rate. Re-weighting the class mix is valid; this does not model a
+    population whose mules launder differently or whose organic traffic is shaped
+    differently. So it answers "what would this queue look like if mules were
+    rarer", not "what will this model do in production". The second question
+    needs real data and is out of scope — see the README's Limitations.
+
+    Returns None, never 0.0, when the projected queue is empty (nothing flagged
+    in either class): an empty queue has made no measurement. Same convention as
+    `_prf` — see its docstring for why that distinction is load-bearing here.
+    """
+    for name, value in (("tpr", tpr), ("fpr", fpr), ("prevalence", prevalence)):
+        v = float(value)
+        if not np.isfinite(v) or not 0.0 <= v <= 1.0:
+            raise ValueError(
+                f"{name} must be a finite rate in [0, 1], got {value!r}"
+            )
+    pi = float(prevalence)
+    hits = pi * float(tpr)
+    false_alarms = (1.0 - pi) * float(fpr)
+    if hits + false_alarms <= 0.0:
+        return None
+    return float(hits / (hits + false_alarms))
+
+
+def prevalence_for_precision(
+    tpr: float, fpr: float, target_precision: float
+) -> float | None:
+    """
+    The base rate at which this operating point's precision equals a target.
+
+    Inverting P(π) above:
+
+        π = q·FPR / (TPR·(1 − q) + q·FPR)      for target precision q
+
+    The use here is to locate where projected precision crosses the cost model's
+    break-even precision p*. Below that base rate this operating point's queue
+    costs more to work than to ignore, which is a boundary worth publishing
+    rather than discovering in production. Above it, the queue pays for itself
+    even though precision looks poor in absolute terms.
+
+    Returns 0.0 when FPR is 0 — a queue with no false positives clears any
+    target below 1.0 at every non-zero base rate, so the crossing is the limit at
+    the bottom of the range rather than a point inside it.
+
+    Returns None when TPR is 0: a policy that catches nothing has no base rate at
+    which its queue becomes worth working, and reporting some finite prevalence
+    there would imply one exists.
+    """
+    for name, value in (("tpr", tpr), ("fpr", fpr),
+                        ("target_precision", target_precision)):
+        v = float(value)
+        if not np.isfinite(v) or not 0.0 <= v <= 1.0:
+            raise ValueError(
+                f"{name} must be a finite rate in [0, 1], got {value!r}"
+            )
+    t, f, q = float(tpr), float(fpr), float(target_precision)
+    if t <= 0.0:
+        return None
+    if f <= 0.0:
+        return 0.0
+    denominator = t * (1.0 - q) + q * f
+    if denominator <= 0.0:            # q == 1 and TPR == 0, already excluded
+        return None                   # pragma: no cover — defensive
+    return float(q * f / denominator)
+
+
+def _rates_from_counts(report: ThresholdReport) -> tuple[float, float]:
+    """
+    TPR and FPR from a report's confusion counts.
+
+    Raises rather than returning None on a single-class split: projecting a base
+    rate needs both class-conditional rates, and a split with no negatives cannot
+    estimate FPR. A caller reaching that state has sliced wrongly, and should
+    hear about it here rather than read a projection built on a missing half.
+    """
+    positives = report.tp + report.fn
+    negatives = report.fp + report.tn
+    if positives == 0 or negatives == 0:
+        raise ValueError(
+            "cannot project a base rate from a single-class split: "
+            f"{positives} positives, {negatives} negatives. Both "
+            "class-conditional rates (TPR, FPR) are required."
+        )
+    return report.tp / positives, report.fp / negatives
+
+
+# ══════════════════════════════════════════════════════════════════
 # Evaluator
 # ══════════════════════════════════════════════════════════════════
 
@@ -862,6 +1280,100 @@ class CostEvaluator:
                 "test_f1": realised.f1,
                 "test_alerts_per_1000": realised.alerts_per_1000,
                 "test_total_cost": realised.total_cost,
+            })
+        return pd.DataFrame(rows)
+
+    def break_even_prevalence(self, report: ThresholdReport) -> float | None:
+        """
+        The base rate below which this operating point stops paying for itself.
+
+        Where projected precision crosses p*. Above this prevalence the alert
+        queue is cheaper to work than to ignore; below it the arithmetic inverts
+        and the correct response is not "ship anyway" but to move up the ROC
+        curve — trade recall for precision until the queue clears p* again, which
+        `find_optimal_threshold` will do on its own once it is given scores from a
+        population at that base rate.
+
+        None when the crossing is undefined; see `prevalence_for_precision`.
+        """
+        tpr, fpr = _rates_from_counts(report)
+        return prevalence_for_precision(
+            tpr, fpr, self.config.break_even_probability
+        )
+
+    def project_to_prevalence(
+        self,
+        report: ThresholdReport,
+        prevalences: tuple[float, ...] | None = None,
+    ) -> pd.DataFrame:
+        """
+        This operating point re-priced at other base rates.
+
+        WHY THIS TABLE EXISTS
+        ─────────────────────
+        The generator elevates mule prevalence to give the model enough
+        positive-class signal to learn from, so every precision and rupee figure
+        in this report is measured at a base rate well above a real payment
+        network's. Quoting those numbers without the correction invites a reviewer
+        to discover the problem for us; publishing the projection answers it in
+        advance, and costs nothing but arithmetic — see
+        `precision_at_prevalence` for why re-weighting is legitimate and for the
+        one assumption it makes.
+
+        WHAT MOVES AND WHAT DOES NOT
+        ────────────────────────────
+        `recall` is constant down the table on purpose. It is a within-class rate,
+        so the base rate cannot touch it — as with ROC-AUC and the leakage
+        headroom, and unlike precision and total cost. Reading the two columns
+        side by side is the fastest way to see which of this project's claims
+        survive a change of base rate and which are contingent on the synthetic
+        mix.
+
+        Counts behind the cost column are EXPECTED values at the stated
+        prevalence, so `projected_cost_per_1000_accounts` is a rate rather than a
+        realised total and is deliberately not rounded to whole rupees: rounding
+        an expectation to the nearest rupee implies a precision it does not have.
+        """
+        tpr, fpr = _rates_from_counts(report)
+        n = report.tp + report.fp + report.tn + report.fn
+        observed = (report.tp + report.fn) / n
+
+        if prevalences is None:
+            # Descending, and de-duplicated against the observed rate so a
+            # coincidence between the two does not emit the row twice — the same
+            # convention `sensitivity_to_cost_ratio` uses for its spine.
+            prevalences = tuple(sorted(
+                {0.02, 0.01, 0.005, 0.002, 0.001, round(float(observed), 6)},
+                reverse=True,
+            ))
+
+        p_star = self.config.break_even_probability
+        rows = []
+        for pi in prevalences:
+            precision = precision_at_prevalence(tpr, fpr, pi)
+            expected_fn = 1000.0 * pi * (1.0 - tpr)
+            expected_fp = 1000.0 * (1.0 - pi) * fpr
+            rows.append({
+                "prevalence": float(pi),
+                # `<=`, not `<`: the ladder carries the observed rate ROUNDED to
+                # six places, whose error against `observed` is at most exactly
+                # 5e-7. A strict comparison leaves the tie unflagged, and then no
+                # row in the table is marked as the one actually measured.
+                "is_observed": bool(abs(float(pi) - observed) <= 5e-7),
+                "recall": float(tpr),
+                "projected_precision": precision,
+                # None, not False, when precision is not computable: "we cannot
+                # tell" and "it fails" are different findings.
+                "clears_break_even": (
+                    None if precision is None else bool(precision >= p_star)
+                ),
+                "projected_alerts_per_1000": float(
+                    1000.0 * (pi * tpr + (1.0 - pi) * fpr)
+                ),
+                "projected_cost_per_1000_accounts": float(
+                    expected_fn * self.config.fn_cost
+                    + expected_fp * self.config.fp_cost
+                ),
             })
         return pd.DataFrame(rows)
 

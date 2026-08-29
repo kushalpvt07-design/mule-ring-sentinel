@@ -1174,7 +1174,10 @@ def main() -> None:
 
         features = process_split(split.upper(), edges_path)
         out_path = PROCESSED_DIR / f"{split}_features.csv"
-        features.to_csv(out_path, index=False)
+        # lineterminator="\n" for the same reason metrics.json is written that
+        # way: a feature table that differs on every line between platforms is
+        # not usefully diffable, and these files are the pipeline's contract.
+        features.to_csv(out_path, index=False, lineterminator="\n")
         print(f"  {sym('arrow')} {out_path.name} "
               f"({len(features):,} rows x {features.shape[1]} cols)")
 

@@ -447,6 +447,124 @@ def render(metrics: dict) -> str:
                 "",
             ]
 
+    # ── how far off the probabilities are, and proof the fix was not applied ──
+    # The section above says the scores are not probabilities. This one says by
+    # HOW MUCH, which is what turns a conceded limitation into a measured one.
+    #
+    # The load-bearing row is ROC-AUC. A calibrator printed in a report is an
+    # invitation to wire it in, and the shipped threshold was selected on the RAW
+    # scale — rescale the scores underneath it and every operating point in this
+    # README moves without a word appearing anywhere. Publishing both AUCs makes
+    # "it cannot re-rank the queue" checkable by a reader instead of asserted by
+    # the author, and tests/test_baselines.py asserts it too.
+    platt = metrics.get("probability_calibration") or {}
+    scaler = platt.get("scaler") or {}
+    invariance = platt.get("ranking_invariance") or {}
+    raw_side = platt.get("test_raw") or {}
+    cal_side = platt.get("test_calibrated") or {}
+    if scaler and invariance:
+        slope = scaler.get("slope")
+        # Over- versus under-confident is a measurement of this run's slope, not
+        # a property of `scale_pos_weight`, so the word is derived. The flat band
+        # is a hair either side of 1.0, where both "sharpens" and "shrinks" would
+        # overstate a difference the fourth decimal place cannot support.
+        if _absent(slope):
+            spread = "moved the spread of the scores by an unrecorded amount"
+        elif abs(float(slope) - 1.0) <= 5e-3:
+            spread = ("left the spread essentially untouched, so on this run the "
+                      "scores were already about as sharp as the evidence "
+                      "supports")
+        elif float(slope) < 1.0:
+            spread = ("shrinks the log-odds — the signature of "
+                      "**over**-confident scores, spread wider than the evidence "
+                      "supports, which is the expected effect of "
+                      "`scale_pos_weight`")
+        else:
+            spread = ("sharpens the log-odds, meaning the raw scores were "
+                      "**under**-confident")
+        positives = scaler.get("n_positive_fit")
+        lines += [
+            "### How far off the probabilities are",
+            "",
+            f"A two-parameter Platt map (a logistic fit on the score log-odds) "
+            f"was fitted on **{_plain(platt.get('fitted_on'))}** and measured on "
+            f"**{_plain(platt.get('measured_on'))}**, the same split discipline "
+            f"every threshold here follows. Slope "
+            f"{_num(slope, 4)}, intercept "
+            f"{_num(scaler.get('intercept'), 4, signed=True)}: it {spread}."
+            + ("" if _absent(positives) else
+               f" Two parameters rather than an isotonic fit because the "
+               f"validation split carries only {_plain(positives)} positives, "
+               f"and a free-form monotone fit on that many points memorises "
+               f"them.")
+            + ("" if scaler.get("converged", True) else
+               " **The fit did not converge**, so the numbers below describe an "
+               "unfinished optimisation and should not be quoted."),
+            "",
+            "| | raw | calibrated | change |",
+            "|---|---|---|---|",
+        ]
+        for label, key, places in (
+            ("Brier score", "brier_score", 5),
+            ("Expected calibration error", "expected_calibration_error", 5),
+        ):
+            before, after = raw_side.get(key), cal_side.get(key)
+            delta = (ABSENT if _absent(before) or _absent(after)
+                     else _num(float(after) - float(before), places, signed=True))
+            lines.append(f"| {label} | {_num(before, places)} "
+                         f"| {_num(after, places)} | {delta} |")
+        auc_raw = invariance.get("test_auc_raw")
+        auc_cal = invariance.get("test_auc_calibrated")
+        auc_delta = (ABSENT if _absent(auc_raw) or _absent(auc_cal)
+                     else _num(float(auc_cal) - float(auc_raw), 6, signed=True))
+        lines += [
+            f"| ROC-AUC | {_num(auc_raw, 5)} | {_num(auc_cal, 5)} "
+            f"| {auc_delta} |",
+            "",
+        ]
+        # The verdict on the AUC row is derived, because it is the one row whose
+        # meaning inverts: a delta at the tolerance is the guarantee holding, and
+        # a delta above it is a silent change to the model. A fixed sentence here
+        # would keep reassuring the reader on the day it stopped being true.
+        delta_value = invariance.get("abs_delta")
+        tolerance = invariance.get("tolerance")
+        if _absent(delta_value) or _absent(tolerance):
+            verdict = ("The AUC comparison was not recorded, so nothing is "
+                       "claimed here about whether the map preserves the "
+                       "ranking.")
+        elif float(delta_value) <= float(tolerance):
+            # An exact zero is the common case and "moves by 0.0e+00" reads as a
+            # rounding artefact rather than the clean result it is, so the two
+            # are worded apart.
+            moved = ("does not move at all" if float(delta_value) == 0.0 else
+                     f"moves by {float(delta_value):.1e}, inside the "
+                     f"{float(tolerance):.0e} float-summation tolerance")
+            verdict = (
+                f"ROC-AUC {moved} — the map is monotone, so it can compress two "
+                f"adjacent scores into a tie but cannot swap a pair. **The alert "
+                f"queue is in the same order.** That is what makes this a "
+                f"diagnostic and not an undisclosed model change: nothing above "
+                f"or below this section is computed on the calibrated scale.")
+        else:
+            verdict = (
+                f"⚠️ ROC-AUC moved by {float(delta_value):.2e}, **outside** the "
+                f"{float(tolerance):.0e} tolerance. A calibrator that re-ranks "
+                f"accounts is not a calibrator, and this block should not be "
+                f"trusted until that is explained.")
+        lines += [
+            verdict,
+            "",
+            "The map is reported and never applied. The operating threshold in "
+            "the headline table was selected on the raw scores, so calibrating "
+            "underneath it would move the published precision, recall and cost "
+            "without changing a single number in this README. If a downstream "
+            "consumer needs scores that read as probabilities — expected-loss "
+            "arithmetic, or blending with another model's output — apply this "
+            "map at that boundary and re-select the threshold on the calibrated "
+            "scale.",
+            "",
+        ]
+
     # ── sensitivity to the one unverifiable assumption ──
     # Rendered only for the split-tagged schema. The legacy schema's numbers were
     # test-optimised, and re-publishing them would restate the defect.
@@ -735,6 +853,247 @@ def render(metrics: dict) -> str:
                 "",
             ]
 
+    # ── the same cap, applied to everybody ──
+    # The section above caps the MODEL and then compares it against baselines
+    # still free to flood the queue. That is not a fair fight and the asymmetry
+    # favours the baselines: at a 13:1 miss-to-false-alert ratio, misses dominate
+    # the total, so any policy allowed unlimited alerts wins on cost by
+    # construction. The paragraph above says so in words; this table is the
+    # measurement, with the budget binding on every row.
+    #
+    # The uncapped table is NOT removed. Two framings of the same comparison,
+    # both published, is the honest form — a reader who cares about cost alone and
+    # a reader whose binding constraint is reviews-per-day are asking different
+    # questions and both deserve an answer.
+    fair = metrics.get("capacity_fair_comparison") or []
+    if fair and budget:
+        scored = [r for r in fair if not _absent(r.get("val_threshold"))]
+        lines += [
+            "#### The same cap, applied to every policy",
+            "",
+            f"Each threshold below was re-selected **on validation** to fit the "
+            f"same {_num(budget, 0)} alerts per 1,000 accounts, then applied once "
+            f"to test. The two trivial policies have no threshold to select and "
+            f"are priced closed-form.",
+            "",
+            "| policy under the cap | val threshold | precision | recall | F1 "
+            "| alerts / 1,000 (test) | total cost |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for row in fair:
+            name = str(row.get("policy", ABSENT))
+            if row.get("is_model"):
+                name = f"**{name}**"
+            if row.get("feasible_under_budget") is False:
+                # Not a footnote: flagging every account is 1,000 alerts per
+                # 1,000 and cannot be made to fit any cap below that. It stays in
+                # the table so a reader sees the excluded policy rather than
+                # wondering whether it was quietly dropped.
+                name += " _(infeasible)_"
+            alerts = _num(row.get("test_alerts_per_1000"), 1)
+            if (row.get("test_within_budget") is False
+                    and not _absent(row.get("val_threshold"))):
+                # A validation-frozen threshold CAN overflow on test: the score
+                # distribution moved and the threshold did not. Marked rather
+                # than re-solved — re-fitting the threshold until the constraint
+                # held would be selection on test wearing a capacity argument as
+                # a disguise.
+                #
+                # Gated on there BEING a validation threshold, because the legend
+                # below describes exactly that case. Flag-everything is over the
+                # cap by construction rather than by distribution shift, and it
+                # already carries `(infeasible)`; marking it here too would put a
+                # symbol on the page that its own legend does not explain.
+                alerts += " ⚠"
+            lines.append(
+                f"| {name} | {_num(row.get('val_threshold'), 4)} "
+                f"| {_pct(row.get('test_precision'))} "
+                f"| {_pct(row.get('test_recall'))} "
+                f"| {_num(row.get('test_f1'), 3)} "
+                f"| {alerts} | {_rupees(row.get('test_total_cost'))} |")
+        lines.append("")
+
+        # A row only counts as overflowing if its alert count is on record: the
+        # flag and the number are two views of one measurement, and a row
+        # carrying the flag without the number cannot be described (`max()` of an
+        # empty sequence raises, which would take the whole report down over one
+        # missing cell).
+        overflowed = [r for r in scored
+                      if r.get("test_within_budget") is False
+                      and not _absent(r.get("test_alerts_per_1000"))]
+        if overflowed:
+            # "Slightly over" was the tempting word and it is a claim, not an
+            # observation — on a run where the distributions moved further it
+            # would be wrong beside a table the reader can check. The size of the
+            # worst overflow is measured instead.
+            worst = max(float(r["test_alerts_per_1000"]) for r in overflowed)
+            lines += [
+                f"⚠ marks a policy whose validation-selected threshold "
+                f"overflowed the cap on test — {_count_word(len(overflowed))} of "
+                f"{_count_word(len(scored))} here, the widest at "
+                f"{_num(worst, 1)} alerts per 1,000 against a budget of "
+                f"{_num(budget, 0)}. Each threshold was frozen on validation and "
+                f"the test score distribution is not identical, so the queue "
+                f"comes out a different size. It is reported rather than "
+                f"corrected: re-solving the threshold on test until the "
+                f"constraint held would be threshold selection on test, which is "
+                f"the one thing this project refuses to do anywhere else.",
+                "",
+            ]
+
+        # WHO WINS IS A MEASUREMENT, AND IT IS THE WHOLE POINT OF THE TABLE
+        # ────────────────────────────────────────────────────────────────
+        # Written as a fixed sentence this would be a claim about the project
+        # rather than about this run — and it is precisely the claim most likely
+        # to invert, because it is the one the capped comparison exists to test.
+        # If the simpler policy wins here, the README says so.
+        model_rows = [r for r in fair if r.get("is_model")
+                      and not _absent(r.get("test_total_cost"))]
+        rivals = [r for r in fair
+                  if not r.get("is_model")
+                  and r.get("feasible_under_budget") is not False
+                  and not _absent(r.get("val_threshold"))
+                  and not _absent(r.get("test_total_cost"))]
+        if model_rows and rivals:
+            model_row = model_rows[0]
+            best = min(rivals, key=lambda r: float(r["test_total_cost"]))
+            model_cost = float(model_row["test_total_cost"])
+            best_cost = float(best["test_total_cost"])
+            if model_cost <= best_cost:
+                lines += [
+                    f"With the cap binding on everyone, the model is the "
+                    f"cheapest policy in the table at "
+                    f"{_rupees(model_cost)} against {_rupees(best_cost)} for the "
+                    f"next best ({best.get('policy', ABSENT)}) — "
+                    f"{_rupees(best_cost - model_cost)} cheaper on the same "
+                    f"queue size. That is the comparison the capped claim above "
+                    f"rests on. The one-line rule's apparent win on cost alone "
+                    f"was bought with a queue the cap does not permit, not with "
+                    f"better detection.",
+                    "",
+                ]
+            else:
+                lines += [
+                    f"⚠️ **Under the same cap the model is not the cheapest "
+                    f"policy.** It costs {_rupees(model_cost)} against "
+                    f"{_rupees(best_cost)} for {best.get('policy', ABSENT)}, a "
+                    f"difference of {_rupees(model_cost - best_cost)} on an "
+                    f"identical queue size. This is not an artefact of an unfair "
+                    f"comparison — the budget binds on both rows — so the honest "
+                    f"reading is that at this queue size the simpler policy is "
+                    f"the better buy, and the graph pipeline earns its keep only "
+                    f"on the other columns.",
+                    "",
+                ]
+
+    # ── the same operating point at a realistic base rate ──
+    # The generator elevates mule prevalence so the model has enough positive
+    # signal to learn from, which makes every precision and rupee figure above a
+    # measurement at a base rate no payment network has. Quoting them without the
+    # correction invites a reviewer to find the problem for us. This table answers
+    # it in advance, and it needs no retraining: TPR and FPR are within-class
+    # rates, so only the mix changes — see cost_matrix.precision_at_prevalence
+    # for the one assumption that buys.
+    projection = metrics.get("prevalence_projection") or []
+    if projection:
+        observed = next((r for r in projection if r.get("is_observed")), None)
+        lines += [
+            "### The same operating point at a realistic base rate",
+            "",
+            "Precision and rupee cost depend on how many mules there are; "
+            "recall, ROC-AUC and the leakage headroom do not. So the honest way "
+            "to read the numbers above is to re-price them at base rates a real "
+            "network would see. Nothing is retrained here — the class-conditional "
+            "score distributions are held fixed and only the mix is re-weighted.",
+            "",
+            "| mule base rate | recall | precision | alerts / 1,000 | cost / "
+            "1,000 accounts | queue pays for itself |",
+            "|---|---|---|---|---|---|",
+        ]
+        for row in projection:
+            rate = _pct(row.get("prevalence"), 3)
+            if row.get("is_observed"):
+                rate = f"**{rate}** _(measured)_"
+            clears = row.get("clears_break_even")
+            verdict = (ABSENT if clears is None
+                       else ("yes" if clears else "**no**"))
+            lines.append(
+                f"| {rate} | {_pct(row.get('recall'))} "
+                f"| {_pct(row.get('projected_precision'), 2)} "
+                f"| {_num(row.get('projected_alerts_per_1000'), 1)} "
+                f"| {_rupees(row.get('projected_cost_per_1000_accounts'))} "
+                f"| {verdict} |")
+        lines.append("")
+
+        # The recall column being constant is the pedagogical point, and stating
+        # it from the rendered rows rather than as prose means the sentence cannot
+        # outlive the table. A drifting recall column would mean the projection
+        # re-derived recall from projected counts and smuggled in an improvement
+        # base rate cannot buy.
+        recalls = {round(float(r["recall"]), 9) for r in projection
+                   if not _absent(r.get("recall"))}
+        if len(recalls) == 1:
+            fixed_note = (
+                f"Recall holds at {_pct(recalls.pop())} down the whole table, "
+                f"which is not an approximation: it is a within-class rate, so "
+                f"no change of base rate can touch it.")
+        else:
+            fixed_note = (
+                f"⚠️ Recall varies across rows ({_count_word(len(recalls))} "
+                f"distinct values). It should be constant — TPR is a within-class "
+                f"rate — so this table was not built the way it claims.")
+
+        # Where the queue stops paying for itself, read off the flags rather than
+        # recomputed, so the sentence and the table cannot disagree. This is the
+        # finding worth volunteering: below the crossing, working the queue costs
+        # more than ignoring it, and no amount of ROC-AUC changes that.
+        flagged = [(float(r["prevalence"]), bool(r["clears_break_even"]))
+                   for r in projection if r.get("clears_break_even") is not None]
+        flagged.sort()
+        clearing = [p for p, ok in flagged if ok]
+        failing = [p for p, ok in flagged if not ok]
+        if clearing and failing:
+            crossing = (
+                f"The break-even line falls between "
+                f"{_pct(max(failing), 3)} and {_pct(min(clearing), 3)}: below "
+                f"roughly that base rate this operating point's queue costs more "
+                f"to work than to ignore, because precision drops under the "
+                f"{_pct(cost.get('break_even_probability'), 2)} break-even the "
+                f"cost model implies. That is a real limit on the result and not "
+                f"a fixable one at this threshold — a rarer mule population needs "
+                f"a tighter cutoff, which trades recall for a queue worth "
+                f"working.")
+        elif clearing:
+            crossing = (
+                f"Every base rate in the table clears the "
+                f"{_pct(cost.get('break_even_probability'), 2)} break-even "
+                f"precision, so the queue pays for itself down to "
+                f"{_pct(min(clearing), 3)} prevalence. That is a claim about the "
+                f"rates shown; it says nothing about base rates below the bottom "
+                f"row.")
+        elif failing:
+            crossing = (
+                f"⚠️ No base rate in the table clears the "
+                f"{_pct(cost.get('break_even_probability'), 2)} break-even "
+                f"precision, including the rate this model was measured at. At "
+                f"this threshold the alert queue costs more to work than to "
+                f"ignore.")
+        else:
+            crossing = ("The break-even comparison was not recorded for any row, "
+                        "so nothing is claimed about where the queue stops paying "
+                        "for itself.")
+        lines += [f"{fixed_note} {crossing}", ""]
+        if observed:
+            lines += [
+                f"The bolded row is the one actually measured: "
+                f"{_pct(observed.get('prevalence'), 3)} prevalence on the test "
+                f"split. Every other row is arithmetic on that measurement, and "
+                f"answers \"what would this queue look like if mules were "
+                f"rarer\" — not \"what will this model do in production\", which "
+                f"needs real data and is out of scope. See Limitations.",
+                "",
+            ]
+
     # ── leakage ──
     if strongest:
         inverted = (" (inverted; raw "
@@ -937,7 +1296,13 @@ def main() -> int:
     if current == updated:
         print("README.md already up to date.")
         return 0
-    README_PATH.write_text(updated, encoding="utf-8")
+    # newline="\n" so `--write` does not rewrite every line of the README as a
+    # side effect of which OS ran it. `read_text` above already normalised the
+    # file's terminators in memory, so without this the output terminator is
+    # whatever the running platform prefers, and the splice of one block shows
+    # up as a diff against the entire document.
+    with open(README_PATH, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(updated)
     print(f"README.md Results section updated from "
           f"{METRICS_PATH.relative_to(ROOT)}.")
     return 0

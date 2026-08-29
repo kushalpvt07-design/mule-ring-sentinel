@@ -69,6 +69,23 @@ METRICS_PATH = MODEL_DIR / "metrics.json"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 
+def _shown_path(path: Path) -> str:
+    """
+    A path to put in an error message, repo-relative when it can be.
+
+    `Path.relative_to` raises when the target is not under PROJECT_ROOT, and
+    every caller here is already inside a failure branch. Formatting the
+    message would then raise `ValueError` instead of the `ModelUnavailable`
+    that carries the command the viewer needs to run — the actionable text
+    replaced by a stack trace, in exactly the case where the file has been
+    relocated and the reader most needs to be told where it was looked for.
+    """
+    try:
+        return str(path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
+
+
 class ModelUnavailable(RuntimeError):
     """
     Raised when the dashboard cannot produce real scores.
@@ -113,7 +130,7 @@ def load_model():
     """
     if not MODEL_PATH.exists():
         raise ModelUnavailable(
-            f"No trained model at {MODEL_PATH.relative_to(PROJECT_ROOT)}.\n\n"
+            f"No trained model at {_shown_path(MODEL_PATH)}.\n\n"
             "Run the pipeline first:\n"
             "```\npython -m data.generator\npython -m data.extractor\n"
             "python -m models.train\n```"
@@ -145,7 +162,7 @@ def load_metrics() -> dict:
     if not METRICS_PATH.exists():
         raise ModelUnavailable(
             f"No {METRICS_PATH.name} at "
-            f"{METRICS_PATH.parent.relative_to(PROJECT_ROOT)}. "
+            f"{_shown_path(METRICS_PATH.parent)}. "
             "Run `python -m models.train`."
         )
     with open(METRICS_PATH, encoding="utf-8") as fh:
@@ -191,7 +208,7 @@ def load_features(split: str) -> pd.DataFrame:
     path = PROCESSED_DIR / f"{split}_features.csv"
     if not path.exists():
         raise ModelUnavailable(
-            f"No {path.name} in {PROCESSED_DIR.relative_to(PROJECT_ROOT)}. "
+            f"No {path.name} in {_shown_path(PROCESSED_DIR)}. "
             f"Run `python -m data.generator` then `python -m data.extractor`."
         )
     return pd.read_csv(path)

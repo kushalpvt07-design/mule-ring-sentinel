@@ -1,0 +1,24 @@
+# Line endings, pinned — because a diff nobody can read is a review nobody does.
+#
+# The pipeline writes tracked artifacts from Python (`models/saved_models/
+# metrics.json` via models/train.py, `README.md`'s generated Results block via
+# models/report.py). Python's text mode translates "\n" to the platform's
+# terminator, so the same file written on Windows and on Linux differs on every
+# single line. A retrain that moved one number then shows up as a 1,900-line
+# diff, and the number that actually changed is invisible inside it.
+#
+# Those two writers now pass newline="\n" explicitly. This file is the second
+# half of the fix: it covers everything git touches regardless of which tool or
+# editor wrote it, so the repository always stores LF and `git diff` always
+# shows only what someone meant to change.
+
+* text=auto eol=lf
+
+# Never newline-translate a booster. XGBoost's saved model is a binary blob;
+# rewriting byte 0x0A inside it produces a file that either fails to load or,
+# worse, loads into a different model than the one that was evaluated.
+*.xgb binary
+*.ubj binary
+*.png binary
+*.jpg binary
+*.ico binary

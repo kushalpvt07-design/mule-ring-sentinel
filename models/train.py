@@ -117,6 +117,10 @@ from models.cost_matrix import (
     DEFAULT_FP_COST,
     CostEvaluator,
     average_precision,
+    brier_score,
+    expected_calibration_error,
+    fit_platt_scaling,
+    reliability_table,
     roc_auc,
     # Underscored, and borrowed deliberately. Precision/recall/F1 are None when
     # not computable (cost_matrix._prf), so every place this module rounds one for
@@ -870,32 +874,39 @@ def calibration_report(
     empirical optimum sits well above p*. That is a defensible choice, but only
     if it is stated — so the size of the distortion is measured here rather than
     left for a reviewer to discover.
-    """
-    y = np.asarray(y_true).astype(float).ravel()
-    p = np.asarray(y_proba, dtype=float).ravel()
-    brier = float(np.mean((p - y) ** 2))
 
-    edges = np.linspace(0.0, 1.0, n_bins + 1)
-    bins = np.clip(np.digitize(p, edges[1:-1], right=False), 0, n_bins - 1)
-    table, ece = [], 0.0
-    for b in range(n_bins):
-        mask = bins == b
-        if not mask.any():
-            continue
-        mean_p = float(p[mask].mean())
-        observed = float(y[mask].mean())
-        weight = float(mask.mean())
-        ece += weight * abs(mean_p - observed)
-        table.append({
-            "bin": f"[{edges[b]:.1f}, {edges[b + 1]:.1f})",
-            "n": int(mask.sum()),
-            "mean_predicted": round(mean_p, 4),
-            "observed_rate": round(observed, 4),
-        })
+    The three quantities are now DELEGATED to models/cost_matrix.py rather than
+    computed inline. They were open-coded here, and then `calibration_diagnostic`
+    below needed the same binning to compare raw against calibrated scores — at
+    which point this file would have held two independent ECE implementations free
+    to disagree about bin edges, empty-bin handling and weighting. That is the
+    exact failure `classification_table` above names in its own docstring: "two
+    sources for the same four numbers is how they drift apart."
+
+    The returned shape is unchanged — same keys, same rounding, populated bins
+    only — because models/report.py renders `reliability` by these key names.
+    """
+    y = np.asarray(y_true).astype(int).ravel()
+    p = np.asarray(y_proba, dtype=float).ravel()
+
+    frame = reliability_table(y, p, n_bins)
+    populated = frame[frame["n"] > 0]
+    table = [
+        {
+            "bin": f"[{row.bin_lower:.1f}, {row.bin_upper:.1f})",
+            "n": int(row.n),
+            "mean_predicted": round(float(row.mean_predicted), 4),
+            "observed_rate": round(float(row.observed_frequency), 4),
+        }
+        for row in populated.itertuples()
+    ]
 
     return {
-        "brier_score": round(brier, 6),
-        "expected_calibration_error": round(float(ece), 4),
+        "brier_score": round(brier_score(y, p), 6),
+        # `_round_or_none`, not round(): ECE is None on an empty split, and 0.0
+        # there would read as perfect calibration of nothing.
+        "expected_calibration_error": _round_or_none(
+            expected_calibration_error(y, p, n_bins), 4),
         "mean_predicted_probability": round(float(p.mean()), 4),
         "actual_prevalence": round(float(y.mean()), 4),
         "reliability": table,
@@ -1625,6 +1636,12 @@ def logistic_regression_baseline(
         "log1p_columns": sorted(LOG1P_COLS),
         "coefficients_standardised": {k: round(v, 4)
                                       for k, v in coefficients.items()},
+        # Underscore-prefixed: handed to capacity_fair_comparison so this
+        # baseline can be re-thresholded under the analyst budget, and stripped
+        # by build_metrics_payload before serialisation. Two float vectors per
+        # split do not belong in metrics.json.
+        "_val_scores": p_val,
+        "_test_scores": p_test,
     }
 
 
@@ -1665,6 +1682,10 @@ def graph_ablation_baseline(
         "test_f1": _round_or_none(report.f1, 4),
         "test_total_cost": float(report.total_cost),
         "test_alerts_per_1000": round(float(report.alerts_per_1000), 1),
+        # See the note in logistic_regression_baseline: underscore keys are
+        # stripped before metrics.json is written.
+        "_val_scores": p_val,
+        "_test_scores": p_test,
     }
 
 
@@ -1805,6 +1826,279 @@ def compute_baselines(
 
 
 # ══════════════════════════════════════════════════════════════════
+# One analyst budget, applied to every policy
+# ══════════════════════════════════════════════════════════════════
+
+def capacity_fair_comparison(
+    frames: dict[str, pd.DataFrame],
+    evaluator: CostEvaluator,
+    baselines: dict,
+    *,
+    model_val_scores: np.ndarray,
+    model_test_scores: np.ndarray,
+    alert_budget: float,
+) -> pd.DataFrame:
+    """
+    Every policy priced under ONE analyst budget, each threshold chosen on val.
+
+    WHY THIS TABLE EXISTS: THE CAPPED COMPARISON WAS NOT LIKE FOR LIKE
+    ─────────────────────────────────────────────────────────────────
+    The capacity discussion published a capped MODEL against UNCAPPED baselines,
+    and then reported that the model loses on cost to the one-line rule. Both
+    halves of that were true and the comparison behind them was not: with a miss
+    priced at ~13x a false alert, total cost is dominated by misses, so any policy
+    free to flood the review queue wins on cost by construction. The rule bought
+    its recall with roughly 12x the alerts the cap allows. Comparing it against a
+    model held to the cap measures the cap, not the model.
+
+    So this table applies the SAME budget to every policy. Note what that is and
+    is not: it does not weaken the baseline to flatter the model — the rule's
+    uncapped cost stays published in the main baseline table, right beside this
+    one, and a reader can compare either way. It removes an allowance the
+    baseline was never entitled to under the stated operating constraint.
+
+    SELECTION IS STILL VALIDATION-ONLY
+    ──────────────────────────────────
+    Each policy's budget threshold comes from `threshold_for_alert_budget` on
+    VALIDATION and is then evaluated once on test at that frozen value — the same
+    discipline as the headline and the cost-ratio table. A consequence worth
+    reading rather than hiding: the frozen threshold can spill over the budget on
+    test, because the score distribution moved and the threshold was fixed before
+    test was seen. `test_within_budget` reports that per row instead of quietly
+    re-fitting the threshold until the constraint holds, which would be selection
+    on test wearing a capacity argument as a disguise.
+
+    The two trivial policies are priced closed-form and kept in the table on
+    purpose. Flag-nothing is the cost floor any real policy must beat;
+    flag-everything is marked infeasible, because 1,000 alerts per 1,000 accounts
+    is not a queue any budget below that permits, and a reader should see the
+    excluded policy rather than wonder whether it was quietly dropped.
+    """
+    from models.cost_matrix import _prf
+
+    y_val = frames["val"][TARGET_COL].to_numpy()
+    y_test = frames["test"][TARGET_COL].to_numpy()
+
+    # (label, validation scores, test scores) for every policy that HAS a score
+    # to threshold. Order mirrors compute_baselines' printed table, model last.
+    scorers: list[tuple[str, np.ndarray, np.ndarray]] = []
+
+    # The one-line rule is REPLAYED from its published machine-readable form
+    # rather than having its score vectors threaded out of the baseline: those are
+    # loop-local to the rule search, and `sign * x >= threshold_on_score` is the
+    # replay contract that function already documents and the dashboard already
+    # uses. Re-deriving here keeps one definition of what the rule means.
+    rule = baselines.get("best_single_feature_rule_by_cost") or {}
+    if rule.get("feature"):
+        sign = 1.0 if rule.get("direction") == "high" else -1.0
+        feature = str(rule["feature"])
+        scorers.append((
+            f"one-line rule: {rule.get('rule', feature)}",
+            sign * frames["val"][feature].to_numpy(dtype=float),
+            sign * frames["test"][feature].to_numpy(dtype=float),
+        ))
+
+    for key, label in (
+        ("logistic_regression", "logistic regression, same features"),
+        ("xgboost_without_graph_features", "XGBoost, no graph features"),
+    ):
+        block = baselines.get(key) or {}
+        # Absent when the baseline was skipped (no scikit-learn, --no-baselines).
+        # A missing row is better than a fabricated one.
+        if block.get("_val_scores") is not None:
+            scorers.append((label,
+                            np.asarray(block["_val_scores"], dtype=float),
+                            np.asarray(block["_test_scores"], dtype=float)))
+
+    scorers.append(("XGBoost, full model",
+                    np.asarray(model_val_scores, dtype=float),
+                    np.asarray(model_test_scores, dtype=float)))
+
+    rows = []
+    for label, s_val, s_test in scorers:
+        budgeted = evaluator.threshold_for_alert_budget(y_val, s_val,
+                                                        alert_budget)
+        realised = evaluator.evaluate_at_threshold(y_test, s_test,
+                                                   budgeted.threshold)
+        rows.append({
+            "policy": label,
+            "is_model": label == "XGBoost, full model",
+            "feasible_under_budget": True,
+            "val_threshold": float(budgeted.threshold),
+            "val_alerts_per_1000": round(float(budgeted.alerts_per_1000), 1),
+            "test_precision": _none_if_nan_or_none(realised.precision),
+            "test_recall": _none_if_nan_or_none(realised.recall),
+            "test_f1": _none_if_nan_or_none(realised.f1),
+            "test_alerts_per_1000": round(float(realised.alerts_per_1000), 1),
+            "test_within_budget": bool(
+                realised.alerts_per_1000 <= alert_budget + 1e-9),
+            "test_total_cost": float(realised.total_cost),
+        })
+
+    # ── the two trivial policies, closed form ──
+    n_pos = int(y_test.sum())
+    n_neg = int(y_test.size - n_pos)
+    none_p, none_r, none_f1 = _prf(tp=0, fp=0, fn=n_pos)
+    all_p, all_r, all_f1 = _prf(tp=n_pos, fp=n_neg, fn=0)
+
+    rows.append({
+        "policy": "flag nothing", "is_model": False,
+        "feasible_under_budget": True,
+        "val_threshold": None, "val_alerts_per_1000": 0.0,
+        "test_precision": none_p, "test_recall": none_r, "test_f1": none_f1,
+        "test_alerts_per_1000": 0.0, "test_within_budget": True,
+        "test_total_cost": float(n_pos * evaluator.config.fn_cost),
+    })
+    rows.append({
+        "policy": "flag everything", "is_model": False,
+        # The point of the row: cheap on paper, impossible to staff.
+        "feasible_under_budget": bool(alert_budget >= 1000.0),
+        "val_threshold": None, "val_alerts_per_1000": 1000.0,
+        "test_precision": all_p, "test_recall": all_r, "test_f1": all_f1,
+        "test_alerts_per_1000": 1000.0,
+        "test_within_budget": bool(alert_budget >= 1000.0),
+        "test_total_cost": float(n_neg * evaluator.config.fp_cost),
+    })
+
+    return pd.DataFrame(rows)
+
+
+def _none_if_nan_or_none(value):
+    """
+    Pass None through, map NaN to None, otherwise return a float.
+
+    `ThresholdReport` already emits None for a not-computable metric, but these
+    values pass through a DataFrame on the way to metrics.json and pandas stores
+    None in a float column as NaN. Without this, "no queue to measure" would
+    round-trip into the published table as a number.
+    """
+    if value is None:
+        return None
+    v = float(value)
+    return None if np.isnan(v) else v
+
+
+# ══════════════════════════════════════════════════════════════════
+# Do the probabilities mean what they say?
+# ══════════════════════════════════════════════════════════════════
+
+def calibration_diagnostic(
+    y_val: np.ndarray,
+    p_val: np.ndarray,
+    y_test: np.ndarray,
+    p_test: np.ndarray,
+    *,
+    n_bins: int = 10,
+) -> dict:
+    """
+    Measure how far the scores are from being probabilities, and by how much a
+    two-parameter calibrator would close the gap.
+
+    Distinct from `calibration_report` above, which DESCRIBES the raw scores on a
+    single split. This one fits a calibrator on validation, applies it to test,
+    and reports the before/after — so it answers "how much of the miscalibration
+    is fixable" rather than only "how much is there".
+
+    WHY THIS IS REPORTED AT ALL
+    ───────────────────────────
+    Every headline number this project publishes is a RANKING number — AUC,
+    average precision, precision and recall at a threshold. None of them constrain
+    the scores to mean anything as probabilities, and this model has a specific
+    reason to be badly calibrated: `scale_pos_weight` re-weights the positive
+    class during training, which deliberately inflates predicted probabilities. So
+    the scores are a good ordering and a bad probability, while the dashboard
+    prints them to two decimals beside the word "probability". Better to measure
+    that and publish the size of it.
+
+    FIT ON VALIDATION, MEASURED ON TEST
+    ───────────────────────────────────
+    The calibrator is fitted on the VALIDATION split and every figure below is
+    reported on TEST. Fitting and reporting on the same split would show the
+    improvement a calibrator can memorise rather than the one it generalises, and
+    the generalising one is the whole claim.
+
+    WHAT THIS DOES NOT DO
+    ─────────────────────
+    It does not change the model, the shipped threshold, or any published
+    operating point. `ranking_invariance` in the returned payload is the check
+    that keeps that claim honest: the calibrated AUC is recomputed and compared
+    against the raw one, so if the map ever stopped being monotone the run says so
+    instead of quietly re-ranking the alert queue.
+    """
+    y_val = np.asarray(y_val).astype(int).ravel()
+    y_test = np.asarray(y_test).astype(int).ravel()
+    p_val = np.asarray(p_val, dtype=float).ravel()
+    p_test = np.asarray(p_test, dtype=float).ravel()
+
+    scaler = fit_platt_scaling(y_val, p_val)
+    calibrated = scaler.transform(p_test)
+
+    raw_brier = brier_score(y_test, p_test)
+    cal_brier = brier_score(y_test, calibrated)
+    raw_ece = expected_calibration_error(y_test, p_test, n_bins)
+    cal_ece = expected_calibration_error(y_test, calibrated, n_bins)
+    raw_auc = roc_auc(y_test, p_test)
+    cal_auc = roc_auc(y_test, calibrated)
+
+    print(banner("Probability Calibration (diagnostic only)"))
+    print(f"  Platt map fitted on validation ({scaler.n_positive_fit} positives "
+          f"of {scaler.n_fit}): slope {scaler.slope:.4f}, "
+          f"intercept {scaler.intercept:+.4f}"
+          + ("" if scaler.converged else "  [DID NOT CONVERGE]"))
+    print(f"  {'':<22s}{'raw':>10s}{'calibrated':>12s}{'change':>10s}")
+    print(f"  {'Brier score':<22s}{raw_brier:>10.5f}{cal_brier:>12.5f}"
+          f"{cal_brier - raw_brier:>+10.5f}")
+    print(f"  {'expected cal. error':<22s}{_fmt(raw_ece, '.5f'):>10s}"
+          f"{_fmt(cal_ece, '.5f'):>12s}"
+          f"{_fmt(None if (cal_ece is None or raw_ece is None) else cal_ece - raw_ece, '+.5f'):>10s}")
+    print(f"  {'ROC-AUC':<22s}{raw_auc:>10.5f}{cal_auc:>12.5f}"
+          f"{cal_auc - raw_auc:>+10.5f}   <- must be ~0: the map is monotone")
+    # A slope below 1 is the signature of over-confidence, which is what
+    # scale_pos_weight is expected to produce. Naming the direction stops the
+    # number being reported without being read.
+    if scaler.slope < 1.0:
+        print("  Slope < 1: the raw scores are OVER-confident — they are spread "
+              "wider than the evidence supports, which is the expected effect of "
+              "scale_pos_weight.")
+    elif scaler.slope > 1.0:
+        print("  Slope > 1: the raw scores are UNDER-confident — the calibrator "
+              "sharpens them.")
+    print("  Not applied at serving time: the shipped threshold was selected on "
+          "the raw scale, so rescaling scores underneath it would move the "
+          "operating point without saying so.")
+
+    return {
+        "purpose": ("diagnostic only — the serving path and every published "
+                    "operating point use the RAW scores"),
+        "fitted_on": "validation",
+        "measured_on": "test",
+        "n_bins": int(n_bins),
+        "scaler": scaler.as_dict(),
+        "test_raw": {
+            "brier_score": round(float(raw_brier), 6),
+            "expected_calibration_error": _round_or_none(raw_ece, 6),
+        },
+        "test_calibrated": {
+            "brier_score": round(float(cal_brier), 6),
+            "expected_calibration_error": _round_or_none(cal_ece, 6),
+        },
+        "ranking_invariance": {
+            "test_auc_raw": round(float(raw_auc), 6),
+            "test_auc_calibrated": round(float(cal_auc), 6),
+            # Tolerance is float-summation slack, not a claim about how much
+            # re-ranking is acceptable. Any real re-ranking exceeds it by orders
+            # of magnitude; tests/test_baselines.py asserts against this key.
+            "abs_delta": float(abs(cal_auc - raw_auc)),
+            "tolerance": 1e-6,
+        },
+        "test_reliability_raw": reliability_table(
+            y_test, p_test, n_bins).to_dict(orient="records"),
+        "test_reliability_calibrated": reliability_table(
+            y_test, calibrated, n_bins).to_dict(orient="records"),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
 # Importance / attribution
 # ══════════════════════════════════════════════════════════════════
 
@@ -1892,6 +2186,31 @@ def importance_report(model, X_test: pd.DataFrame) -> tuple[dict, dict]:
 # Persistence
 # ══════════════════════════════════════════════════════════════════
 
+def _public_only(baselines: dict) -> dict:
+    """
+    Strip underscore-prefixed keys from every baseline block, one level deep.
+
+    THE DEFECT THIS PREVENTS: `build_metrics_payload` filters underscore keys out
+    of the `test` block but passed `baselines` through whole. The moment a
+    baseline started carrying `_val_scores` for the capacity-fair table, two float
+    vectors per baseline — thousands of numbers nobody reads — would have been
+    serialised into metrics.json, and `report.py --check` compares that file
+    byte-for-byte against a regenerated one. So this is not only bloat: score
+    vectors are the least stable thing in the payload, and they would have turned
+    every rerun into a spurious staleness failure.
+
+    One level deep is deliberate and sufficient: underscore keys are only ever
+    added to the baseline blocks themselves. Recursing would silently launder a
+    private key out of a nested structure where its presence is a bug worth
+    seeing.
+    """
+    return {
+        name: ({k: v for k, v in block.items() if not k.startswith("_")}
+               if isinstance(block, dict) else block)
+        for name, block in baselines.items()
+    }
+
+
 def build_metrics_payload(
     *,
     evaluator: CostEvaluator,
@@ -1904,6 +2223,9 @@ def build_metrics_payload(
     shap: dict,
     cv_results: dict,
     sensitivity: pd.DataFrame,
+    capacity_fair: pd.DataFrame | None,
+    prevalence_projection: pd.DataFrame | None,
+    calibration: dict | None,
     alert_budget: float,
     hparams: dict,
     n_train: int,
@@ -1962,8 +2284,19 @@ def build_metrics_payload(
         },
         "test": {k: v for k, v in test_results.items()
                  if not k.startswith("_")},
-        "baselines": baselines,
+        "baselines": _public_only(baselines),
         "cost_ratio_sensitivity": sensitivity.to_dict(orient="records"),
+        # Each of the three is None rather than absent when it could not be built
+        # (--no-baselines, a missing dependency). An explicit null tells report.py
+        # "this run did not produce it"; a missing key is indistinguishable from a
+        # metrics.json written by an older version of this script.
+        "capacity_fair_comparison": (
+            None if capacity_fair is None
+            else capacity_fair.to_dict(orient="records")),
+        "prevalence_projection": (
+            None if prevalence_projection is None
+            else prevalence_projection.to_dict(orient="records")),
+        "probability_calibration": calibration,
         "cross_validation": cv_results or None,
     }
 
@@ -2008,8 +2341,20 @@ def save_artifacts(model, metrics: dict) -> None:
     print(f"  Model saved   {sym('arrow')} {model_path}")
 
     metrics_path = MODEL_DIR / "metrics.json"
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(_json_safe(metrics), f, indent=2, default=float)
+    # newline="\n" so the committed artifact is byte-identical whoever wrote it.
+    # Python's text mode translates "\n" to the platform terminator, so the same
+    # metrics.json written on Windows and on Linux differ in every single line —
+    # which turns a retrain that changed one number into a whole-file diff and
+    # buries the change nobody can now see.
+    with open(metrics_path, "w", encoding="utf-8", newline="\n") as f:
+        # allow_nan=False turns a `_json_safe` miss into an exception here instead
+        # of a metrics.json containing the bare token `NaN`. That file is read by
+        # the dashboard, the API and `report.py --check`; a strict parser rejects
+        # it and a lenient one silently yields a float that poisons whatever it
+        # touches. Failing at the write is the cheaper of the two outcomes, and
+        # `_json_safe` runs first precisely so this never fires.
+        json.dump(_json_safe(metrics), f, indent=2, default=float,
+                  allow_nan=False)
     print(f"  Metrics saved {sym('arrow')} {metrics_path}")
 
 
@@ -2129,6 +2474,68 @@ def main() -> None:
 
     gain, shap = importance_report(model, frames["test"][FEATURE_COLS])
 
+    # ── The three blocks that answer the stated limitations ──
+    y_val = frames["val"][TARGET_COL].to_numpy()
+    y_test = frames["test"][TARGET_COL].to_numpy()
+
+    # 1. What the published precision and rupee cost become at a production base
+    #    rate. The operating point is re-derived here rather than read out of
+    #    `test_results`, because the projection needs the raw confusion counts and
+    #    `at_selected_threshold` has already been flattened for JSON.
+    selected = evaluator.evaluate_at_threshold(
+        y_test, test_results["_scores"],
+        float(thresholds["cost_optimal"].threshold))
+    prevalence_projection = evaluator.project_to_prevalence(selected)
+    print(banner("Precision and Cost at Lower Base Rates"))
+    print(prevalence_projection.to_string(index=False,
+                                          float_format=lambda v: f"{v:,.4f}"))
+    pi_star = evaluator.break_even_prevalence(selected)
+    print("  (Recall is CONSTANT down this table on purpose: TPR and FPR are "
+          "within-class rates, so a change of")
+    print("   base rate cannot touch them. Precision and total cost are not "
+          "within-class, and they move a great deal.")
+    if pi_star is None:
+        print("   This operating point has no break-even prevalence — it never "
+              "clears p*, at any base rate.)")
+    else:
+        print(f"   Below a prevalence of {pi_star:.4%} the queue stops paying "
+              f"for itself at this threshold: projected precision falls under "
+              f"the break-even")
+        print(f"   p* of {evaluator.break_even_probability:.4%}, and the false "
+              "alerts then cost more than the misses they prevent.)")
+
+    # 2. Every policy under one analyst budget. Needs the baselines, so it is
+    #    skipped rather than faked when they were skipped.
+    if baselines:
+        capacity_fair = capacity_fair_comparison(
+            frames, evaluator, baselines,
+            model_val_scores=thresholds["_scores"],
+            model_test_scores=test_results["_scores"],
+            alert_budget=args.alert_budget,
+        )
+        print(banner(f"Every Policy at the Same {args.alert_budget:.0f} "
+                     "Alerts/1,000 Budget"))
+        print(capacity_fair.to_string(index=False,
+                                      float_format=lambda v: f"{v:,.4f}"))
+        print("  (The baseline table above lets each policy raise as many alerts "
+              "as it likes. At 13.3:1 that is an")
+        print("   advantage and not a fair fight, because misses dominate cost — "
+              "so the one-line rule bought its")
+        print("   recall with roughly 12x the queue the cap allows. Here every "
+              "policy is held to the SAME queue size,")
+        print("   with each threshold still selected on validation. "
+              "test_within_budget=False means a val-selected")
+        print("   threshold overflowed the budget on test; that is reported "
+              "rather than re-fitted, because re-fitting")
+        print("   it until the constraint held would be selection on test in a "
+              "capacity argument's clothing.)")
+    else:
+        capacity_fair = None
+
+    # 3. Whether the scores mean anything as probabilities.
+    calibration = calibration_diagnostic(
+        y_val, thresholds["_scores"], y_test, test_results["_scores"])
+
     print("\n[7/7] Saving artifacts...")
     metrics = build_metrics_payload(
         evaluator=evaluator,
@@ -2141,6 +2548,9 @@ def main() -> None:
         shap=shap,
         cv_results=cv_results,
         sensitivity=sensitivity,
+        capacity_fair=capacity_fair,
+        prevalence_projection=prevalence_projection,
+        calibration=calibration,
         alert_budget=args.alert_budget,
         hparams={**HPARAMS, "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
                  "best_iteration": int(model.best_iteration)},

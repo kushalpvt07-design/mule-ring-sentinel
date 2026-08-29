@@ -2023,7 +2023,7 @@ def main() -> None:
     for s in SPLITS:
         df = splits[s]
         path = OUTPUT_DIR / f"{s}_edges.csv"
-        df.to_csv(path, index=False)
+        df.to_csv(path, index=False, lineterminator="\n")
         members = ring_member_nodes(df)
         nodes = set(df["sender"]) | set(df["receiver"])
         print(f"  {sym('arrow')} {path.name:<24s} {len(df):>8,} edges | "
@@ -2047,7 +2047,7 @@ def main() -> None:
     context = splits["val"].copy()
     context = context.sort_values("timestamp").reset_index(drop=True)
     context_path = OUTPUT_DIR / "serving_context_edges.csv"
-    context.to_csv(context_path, index=False)
+    context.to_csv(context_path, index=False, lineterminator="\n")
     ctx_days = (
         context["timestamp"].max() - context["timestamp"].min()
     ).total_seconds() / 86_400.0
