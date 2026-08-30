@@ -845,11 +845,27 @@ def render(metrics: dict) -> str:
                 "",
             ]
         elif rule_cost is not None:
+            # The clause about the rule's queue is CONDITIONAL on the rule's queue
+            # actually breaching the cap. It used to read "a queue the budget
+            # forbids outright" unconditionally, which is a claim about a number
+            # printed two words earlier: on any run where the rule's uncapped
+            # queue happened to fit, the README would have contradicted its own
+            # table in the same sentence. The uncapped rule breaches the cap by a
+            # wide margin on the shipped data, which is exactly why the sentence
+            # survived unnoticed — it was right by luck, not by construction.
+            if not _absent(rule_alerts) and float(rule_alerts) > float(budget):
+                tail = (f", which the rule reaches only by issuing "
+                        f"{_num(rule_alerts, 1)} alerts per 1,000 accounts — a "
+                        f"queue the budget forbids outright.")
+            elif not _absent(rule_alerts):
+                tail = (f", at {_num(rule_alerts, 1)} alerts per 1,000 accounts "
+                        f"against the same {_num(budget, 0)} cap — so on this run "
+                        f"the rule is affordable and still more expensive.")
+            else:
+                tail = "."
             lines += [
                 f"Even under the cap the model stays below the one-line rule "
-                f"({_rupees(rule_cost)}), which the rule reaches only by issuing "
-                f"{_num(rule_alerts, 1)} alerts per 1,000 accounts — "
-                f"a queue the budget forbids outright.",
+                f"({_rupees(rule_cost)}){tail}",
                 "",
             ]
 
@@ -867,7 +883,16 @@ def render(metrics: dict) -> str:
     # questions and both deserve an answer.
     fair = metrics.get("capacity_fair_comparison") or []
     if fair and budget:
-        scored = [r for r in fair if not _absent(r.get("val_threshold"))]
+        # A policy is only a candidate for the ⚠ overflow legend below if it HAD a
+        # validation-selected threshold and that threshold bought a queue. An
+        # infeasible row never had a queue to overflow, so counting it in the
+        # legend's denominator would describe a risk it was never exposed to.
+        scored = [r for r in fair
+                  if not _absent(r.get("val_threshold"))
+                  and r.get("feasible_under_budget") is not False]
+        infeasible = [r for r in fair
+                      if r.get("feasible_under_budget") is False
+                      and not _absent(r.get("val_threshold"))]
         lines += [
             "#### The same cap, applied to every policy",
             "",
@@ -885,10 +910,16 @@ def render(metrics: dict) -> str:
             if row.get("is_model"):
                 name = f"**{name}**"
             if row.get("feasible_under_budget") is False:
-                # Not a footnote: flagging every account is 1,000 alerts per
-                # 1,000 and cannot be made to fit any cap below that. It stays in
-                # the table so a reader sees the excluded policy rather than
-                # wondering whether it was quietly dropped.
+                # Not a footnote. Two different things land here and both mean
+                # "this is not a policy you could run at this capacity":
+                # flag-everything, which is 1,000 alerts per 1,000 by
+                # construction; and a policy whose scores are too coarse to form
+                # ANY non-empty queue that fits — a one-line rule on an
+                # integer-valued feature has a large tie at the top, so its
+                # strictest real cut can already exceed the cap. Both stay in the
+                # table so a reader sees the excluded policy rather than
+                # wondering whether it was quietly dropped, and neither is
+                # eligible to be the rival the model beats.
                 name += " _(infeasible)_"
             alerts = _num(row.get("test_alerts_per_1000"), 1)
             if (row.get("test_within_budget") is False
@@ -912,6 +943,27 @@ def render(metrics: dict) -> str:
                 f"| {_num(row.get('test_f1'), 3)} "
                 f"| {alerts} | {_rupees(row.get('test_total_cost'))} |")
         lines.append("")
+
+        # An infeasible SCORED row needs saying out loud, because its cells look
+        # like a policy's and are not. It reads as zero alerts at the cost of
+        # every miss, which is what abstaining costs, and leaving that unexplained
+        # invites a reader to score it as a rival the model crushed.
+        for row in infeasible:
+            floor = row.get("val_strictest_nonempty_alerts_per_1000")
+            if _absent(floor):
+                continue
+            lines += [
+                f"`{row.get('policy', ABSENT)}` has no feasible operating point "
+                f"under this cap. Its scores tie: the strictest cut that flags "
+                f"anything at all already raises {_num(floor, 1)} alerts per "
+                f"1,000 accounts against a budget of {_num(budget, 0)}, so every "
+                f"non-empty queue it can form is unaffordable and the only "
+                f"affordable one is empty. The row below it is priced as an "
+                f"abstention — no alerts, every miss paid for — and it is "
+                f"excluded from the comparison rather than counted as a policy "
+                f"the model beat.",
+                "",
+            ]
 
         # A row only counts as overflowing if its alert count is on record: the
         # flag and the number are two views of one measurement, and a row

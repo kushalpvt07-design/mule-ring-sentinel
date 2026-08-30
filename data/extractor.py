@@ -26,19 +26,28 @@ Degree structure
   degree_balance             min/max, bounded [0,1] — a pass-through account
                              is balanced; a sink or a source is not
 Value flow
-  in_amount_sum,             absolute value at risk. The only unbounded
-  out_amount_sum             magnitudes kept, because the cost model in
+  in_amount_sum,             absolute value at risk, rescaled to a 60-day
+  out_amount_sum             reference window. The only unbounded magnitudes
+                             kept, because the cost model in
                              models/cost_matrix.py is denominated in rupees and
-                             an analyst needs the number. Comparable across
-                             splits only because all observation windows are the
-                             same length — see data/generator.py.
+                             an analyst needs the number — so the unit stays
+                             rupees, read as "rupees per 60 days observed". v3
+                             emitted the raw sum and was comparable across splits
+                             only because every window happened to be the same
+                             length; v4 divides that promise out. See
+                             REFERENCE_WINDOW_DAYS.
   flow_passthrough           min/max of inbound vs outbound value, bounded [0,1].
                              ≈1 means "money in ≈ money out": the pass-through
                              signature of a mule — and of a gig worker, which is
                              why the generator emits gig accounts.
 Centrality / local topology
-  pagerank                   centrality in the payment network
-  clustering_coefficient     how tightly the node's counterparties inter-transact
+  pagerank                   centrality, as a multiple of the uniform 1/N
+                             baseline. Emitted as pagerank × N so it does not
+                             move with node count — see
+                             compute_pagerank_vs_uniform.
+  clustering_coefficient     how tightly the node's counterparties inter-transact,
+                             computed on the DIRECTED graph so a layering loop and
+                             reciprocal social payment do not collapse together
   cycle_participation        the project's thesis as a feature — see below
   reciprocity                share of counterparties that both pay and are paid
 Behavioural
@@ -47,9 +56,47 @@ Behavioural
   burst_ratio                busiest single hour's share of the node's traffic
   amount_cv                  CV of INDIVIDUAL transaction amounts
   counterparty_amount_cv     CV across PER-COUNTERPARTY mean amounts
-  repeat_ratio               transactions per distinct counterparty
+  repeat_ratio               transactions per distinct counterparty per 60 days
+                             observed — the same reference-window rescale as the
+                             two sums, because only its numerator grows with the
+                             window
 Community structure
   community_internal_ratio   how closed the node's Louvain community is
+
+─────────────────────────────────────────────────────────────────────────────
+v3 → v4 CHANGES
+─────────────────────────────────────────────────────────────────────────────
+The 18 column NAMES are unchanged. Four DEFINITIONS changed, which is why
+`models/features.py` bumps MODEL_VERSION: `assert_feature_contract` compares
+names against the booster and would have loaded a v3 model against v4 features
+without a word of complaint. The version is the only thing standing between a
+redefinition and a silently mis-scored account.
+
+1. `pagerank` is emitted as pagerank × N. The raw value has mean exactly 1/N, so
+   it tracked node count — the property rule 3 retired `community_size` for.
+   Measured: means of 0.000322997 / 0.000339328 / 0.000348918 across the three
+   splits are 1/3096, 1/2947, 1/2866 to nine decimals.
+
+2. `clustering_coefficient` is computed on `G`, not on the undirected projection.
+   On the projection a directed 3-cycle and a reciprocal triangle are the same
+   object; the v3 docstring claimed this feature separated them. It did not, and
+   it was the weakest of the 18 (test AUC 0.524, 65% of test nodes at 0.0).
+
+3. `in_amount_sum`, `out_amount_sum` and `repeat_ratio` are rescaled to a 60-day
+   reference window. All three grow with how long the graph was watched — measured
+   2.00x / 1.99x / 1.88x when the window doubles — and v3 kept them comparable by
+   requiring every window to be the same length by hand. See `window_scale` for
+   the residuals, including the honest admission that `repeat_ratio` is sublinear
+   so its correction overshoots by ~6%.
+
+4. `MIN_WINDOW_DAYS_FOR_RESCALE` switches item 3 off for graphs spanning under a
+   day, because extrapolating an hour of traffic to 60 days fabricates a rupee
+   figure rather than estimating one.
+
+Nothing above can reorder accounts within a single graph: each is either a
+per-node redefinition (2) or a multiplication by one per-graph constant (1, 3).
+The in-split rank order the trees split on is unchanged; what changes is that the
+axis now means the same thing in two graphs of different size or duration.
 
 ─────────────────────────────────────────────────────────────────────────────
 v2 → v3 CHANGES
@@ -60,9 +107,10 @@ v2 → v3 CHANGES
 
 2. `reciprocity`, `burst_ratio` and `counterparty_amount_cv` added. Each exists
    because a v2 feature was doing two jobs at once: `clustering_coefficient` was
-   the only thing distinguishing a layering loop from ordinary two-way social
-   payment, and `txn_velocity` conflated "many transactions" with "many
-   transactions crammed into one hour".
+   claimed to be the only thing distinguishing a layering loop from ordinary
+   two-way social payment — a claim v4 item 2 above finally makes true — and
+   `txn_velocity` conflated "many transactions" with "many transactions crammed
+   into one hour".
 
 3. `community_size` and `net_flow` dropped. `community_size` is a raw count that
    grows with the graph and scored test AUC 0.10 — it had become an inverted
@@ -101,7 +149,6 @@ import hashlib
 from collections import defaultdict, deque
 from pathlib import Path
 
-import community as community_louvain  # python-louvain
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -128,16 +175,64 @@ LOUVAIN_SEED = 42
 # ring. Requiring repetition is also what makes the search tractable.
 MIN_REPEATS = 2
 
-# Longest directed cycle considered. Ring sizes in the generator top out at 8,
-# so 8 is what it takes to see a full ring loop. Chosen empirically: on the test
-# split, single-feature AUC for cycle_participation rises 0.55 → 0.58 → 0.73 →
-# 0.80 → 0.87 as the bound goes 3 → 4 → 5 → 6 → 8, while the share of NEGATIVE
-# nodes with a nonzero score also rises (2.8% → 23%). Both moving together is
-# the point: the feature is finding real structure, not the label.
+# Longest directed cycle considered. Fixed a priori by the generator, NOT tuned
+# on data: ring sizes top out at 8 (RING_ARCHETYPES in data/generator.py —
+# stealth_cycle spans size_range (4, 8), the rest smaller), so 8 is the smallest
+# bound that can still close the largest ring the generator can emit, and no
+# larger bound could find a longer one because none exists. (Fan-in hubs are
+# stars, not loops, so their feeder counts up to 40 do not bear on cycle length.)
+#
+# Deliberately not chosen by sweeping single-feature AUC. cycle_participation is
+# the strongest of the 18 features, and selecting its one hyperparameter to
+# maximise a score computed ON THE TEST SPLIT would fit the feature construction
+# to the very rows held out to judge the model — the leakage models/features.py
+# forbids by name ("feature-level decisions from here on are made on VALIDATION;
+# reading it on test and then acting on it consumes the one evaluation the split
+# exists for"). An earlier revision justified the 8 with exactly such a test-split
+# AUC ladder; it was removed because a sound a-priori bound needs no sweep, and a
+# sweep that is wanted belongs on validation.
 MAX_CYCLE_LEN = 8
 
 # Cycles of length 2 are mutual pairs, which `reciprocity` already measures.
 MIN_CYCLE_LEN = 3
+
+
+# ── Window normalisation (models/features.py rule 3) ──────────────
+# Three features grow with HOW LONG the graph was watched, so their values are
+# only comparable between two graphs of the same span. Rule 3 used to discharge
+# that with a promise — every window is 60 days, asserted in data/generator.py —
+# and a promise maintained by hand is a promise that gets broken: v2 shipped
+# windows of 108/32/39 days and an API context spanning a third length again.
+#
+# v4 replaces the promise with arithmetic. Each of the three is emitted rescaled
+# to a REFERENCE window, so the number does not depend on the span of the graph
+# it was measured on and a mismatched window can no longer silently change a
+# feature's scale. What it CAN still do is change the graph's structure, which is
+# why api/main.py keeps warning about window drift rather than treating this as a
+# licence to score against any context.
+#
+# 60 days because that is what data/generator.py emits, so the shipped splits are
+# rescaled by 1.000067 / 1.000264 / 1.000112 (train / val / test) — i.e. this
+# change moves no published rupee figure, it only removes the dependency. The
+# rupee unit survives too, which rule 3's exception for the two sums requires:
+# `in_amount_sum` is still rupees, now "rupees per 60 days observed".
+REFERENCE_WINDOW_DAYS = 60.0
+
+# Below this the rescale is switched OFF rather than applied. A graph spanning an
+# hour would otherwise be multiplied by 1,440 to reach the reference, which does
+# not estimate the account's 60-day exposure, it fabricates it — and the figure
+# is one an analyst reads in rupees. Returning the un-rescaled value is wrong by a
+# known factor; returning a fabricated one is wrong by an unknown factor and
+# looks authoritative. One day is the shortest span over which the diurnal
+# structure the generator emits completes even once.
+#
+# No shipped call reaches this branch (every window is ~60 days, and serving
+# merges the batch INTO the 60-day context so the merged span is the context's).
+# It is reachable from a unit test with a hand-built graph, which is where it is
+# pinned — see tests/test_features.py.
+MIN_WINDOW_DAYS_FOR_RESCALE = 1.0
+
+_NS_PER_DAY = 86_400_000_000_000
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -215,6 +310,67 @@ def build_graph(edges_df: pd.DataFrame) -> nx.DiGraph:
 # Graph-level features
 # ══════════════════════════════════════════════════════════════════
 
+def observation_window_days(G: nx.DiGraph) -> float:
+    """
+    How long this graph was watched, in days, from its own transaction times.
+
+    Measured rather than declared, for the reason `partition_fingerprint` exists:
+    a caller-supplied span is a second copy of a fact the data already carries,
+    and two copies drift. `compute_node_features` accepts an override anyway, but
+    only so a test can pin the value — nothing in the pipeline passes one.
+
+    Reads the per-edge `timestamps_ns` lists that `build_graph` stores, so this is
+    one pass over edges rather than a re-parse of the CSV. Returns 0.0 for a graph
+    with no timestamped edges, which `window_scale` treats as "do not rescale".
+    """
+    lo, hi = None, None
+    for _, _, data in G.edges(data=True):
+        stamps = data.get("timestamps_ns") or ()
+        if not stamps:
+            continue
+        edge_lo, edge_hi = min(stamps), max(stamps)
+        lo = edge_lo if lo is None or edge_lo < lo else lo
+        hi = edge_hi if hi is None or edge_hi > hi else hi
+    if lo is None or hi is None or hi <= lo:
+        return 0.0
+    return (hi - lo) / _NS_PER_DAY
+
+
+def window_scale(window_days: float) -> float:
+    """
+    The multiplier that puts a window-length-dependent feature on the reference
+    window, or exactly 1.0 when rescaling would do more harm than the skew.
+
+    Two properties worth being explicit about, because both are load-bearing:
+
+    IT CANNOT REORDER ACCOUNTS. The factor is one constant per graph, so every
+    account in a graph is multiplied by the same number. Within a single split
+    the rank order — and therefore every threshold a tree can pick — is
+    bit-identical to the un-rescaled version. Verified directly:
+    `np.argsort` agrees before and after on both `in_amount_sum` and
+    `repeat_ratio` over the 2,947-account validation graph. So this fix costs
+    nothing in-split; it only buys comparability BETWEEN graphs.
+
+    IT IS NOT AN EXACT CORRECTION FOR `repeat_ratio`. Measured on the serving
+    context, 60 days against the last 30 over the 2,946 accounts present in both
+    windows (median of per-account ratios; ratio of totals in brackets):
+
+        in_amount_sum    2.0000 (1.9748)  ->  1.0002 (0.9876)
+        out_amount_sum   1.9893 (1.9949)  ->  0.9949 (0.9977)
+        repeat_ratio     1.8750 (1.8525)  ->  0.9377 (0.9265)
+
+    The two sums are linear in window length, so referencing them is exact.
+    `repeat_ratio` is SUBLINEAR — doubling the window multiplies it by 1.875, not
+    2 — so dividing by the full factor overshoots and leaves a ~6% residual in the
+    other direction. 6% against 88% is the trade being made. A fitted exponent
+    (1.875 = 2^0.907) would close it on this one measurement and is deliberately
+    not offered: that is curve-fitting a correction to a single pair of windows.
+    """
+    if window_days < MIN_WINDOW_DAYS_FOR_RESCALE:
+        return 1.0
+    return REFERENCE_WINDOW_DAYS / window_days
+
+
 def compute_pagerank(G: nx.DiGraph) -> dict[str, float]:
     """
     PageRank on the transaction graph, with a convergence fallback.
@@ -231,6 +387,52 @@ def compute_pagerank(G: nx.DiGraph) -> dict[str, float]:
         return nx.pagerank(G, alpha=0.85, max_iter=200)
     except nx.PowerIterationFailedConvergence:
         return nx.pagerank(G, alpha=0.85, max_iter=1000, tol=1e-4)
+
+
+def compute_pagerank_vs_uniform(G: nx.DiGraph) -> dict[str, float]:
+    """
+    PageRank expressed as a multiple of the uniform baseline: `pagerank * N`.
+
+    This is the column `models/features.py` declares as `pagerank`, and it is not
+    what `compute_pagerank` above returns. The distinction is the whole point, so
+    it gets its own function name rather than a keyword argument.
+
+    WHY THE RAW VALUE COULD NOT STAY
+    ────────────────────────────────
+    PageRank is normalised to sum to 1, so the MEAN pagerank in any graph is
+    exactly 1/N. That makes the raw column a function of node count — which is
+    the one property rule 3 rejects by name, and the property that retired
+    `community_size`. Measured to nine decimals on the shipped splits:
+    0.000322997 / 0.000339328 / 0.000348918, against 1/3096, 1/2947, 1/2866 —
+    identical. An 8% shift in the mean of the #2 feature by test AUC (0.786),
+    driven purely by how many accounts happened to be in the window.
+
+    Two ways that bites. Across splits it is a covariate shift the window-length
+    guards cannot see, because it is not about duration: `assert_equal_window_lengths`
+    checks calendar days and node count is not calendar days. At serve time
+    `merge_with_context` adds the batch to a 2,947-node graph, so every scored
+    account's raw pagerank moves by roughly N/(N+k) — about 1.7% for a 50-account
+    batch, the same order as the `community_internal_ratio` instability that
+    justified freezing the partition.
+
+    Multiplying by N removes exactly that dependence and nothing else. The mean is
+    1.0 in every graph by construction, "2.0" means twice as central as the average
+    account whether the graph holds 3,000 accounts or 300,000, and because N is one
+    constant per graph the within-graph rank order is untouched — so the trees see
+    the same ordering they always did, on an axis that now transfers.
+
+    What it does NOT fix is rule 5: pagerank is a global fixpoint, so adding any
+    node still perturbs every value. That was measured and accepted separately
+    (max |Δ| 1.0e-05, rank correlation > 0.9999 for a two-account perturbation),
+    and `tests/test_features.py` allows pagerank a 1e-4 tolerance for it. Note the
+    tolerance is on the EMITTED column, so it now sits on a quantity ~N times
+    larger and had to be rescaled with this change.
+    """
+    raw = compute_pagerank(G)
+    n = G.number_of_nodes()
+    if n == 0:
+        return {}
+    return {node: value * n for node, value in raw.items()}
 
 
 def undirected_projection(G: nx.DiGraph) -> nx.Graph:
@@ -257,20 +459,25 @@ def undirected_projection(G: nx.DiGraph) -> nx.Graph:
         being discarded;
       * `extend_partition` — assigns an unseen account to its heaviest known
         neighbour, so the tie-break was decided on half a relationship.
-    (`nx.clustering` and `compute_community_internal_ratio` count edges rather
-    than weights and are unaffected either way.)
+    (`compute_community_internal_ratio` counts edges rather than weights and is
+    unaffected either way. `nx.clustering` used to be a third consumer here and
+    is no longer: in v4 the clustering coefficient is computed on the DIRECTED
+    graph, because a projection cannot tell A→B→C→A from A↔B↔C↔A — see
+    `compute_node_features`.)
 
     `total_amount` is summed for the same reason. The per-transaction `amounts`
     and `timestamps_ns` lists are deliberately NOT carried across: no consumer
     reads them off the undirected graph, and concatenating them here would
     double the peak memory of the largest attributes in the graph for nothing.
 
-    ⚠ TRAIN/SERVE SKEW, NOT YET CLOSED: `api/main.py` builds its own reference
+    TRAIN/SERVE SKEW, NOW CLOSED: `api/main.py` used to build its own reference
     projection with `build_graph(ctx).to_undirected()`, and `tests/conftest.py`
-    does the same for its Louvain fixture. Until both call this function, the
-    frozen serving partition is computed on last-wins weights while training
-    uses summed ones — which is exactly the class of skew `test_contract.py`'s
-    TRAIN/SERVE check exists to catch.
+    did the same for its Louvain fixture — so the frozen serving partition was an
+    optimum of a last-wins graph while training used summed weights. Both now call
+    this function. `tests/test_contract.py`'s TRAIN/SERVE check exists to catch
+    exactly this class of skew and could not see it, because the fixture
+    reproduced the same wrong call the API made; the fixture was the thing that
+    made the two agree.
     """
     UG = nx.Graph()
     UG.add_nodes_from(G.nodes())
@@ -293,6 +500,16 @@ def compute_louvain_communities(UG: nx.Graph) -> dict[str, int]:
     The integer ids are NOT a model feature — they feed the structural community
     feature below and survive as a metadata column for plots.
     """
+    # LAZY, and it must stay lazy. python-louvain is the one heavy dependency this
+    # module needs ONLY when a partition is actually computed; training and the
+    # feature arithmetic never call this function. Importing it at module scope
+    # made `import data.extractor` hard-require python-louvain, which in turn made
+    # tests/conftest.py's `pytest.importorskip("community")` in the
+    # `frozen_partition` fixture dead code: the val_graph fixture imports the
+    # extractor first, so a machine without python-louvain hit an ImportError at
+    # collection instead of the clean skip that skip exists to give. Keeping the
+    # import here restores it. Do not move it back to module scope.
+    import community as community_louvain  # python-louvain
     return community_louvain.best_partition(UG, random_state=LOUVAIN_SEED)
 
 
@@ -453,11 +670,15 @@ def repeated_edge_cycle_core(
        it can strip its neighbours of their last inbound/outbound edge, so this
        repeats to a fixed point.
 
-    Step 2 is where the tractability comes from, and it is lossless. Measured on
-    the test split: 16,158 repeated edges over 2,905 nodes reduce to 4,970 edges
-    over 1,724 nodes — a 3.3x shrink — while retaining 116 of 119 ring members.
-    The three dropped are members of open-chain rings that genuinely never close
-    a loop, so a cycle feature *should* score them zero.
+    Step 2 is where the tractability comes from, and it is lossless by
+    construction rather than by measurement: a node missing either an inbound or
+    an outbound edge cannot lie on any directed cycle, so deleting it removes no
+    cycle. On the shipped splits it shrinks the repeated-edge graph severalfold in
+    both edges and nodes while retaining all but a handful of ring members, and
+    the ones it drops belong to open-chain rings that genuinely never close a loop
+    — a cycle feature *should* score those zero. Exact counts are deliberately not
+    pinned here: they move whenever the data is regenerated, and a stale figure in
+    a docstring is worse than no figure.
 
     Returns (successors, predecessors) as plain dict-of-set adjacency.
     """
@@ -586,15 +807,16 @@ def compute_cycle_participation(
         successor of m can reach n — is wrong: that path may route back through
         m, and n → m → x ⇝ m → n contains a cycle through m alone.)
 
-    Cost is one extra BFS per mutual pair inside the core, not per node: 3,124
-    extra traversals over 885 mutual pairs on train, 2,907 over 782 on test,
-    which is roughly a doubling of this function's work and still under 5s.
-
-    MEASURED on the training split: 2.5s for 3,090 nodes / 20,741 pairs, of
-    which the cycle core reduces 16,158 repeated edges to 4,970. Serving cost
-    matters because api/main.py rebuilds this graph per scoring batch, so if the
-    serving context ever grows past one observation window this is the function
-    that will notice first.
+    Cost is one bounded re-BFS per mutual EDGE (so two per mutual pair) on top of
+    the single base BFS each core node already gets, and it runs over the reduced
+    core rather than the full repeated-edge graph. The forward-distance trees are
+    consumed as they are built rather than all held at once (see the scoring loop
+    below), so peak memory is one tree plus the co-cyclic-neighbour sets — bounded
+    by the core edge count — not the sum of every node's tree, which is the
+    quantity that would actually grow dangerously. That ceiling matters because api/main.py rebuilds this graph per
+    scoring batch: whatever this function costs, it costs per request, and it is
+    the one that will notice first if the serving context ever grows past a
+    single observation window.
     """
     succ, pred = repeated_edge_cycle_core(G, min_repeats)
     core_nodes = set(succ) | set(pred)
@@ -608,16 +830,41 @@ def compute_cycle_participation(
             nbrs[u].add(v)
             nbrs[v].add(u)
 
-    # One bounded BFS per core node. max_len - 1 because the closing edge of the
-    # cycle supplies the final hop.
-    reach = {
-        n: _bounded_forward_distances(succ, n, max_len - 1)
-        for n in core_nodes
-    }
-
     def closes(d: int | None) -> bool:
         """Does a return path of `d` hops make a cycle of allowed length?"""
         return d is not None and MIN_CYCLE_LEN <= d + 1 <= max_len
+
+    # One bounded BFS per core node — but the trees are CONSUMED as they are
+    # built, never all held at once. The question is per directed edge u → v:
+    # does a return path v ⇝ u of length <= max_len - 1 close a cycle? That is
+    # answered entirely by the forward-distance tree rooted at v, so we root one
+    # BFS at each core node v, resolve every edge INTO v from that single tree,
+    # credit both endpoints, and let the tree fall out of scope. Peak memory is
+    # one tree plus the co-cyclic-neighbour sets (bounded by the core edge
+    # count), rather than the sum of every core node's tree materialised up
+    # front — on the training split that eager sum was ~1.7M entries, and
+    # api/main.py rebuilds this per scoring batch, so the peak recurred per call.
+    #
+    # An edge u → v sits on an allowed cycle iff v reaches u again within
+    # max_len - 1 hops (the closing edge u → v supplies the final hop). If v → u
+    # is itself a direct edge the pair is mutual: BFS then reports only that
+    # length-1 hop and masks every longer return path, so re-ask with that one
+    # reciprocal edge removed — the answer is the shortest path of length >= 2,
+    # i.e. the shortest cycle through the pair that is not the length-2 cycle
+    # `reciprocity` already measures. Crediting BOTH endpoints of each closing
+    # edge is what covers both directions round a mutual pair: the edge v → u is
+    # resolved in its own turn, when the loop roots its BFS at u.
+    on_cycle: dict[str, set[str]] = defaultdict(set)
+    for v in core_nodes:
+        reach_v = _bounded_forward_distances(succ, v, max_len - 1)
+        for u in pred.get(v, ()):
+            d = reach_v.get(u)
+            if d == 1:
+                d = _bounded_forward_distances(
+                    succ, v, max_len - 1, skip_edge=(v, u)).get(u)
+            if closes(d):
+                on_cycle[u].add(v)
+                on_cycle[v].add(u)
 
     out: dict[str, float] = {}
     for node in G.nodes():
@@ -625,45 +872,7 @@ def compute_cycle_participation(
         if not neighbours or node not in core_nodes:
             out[node] = 0.0
             continue
-
-        on_cycle: set[str] = set()
-
-        # Edge node → m closes a cycle if m can reach node within max_len - 1.
-        for m in succ.get(node, ()):
-            d = reach.get(m, {}).get(node)
-            if closes(d):
-                on_cycle.add(m)
-            elif d == 1:
-                # d == 1 means the edge m → node exists: a mutual pair, whose
-                # length-2 cycle is correctly rejected above. But BFS reported
-                # only that shortest hop, so any LONGER return path m ⇝ node was
-                # never seen. Ask again with the reciprocal edge masked; the
-                # answer is then the shortest path of length >= 2, which is the
-                # shortest cycle through this pair that is not the mutual pair.
-                d2 = _bounded_forward_distances(
-                    succ, m, max_len - 1, skip_edge=(m, node)).get(node)
-                if closes(d2):
-                    on_cycle.add(m)
-
-        # Edge m → node closes a cycle if node can reach m within max_len - 1.
-        node_reach = reach.get(node, {})
-        for m in pred.get(node, ()):
-            if m in on_cycle:
-                continue
-            d = node_reach.get(m)
-            if closes(d):
-                on_cycle.add(m)
-            elif d == 1:
-                # Mirror of the case above, for the other direction round the
-                # pair. Both are checked because they are different cycles: one
-                # uses the edge node → m, the other the edge m → node, and
-                # either one qualifies m as sharing a cycle with node.
-                d2 = _bounded_forward_distances(
-                    succ, node, max_len - 1, skip_edge=(node, m)).get(m)
-                if closes(d2):
-                    on_cycle.add(m)
-
-        out[node] = len(on_cycle & neighbours) / len(neighbours)
+        out[node] = len(on_cycle.get(node, set()) & neighbours) / len(neighbours)
 
     return out
 
@@ -716,6 +925,34 @@ _NS_PER_HOUR = 3_600_000_000_000
 # thing that matters is WHICH neighbourhood they get pooled into.
 UNDEFINED_HHI = 1.0     # no inbound value at all → not a fan-in hub
 UNDEFINED_CV = 1.0      # CV of an exponential: the no-structure reference point
+UNDEFINED_VELOCITY = 0.0  # no rate is defined without ≥2 events over real time
+
+# A FOURTH CASE, of the same shape, listed here so the block is the complete
+# inventory it reads as. `window_scale` returns exactly 1.0 — no rescale — for a
+# graph spanning less than MIN_WINDOW_DAYS_FOR_RESCALE, because multiplying an
+# hour of traffic by 1,440 to reach the 60-day reference fabricates a rupee figure
+# instead of estimating one. Same principle as the three above: when the quantity
+# is undefined, return the least misleading value in range rather than a
+# confident wrong one. Unlike the three above it is not reachable from the shipped
+# data at all — every window is ~60 days and serving merges the batch into the
+# 60-day context — so it is pinned by a hand-built graph in tests/test_features.py
+# rather than by a row count.
+#
+# A FIFTH CASE, listed for the same completeness, but the MIRROR of the three
+# constants above rather than a repeat of them. `compute_txn_velocity` is a rate
+# — transactions per hour — so its fraud-like end is HIGH (rapid layering) and
+# the least-misleading value for an undefined rate is the LOW end, 0.0, not a
+# raised sentinel. The defect was the opposite mistake: the zero-span branch
+# returned `float(n)`, a raw COUNT (2.0+), above the entire genuine range (0 to
+# 0.583 on the shipped splits) and at the suspicious end, so a timestamp artefact
+# — all of a node's transactions sharing one instant — read as its most-
+# suspicious possible value. Flooring the span at the data's one-second
+# resolution instead would divide n events by <=1s, i.e. >=3,600·n per hour, an
+# even larger excursion past that ceiling; the honest reading of "n events in no
+# measurable time" is that the rate is undefined, so it returns
+# UNDEFINED_VELOCITY = 0.0. Not reachable on the shipped data (no node has all
+# its transactions in one instant), and the burstiness such a node genuinely has
+# is carried by `burst_ratio`, which is bounded [0, 1] and cannot run away.
 
 
 def compute_fan_in_concentration(in_amounts: list[float]) -> float:
@@ -753,13 +990,21 @@ def compute_txn_velocity(timestamps_ns: list[int]) -> float:
     Transactions per hour across the node's active span.
 
     Takes epoch nanoseconds so no datetime parsing happens per node.
+
+    Two undefined cases return `UNDEFINED_VELOCITY` = 0.0 (see the UNDEFINED CASE
+    block): fewer than two transactions, where there is no span to divide by, and
+    a zero span, where every transaction shares a single instant. The zero-span
+    branch used to return `float(n)` — a raw count, dimensionally not a rate,
+    landing at 2.0+ against a genuine range of 0 to 0.583, i.e. at the suspicious
+    end for what is only a timestamp artefact. 0.0 is the benign end; a node that
+    genuinely crams its activity into one moment is caught by `burst_ratio`.
     """
     n = len(timestamps_ns)
     if n < 2:
-        return 0.0
+        return UNDEFINED_VELOCITY
     span_h = (max(timestamps_ns) - min(timestamps_ns)) / _NS_PER_HOUR
     if span_h <= 0:
-        return float(n)  # everything landed inside the same instant
+        return UNDEFINED_VELOCITY  # all transactions in a single instant
     return float(n / span_h)
 
 
@@ -872,6 +1117,7 @@ def compute_node_features(
     G: nx.DiGraph,
     verbose: bool = False,
     partition: dict[str, int] | None = None,
+    window_days: float | None = None,
 ) -> pd.DataFrame:
     """
     Compute the full feature table for every node in `G`.
@@ -894,17 +1140,37 @@ def compute_node_features(
     the `louvain_community` metadata column. Ground-truth columns are attached
     separately by `label_nodes` — this function never sees labels, which is what
     makes it safe to call at serving time.
+
+    `window_days`
+        None (the default, and what both training and serving use) → measure the
+        graph's own span with `observation_window_days`. Pass a number only to pin
+        the rescale in a test; production must never supply one, because a
+        declared span that disagrees with the data is a silent scale error and
+        that is the class of bug this parameter exists to close.
     """
     if verbose:
         print("  Undirected projection...")
     # Summing projection, not G.to_undirected(): the latter lets one direction of
     # a reciprocal pair overwrite the other's weight, losing 6.3% of all
     # transaction weight. See `undirected_projection`.
-    UG = undirected_projection(G)  # computed once; three consumers below
+    UG = undirected_projection(G)  # computed once; two consumers below
+
+    # One constant per graph, applied to the three features that grow with how
+    # long the graph was watched. See `window_scale` for what it can and cannot
+    # correct, and REFERENCE_WINDOW_DAYS for why the shipped numbers barely move.
+    if window_days is None:
+        window_days = observation_window_days(G)
+    scale = window_scale(window_days)
+    if verbose:
+        print(f"  Observation window {window_days:.4f} d "
+              f"-> window scale x{scale:.6f}"
+              + ("  (rescale OFF: window shorter than "
+                 f"{MIN_WINDOW_DAYS_FOR_RESCALE} d)" if scale == 1.0
+                 and window_days < MIN_WINDOW_DAYS_FOR_RESCALE else ""))
 
     if verbose:
-        print("  PageRank...")
-    pagerank = compute_pagerank(G)
+        print("  PageRank (relative to the uniform 1/N baseline)...")
+    pagerank = compute_pagerank_vs_uniform(G)
 
     if partition is None:
         if verbose:
@@ -922,8 +1188,23 @@ def compute_node_features(
     comm_ratios = compute_community_internal_ratio(UG, partition)
 
     if verbose:
-        print("  Clustering coefficients...")
-    clustering = nx.clustering(UG)
+        print("  Clustering coefficients (directed)...")
+    # `G`, not `UG`. On the projection, A→B→C→A (a layering loop) and A↔B↔C↔A
+    # (reciprocal social payment) collapse to the identical triangle and score the
+    # same — while the module docstring claimed this feature was "the only thing
+    # distinguishing a layering loop from ordinary two-way social payment". It was
+    # measurably not: weakest of the 18 at test AUC 0.524, with 65% of test nodes
+    # at exactly 0.0. networkx's directed coefficient (Fagiolo 2007) counts the
+    # eight directed triad patterns separately and subtracts bidirectional degree
+    # from the denominator, so the two cases above no longer coincide, which is
+    # what the claim needed all along.
+    #
+    # Left unweighted on purpose. `nx.clustering(..., weight=...)` normalises each
+    # edge weight by the LARGEST weight in the whole graph, so the weighted variant
+    # is graph-scale-dependent — the thing rule 3 exists to keep out, and the thing
+    # this same commit is removing from `pagerank`. Direction was the defect worth
+    # fixing; adding a scale dependence to fix it would be a trade, not a fix.
+    clustering = nx.clustering(G)
 
     if verbose:
         print(f"  Cycle participation (repeated edges, length <= {MAX_CYCLE_LEN})...")
@@ -1000,10 +1281,15 @@ def compute_node_features(
             "degree_ratio": out_deg / max(in_deg, 1),
             "degree_balance": (lo_deg / hi_deg) if hi_deg > 0 else 0.0,
             # ── value flow ──
-            "in_amount_sum": round(in_amount, 2),
-            "out_amount_sum": round(out_amount, 2),
+            # Rescaled to REFERENCE_WINDOW_DAYS: still rupees, now rupees per
+            # 60 days observed. `scale` is one constant for the whole graph, so
+            # this cannot change any account's rank — see `window_scale`.
+            "in_amount_sum": round(in_amount * scale, 2),
+            "out_amount_sum": round(out_amount * scale, 2),
             "flow_passthrough": (lo_amt / hi_amt) if hi_amt > 0 else 0.0,
             # ── centrality / topology ──
+            # `pagerank` here is pagerank × N — a multiple of the uniform
+            # baseline, mean 1.0 in every graph. See compute_pagerank_vs_uniform.
             "pagerank": float(pagerank.get(node, 0.0)),
             "clustering_coefficient": float(clustering.get(node, 0.0)),
             "cycle_participation": float(cycle_part.get(node, 0.0)),
@@ -1014,7 +1300,12 @@ def compute_node_features(
             "burst_ratio": compute_burst_ratio(timestamps),
             "amount_cv": compute_amount_cv(amounts),
             "counterparty_amount_cv": compute_counterparty_amount_cv(cp_means),
-            "repeat_ratio": (n_txns / n_counterparties) if n_counterparties else 0.0,
+            # Same rescale, same reason: transactions per distinct counterparty
+            # per 60 days observed. This one is a SUBLINEAR grower so the
+            # correction is approximate — 0.94x residual against 1.88x
+            # uncorrected, measured in `window_scale`.
+            "repeat_ratio": ((n_txns / n_counterparties) * scale
+                             if n_counterparties else 0.0),
             # ── community structure ──
             "community_internal_ratio": float(comm_ratios.get(comm, 0.0)),
             # ── metadata only, never fed to the model ──
@@ -1070,6 +1361,27 @@ def label_nodes(features_df: pd.DataFrame, edges_df: pd.DataFrame) -> pd.DataFra
                  stealthy rings are much harder than the loud ones.
 
     Negatives get ring_id = -1 and ring_type = "organic".
+
+    FULL MEMBERSHIP IS ALSO RECORDED, BECAUSE THE ATTRIBUTION LOSES INFORMATION
+    ──────────────────────────────────────────────────────────────────────────
+    `ring_id` keeps only the first ring, so an account bridging two rings is
+    invisible to the second one, and downstream ring recall carries slack it
+    cannot see. `rings_attributed` and `ring_types_attributed` carry the FULL
+    pipe-separated sets alongside the single attribution, so the size of that
+    slack is a measurement rather than an estimate.
+
+    This exists because `models/train.py` used to publish the sentence "Measured
+    on shipped v3 test data: 4 of 119 positives are in two rings…" into
+    metrics.json as a string literal. Those counts were measured once, by hand,
+    on an earlier dataset — the test split has 124 positives, not 119 — and they
+    were then republished verbatim by every subsequent run, inside the very
+    artefact whose numbers are supposed to be derived. `archetype_breakdown`
+    receives the feature table and never sees an edge file, so it could not have
+    computed them; these two columns are how it can.
+
+    They are labels, not features: `FEATURE_COLS` is the single source of truth
+    for model input and does not contain them, exactly as it does not contain
+    `ring_id`.
     """
     if "edge_role" not in edges_df.columns:
         raise RuntimeError(
@@ -1086,6 +1398,10 @@ def label_nodes(features_df: pd.DataFrame, edges_df: pd.DataFrame) -> pd.DataFra
     # node has exactly one ring in all but pathological configurations.
     ring_of: dict[str, int] = {}
     type_of: dict[str, str] = {}
+    # Every ring a node appears in, so the cost of keeping only the first is
+    # measurable downstream instead of being asserted from memory.
+    rings_of: dict[str, set[int]] = {}
+    types_of: dict[str, set[str]] = {}
     for row in ring_edges[["sender", "receiver", "ring_id", "ring_type"]].itertuples(
         index=False
     ):
@@ -1093,6 +1409,8 @@ def label_nodes(features_df: pd.DataFrame, edges_df: pd.DataFrame) -> pd.DataFra
             if account not in ring_of:
                 ring_of[account] = int(row.ring_id)
                 type_of[account] = str(row.ring_type)
+            rings_of.setdefault(account, set()).add(int(row.ring_id))
+            types_of.setdefault(account, set()).add(str(row.ring_type))
 
     features_df[TARGET_COL] = features_df["node"].isin(mule_nodes).astype(int)
     features_df["ring_id"] = (
@@ -1100,6 +1418,15 @@ def label_nodes(features_df: pd.DataFrame, edges_df: pd.DataFrame) -> pd.DataFra
     )
     features_df["ring_type"] = (
         features_df["node"].map(type_of).fillna("organic").astype(str)
+    )
+    # Sorted so the column is stable across runs and diffable; pipe-separated
+    # because ring ids are integers and commas would fight the CSV. Empty for
+    # negatives, which belong to no ring.
+    features_df["rings_attributed"] = features_df["node"].map(
+        lambda n: "|".join(str(r) for r in sorted(rings_of.get(n, ())))
+    )
+    features_df["ring_types_attributed"] = features_df["node"].map(
+        lambda n: "|".join(sorted(types_of.get(n, ())))
     )
     return features_df
 
@@ -1160,7 +1487,7 @@ def process_split(name: str, edges_path: Path) -> pd.DataFrame:
 
 def main() -> None:
     enable_utf8_stdout()
-    print(banner("UPI Mule-Ring Sentinel: Feature Extractor (v3)"))
+    print(banner("UPI Mule-Ring Sentinel: Feature Extractor (v4)"))
 
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 

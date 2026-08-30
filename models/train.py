@@ -772,17 +772,25 @@ def bootstrap_auc_ci(
     scores, so six accounts from one ring carry barely more information about
     "would this model catch an unseen ring?" than one of them does.
 
-    Test holds 119 positives but only 24 rings. Resampling accounts therefore
-    inflates the effective sample size by roughly the mean ring size and reports
-    an interval far tighter than the evidence supports: the published
-    [0.9737, 0.9919] is about 2.14x too narrow. The honest interval resamples the
-    24 rings with replacement (each non-member account is its own singleton
-    cluster, so the negative class is still resampled at account level, which is
-    correct — nothing ties two random customers together).
+    The test split holds on the order of a hundred positives drawn from a couple
+    of dozen rings. Resampling accounts therefore inflates the effective sample
+    size by roughly the mean ring size and reports an interval tighter than the
+    evidence supports. The honest interval resamples the RINGS with replacement
+    (each non-member account is its own singleton cluster, so the negative class
+    is still resampled at account level, which is correct — nothing ties two
+    random customers together).
+
+    No counts are quoted here on purpose. An earlier version of this paragraph
+    said "119 positives but only 24 rings" and "about 2.14x too narrow", measured
+    once by hand; the positive count was already wrong by 5 and a reader had no
+    way to know which of the three numbers had aged. The live figures are in
+    metrics.json — `n_rings` in the recall breakdown, and both intervals side by
+    side, one clustered and one naive — so the size of the understatement is a
+    published measurement rather than a remembered one.
 
     That is not a cosmetic difference in a hackathon judged on honest metrics: a
     narrow interval is the claim "this AUC would hold on your data", and the
-    number of independent fraud rings behind it is 24.
+    number of independent fraud rings behind it is two dozen.
 
     Returns the percentile interval. `main` also prints the naive account-level
     interval beside it, obtained by passing singleton clusters, so the size of the
@@ -962,33 +970,41 @@ def archetype_breakdown(
     data/extractor.py's `label_nodes` walks the ring edges and keeps the FIRST
     ring each account appears in, so an account bridging two rings is counted
     under one of them and is invisible to the other. Its own comment calls the
-    situation "pathological"; on the shipped v3 data it is simply uncommon —
-    4 of 119 test positives are endpoints of ring edges from two different rings
-    (8 of 196 in train, 2 of 110 in val), and 2 of those 4 bridge two archetypes
-    (fast_cycle and stealth_cycle).
+    situation "pathological"; on the shipped data it is simply uncommon.
 
-    Two consequences, both real, neither repairable here — this function receives
-    the feature table and never sees the edge file, so first-ring attribution is
-    all the information that reaches it:
+    Two consequences, both real:
 
       • An archetype's ACCOUNT denominator is short by the members it lent to
         another archetype, and the borrowing archetype's is long by the same
-        accounts. On test that moves 2 accounts between fast_cycle and
-        stealth_cycle out of 119.
+        accounts.
 
       • A ring's membership as seen here can be smaller than the ring the
-        generator built: 4 of the 24 test rings (ids 65, 79, 80, 87) show one
-        fewer member. A ring whose only alerting account was attributed to
+        generator built. A ring whose only alerting account was attributed to
         another ring therefore reads as escaped when an analyst would in fact
-        have been looking at it. With 4 rings exposed, ring recall carries up to
-        4/24 of slack in that direction — worth stating next to a figure of
-        23/24, which is otherwise easy to read as exact.
+        have been looking at it, so ring recall carries slack in that direction
+        — worth stating next to a figure like 23/24, which is otherwise easy to
+        read as exact.
+
+    HOW BIG THAT SLACK IS, IS MEASURED AND NOT REMEMBERED
+    ────────────────────────────────────────────────────
+    `ring_attribution.measured` in the returned dict carries the counts for the
+    split in hand: positives in more than one ring, positives bridging two
+    archetypes, and the exact number of rings short a member. See
+    `_attribution_slack`.
+
+    This paragraph used to quote those counts as literals, and so did the string
+    this function wrote into metrics.json. They had been measured once by hand on
+    an earlier dataset and were wrong by the time anyone read them — they said
+    119 test positives against an actual 124 — while sitting inside the artefact
+    whose entire claim is that its numbers are derived. Nothing here quotes a
+    count any more; `label_nodes` records full membership and this function
+    counts it.
 
     No ring disappears entirely under this attribution on the shipped data — every
     ring keeps at least one member, so the ring DENOMINATOR is complete even where
-    membership is short (train 40/40 rings attributed, val 24/24, test 24/24), and
-    `ring_id` determines `ring_type` in all three splits. Both properties are
-    checked below rather than trusted, because neither is guaranteed by anything.
+    membership is short, and `ring_id` determines `ring_type` in all three splits.
+    Both properties are checked below rather than trusted, because neither is
+    guaranteed by anything.
     """
     flagged = np.asarray(y_proba) >= threshold
     positives = (df[TARGET_COL] == 1).to_numpy()
@@ -1135,12 +1151,62 @@ def archetype_breakdown(
             "consequence": (
                 "an account in two rings is counted under one of them; a ring "
                 "detected only through such an account can read as escaped, and "
-                "archetype account counts can be short or long by those "
-                "accounts. Measured on shipped v3 test data: 4 of 119 positives "
-                "are in two rings, 2 of them across archetypes, and 4 of 24 "
-                "rings show one fewer member than the generator built."
+                "archetype account counts can be short or long by those accounts"
             ),
+            # MEASURED on the split in hand, from the full membership sets
+            # data.extractor.label_nodes now carries. This used to be a sentence
+            # of hand-typed counts ("4 of 119 positives…") republished verbatim
+            # every run, inside the artefact whose whole point is that its
+            # numbers are derived. The test split has 124 positives, not 119.
+            "measured": _attribution_slack(df, positives),
         },
+    }
+
+
+def _attribution_slack(df: pd.DataFrame, positives: np.ndarray) -> dict | None:
+    """
+    How much ring recall's denominator loses to first-ring attribution.
+
+    Returns None — absence, not zero — when the feature table predates the
+    `rings_attributed` / `ring_types_attributed` columns, because "no accounts
+    bridge two rings" and "we cannot tell" are different findings and only one of
+    them should be publishable as a reassurance.
+
+    `rings_short_a_member` is exact rather than a bound: a ring loses exactly
+    those accounts that are endpoints of its edges while attributed elsewhere,
+    and both facts are in the two columns.
+    """
+    needed = ("rings_attributed", "ring_types_attributed")
+    if any(col not in df.columns for col in needed):
+        return None
+
+    rows = df.loc[positives, ["ring_id", *needed]]
+    # Read back from CSV, an empty cell is NaN; positives always have a ring, so
+    # this only guards the type.
+    ring_sets = rows["rings_attributed"].fillna("").astype(str)
+    type_sets = rows["ring_types_attributed"].fillna("").astype(str)
+
+    per_account_rings = [
+        {int(r) for r in cell.split("|") if r} for cell in ring_sets
+    ]
+    n_types = [len([t for t in cell.split("|") if t]) for cell in type_sets]
+
+    # Rings that own an edge endpoint they were not credited with.
+    shorted: set[int] = set()
+    for attributed, rings in zip(rows["ring_id"].astype(int), per_account_rings):
+        shorted |= (rings - {attributed})
+
+    multi = sum(1 for rings in per_account_rings if len(rings) > 1)
+    return {
+        "n_positives": int(len(rows)),
+        "positives_in_more_than_one_ring": int(multi),
+        "positives_bridging_two_archetypes": int(sum(1 for k in n_types if k > 1)),
+        "rings_short_a_member": int(len(shorted)),
+        "note": (
+            "rings_short_a_member is the count of distinct rings that own an "
+            "edge endpoint credited to a different ring; ring recall carries up "
+            "to that many rings of slack in the escaped-looking direction"
+        ),
     }
 
 
@@ -1873,6 +1939,26 @@ def capacity_fair_comparison(
     flag-everything is marked infeasible, because 1,000 alerts per 1,000 accounts
     is not a queue any budget below that permits, and a reader should see the
     excluded policy rather than wonder whether it was quietly dropped.
+
+    WHAT `feasible_under_budget` MEANS, AND WHY IT IS COMPUTED
+    ─────────────────────────────────────────────────────────
+    True exactly when the policy forms a NON-EMPTY review queue that fits inside
+    the budget. Both halves matter, and the column used to be the literal `True`
+    for every scored policy, which made it decoration.
+
+    It is not decoration, because a coarse rule can fail the first half. Scores
+    tie: on the shipped validation split 126 of 2,947 accounts share the maximum
+    `cycle_participation`, so the strictest non-empty cut this rule can form
+    flags 42.8 per 1,000 — over twice the 20-per-1,000 cap. There is no threshold
+    at which the rule is both non-empty and affordable, so
+    `threshold_for_alert_budget` returns the flag-nothing operating point, and
+    with the column hardcoded True the table published that as a policy which
+    caught no mules at a cost of every miss. The model then "beat" it. That is
+    not a win over a rival; it is a win over an abstention, and reporting it as
+    the former inflates the model's standing with a comparison it never made.
+
+    `val_strictest_nonempty_alerts_per_1000` carries the reason, so a reader can
+    see by how much the cap was missed rather than only that a row was excluded.
     """
     from models.cost_matrix import _prf
 
@@ -1923,9 +2009,14 @@ def capacity_fair_comparison(
         rows.append({
             "policy": label,
             "is_model": label == "XGBoost, full model",
-            "feasible_under_budget": True,
+            # Computed, not asserted. `budget_feasible` is False when no
+            # non-empty cut fits the cap; see the docstring.
+            "feasible_under_budget": bool(budgeted.budget_feasible),
             "val_threshold": float(budgeted.threshold),
             "val_alerts_per_1000": round(float(budgeted.alerts_per_1000), 1),
+            "val_strictest_nonempty_alerts_per_1000":
+                _none_if_nan_or_none(
+                    budgeted.strictest_nonempty_alerts_per_1000),
             "test_precision": _none_if_nan_or_none(realised.precision),
             "test_recall": _none_if_nan_or_none(realised.recall),
             "test_f1": _none_if_nan_or_none(realised.f1),
@@ -1943,8 +2034,12 @@ def capacity_fair_comparison(
 
     rows.append({
         "policy": "flag nothing", "is_model": False,
-        "feasible_under_budget": True,
+        # An empty queue is affordable at any budget and is not a policy, so it
+        # is infeasible under the definition above. This is the row whose cost
+        # every feasible policy must beat, not one of the policies being ranked.
+        "feasible_under_budget": False,
         "val_threshold": None, "val_alerts_per_1000": 0.0,
+        "val_strictest_nonempty_alerts_per_1000": None,
         "test_precision": none_p, "test_recall": none_r, "test_f1": none_f1,
         "test_alerts_per_1000": 0.0, "test_within_budget": True,
         "test_total_cost": float(n_pos * evaluator.config.fn_cost),
@@ -1954,6 +2049,7 @@ def capacity_fair_comparison(
         # The point of the row: cheap on paper, impossible to staff.
         "feasible_under_budget": bool(alert_budget >= 1000.0),
         "val_threshold": None, "val_alerts_per_1000": 1000.0,
+        "val_strictest_nonempty_alerts_per_1000": 1000.0,
         "test_precision": all_p, "test_recall": all_r, "test_f1": all_f1,
         "test_alerts_per_1000": 1000.0,
         "test_within_budget": bool(alert_budget >= 1000.0),
@@ -2030,7 +2126,7 @@ def calibration_diagnostic(
     p_val = np.asarray(p_val, dtype=float).ravel()
     p_test = np.asarray(p_test, dtype=float).ravel()
 
-    scaler = fit_platt_scaling(y_val, p_val)
+    scaler = fit_platt_scaling(y_val, p_val, fit_on="validation")
     calibrated = scaler.transform(p_test)
 
     raw_brier = brier_score(y_test, p_test)

@@ -44,23 +44,71 @@ DESIGN RULES for anything added to FEATURE_COLS
    because a repo whose selling point is honest metrics does not get to launder
    its own history.
 
-   `in_amount_sum` and `out_amount_sum` are the two deliberate exceptions. They
-   stay because the cost model in models/cost_matrix.py is denominated in rupees
-   and an analyst reviewing an alert needs the absolute exposure, not a ratio.
+   `in_amount_sum` and `out_amount_sum` are the two deliberate exceptions to the
+   "prefer bounded ratios" half of this rule. They stay unbounded because the cost
+   model in models/cost_matrix.py is denominated in rupees and an analyst
+   reviewing an alert needs the absolute exposure, not a ratio.
 
-   The exception carries an obligation. A sum, a count and a rate all scale with
-   how long you watched the account, so these features are only comparable
-   across train, validation, test and serving if every observation window is the
-   SAME LENGTH. That is not a style preference, it is a correctness requirement,
-   and it was violated: v2 split the timeline 60/18/22, giving windows of
-   108/32/39 days, so train features were roughly 3x test features purely by
-   duration — and the API's context file spanned train+val, a third scale again,
-   which is silent train/serve skew.
+   They are NOT exceptions to the "window-stable always" half, and in v3 they
+   were. So was `repeat_ratio`, which is the more interesting case because it
+   looks scale-free: `n_txns / n_counterparties` is a ratio, but only the
+   numerator grows with the window — a longer watch adds transactions to
+   counterparties already seen far faster than it adds new counterparties.
 
-   The constant itself lives in data/generator.py (a models/ module must not
-   depend on data/), enforced there by `assert_equal_window_lengths()` and
-   covered by tests/test_leakage.py. Anything that builds a graph to score
-   against — including `serving_context_edges.csv` — must span one window.
+   MEASURED, and this time with the estimator named. On
+   `serving_context_edges.csv`, the full 60 days against the last 30, over the
+   2,946 accounts present in both windows, as the median of per-account ratios
+   (ratio of totals in brackets):
+
+     feature          v3, raw           v4, referenced to 60 days
+     in_amount_sum    2.0000 (1.9748)   1.0002 (0.9876)
+     out_amount_sum   1.9893 (1.9949)   0.9949 (0.9977)
+     repeat_ratio     1.8750 (1.8525)   0.9377 (0.9265)
+     txn_velocity     0.9332            unchanged — already a rate
+     distinct cps     1.0000 (1.1041)   unchanged — saturates, see below
+
+   NAMING THE ESTIMATOR IS PART OF THE FIX. This rule previously cited "2.00x,
+   2.00x, 1.84x" and "in_degree and out_degree 1.11x" with no estimator attached,
+   and re-measuring showed those four figures came from three DIFFERENT ones: 2.00
+   is a median, 1.11 is a mean (its median is 1.0000), and 1.84 is nearest the
+   ratio of totals. Mixing estimators inside one list makes a spread of 1.0–1.11
+   read as a single measured constant. The mean of per-account ratios is the worst
+   choice of the three here and is the reason to state it: a ratio-of-ratios is
+   heavy-tailed, so accounts with a near-zero half-window value dominate it, and
+   `in_amount_sum` comes out at 3.17 under it. Median and totals are both quoted
+   above precisely because they do not always agree.
+
+   WHAT v4 DOES ABOUT IT. `data/extractor.py` multiplies all three by one
+   per-graph constant, `REFERENCE_WINDOW_DAYS / observed_days`, so the emitted
+   value is what the account would have shown over a 60-day watch. Two things
+   follow, and both matter:
+
+     * It cannot reorder accounts. One constant per graph means every account is
+       multiplied by the same number, so within a split the rank order — and
+       therefore every threshold a tree can choose — is bit-identical. This fix
+       buys nothing in-split; it buys comparability BETWEEN graphs.
+     * On the shipped splits the constant is 1.000067 / 1.000264 / 1.000112, so
+       no published rupee figure moves. The dependency is what goes away.
+
+   `repeat_ratio`'s correction is approximate and is documented as such in
+   `window_scale`: it grows sublinearly (2x window → 1.875x), so dividing by the
+   full factor overshoots and leaves ~6% the other way against 88% uncorrected. A
+   fitted exponent would close that on one pair of windows and is not offered.
+
+   THE OBLIGATION THIS USED TO CARRY, AND WHY IT IS NOT DISCHARGED. v3 kept these
+   features comparable by REQUIRING every observation window to be the same
+   length — "not a style preference, a correctness requirement" — and it was
+   violated: v2 split the timeline 60/18/22, giving windows of 108/32/39 days, so
+   train features were roughly 3x test features purely by duration, and the API's
+   context file spanned train+val, a third scale again. v4 divides that
+   requirement out of the three features that depended on it, but equal windows
+   are still required for a different reason the rescale cannot touch: window
+   length changes the graph's STRUCTURE, not just its magnitudes. Distinct
+   counterparties saturate (1.00 median, 1.10 by totals — sublinear, not flat),
+   which moves `degree_balance`, `reciprocity` and the cycle core. So
+   `assert_equal_window_lengths()` in data/generator.py stays, tests/test_leakage.py
+   keeps covering it, and anything that builds a graph to score against —
+   including `serving_context_edges.csv` — must still span one window.
 
 4. NO FEATURE MAY ENCODE THE LABEL.
    The generator must not be able to plant a feature that separates classes by
@@ -115,9 +163,71 @@ DESIGN RULES for anything added to FEATURE_COLS
    pagerank by at most 1.0e-05 with rank correlation > 0.9999. Bounded and
    negligible is acceptable; 0.29 is not.
 
+   v4 NOTE, and an admission about that tolerance. `pagerank` is now emitted as
+   pagerank × N (rule 3), which changes what a tolerance on it means twice over.
+   First, the honest reading of the v3 guard: raw pagerank has mean 1/N ≈ 3.4e-04
+   on these graphs, and the guard allowed an absolute 1e-4 — i.e. 29% of a typical
+   value, and 10x the drift ever measured. "Within 1e-4" sounded tight and was
+   nearly vacuous. Second, the direction of the fix: most of that 1e-05 drift IS
+   the 1/N normalisation moving, because adding k nodes rescales every existing
+   node's raw value by about N/(N+k) — and multiplying by N cancels exactly that
+   term to first order. So on a quantity whose mean is now 1.0 by construction,
+   the residual should be materially smaller in RELATIVE terms than v3's 29%
+   allowance, not larger.
+
    tests/test_features.py asserts this: perturb the graph with disconnected
    accounts, require bit-identical values for every feature except pagerank, and
-   require pagerank within 1e-4.
+   require pagerank within `PAGERANK_PERTURBATION_TOLERANCE`. That constant is set
+   to 1e-3 on the mean-1.0 column — 290x tighter than v3's effective allowance,
+   and chosen as a bound the cancellation argument clears comfortably rather than
+   as a measurement, because the perturbation cannot be re-measured until the
+   retrain runs. If the retrain shows the true residual is orders of magnitude
+   below it, tighten it and record the figure here; a tolerance nobody has
+   measured against is how the v3 one got to 29%.
+
+─────────────────────────────────────────────────────────────────────────────
+v3 → v4 CHANGES
+─────────────────────────────────────────────────────────────────────────────
+NOTHING WAS ADDED OR DROPPED. FEATURE_COLS is the same 18 names in the same
+order. Four of them mean something different, which is a more dangerous kind of
+change than adding a column and is why the version is bumped:
+`assert_feature_contract` below compares NAMES against the booster, so a
+`sentinel_v3.xgb` left on disk would have loaded against v4 features and scored
+every account confidently wrong without raising anything. Renaming the artefact
+is what stops that — the API derives its path from MODEL_NAME, so the old file is
+simply not found and the service refuses to start until `python -m models.train`
+has run.
+
+REDEFINED
+  pagerank          Emitted as pagerank × N, a multiple of the uniform baseline.
+                    Raw PageRank sums to 1, so its mean is exactly 1/N and the
+                    column tracked node count: means of 0.000322997 / 0.000339328
+                    / 0.000348918 are 1/3096, 1/2947, 1/2866 to nine decimals —
+                    an 8% shift in the mean of the #2 feature by test AUC (0.786)
+                    driven by nothing but how many accounts were in the window.
+                    Rule 3 retired `community_size` for precisely this.
+  clustering_coefficient
+                    Computed on the DIRECTED graph. On the undirected projection a
+                    layering loop (A→B→C→A) and reciprocal social payment
+                    (A↔B↔C↔A) are the same triangle — while the v2/v3 docstrings
+                    claimed this feature was what told them apart. It was the
+                    weakest of the 18 instead: test AUC 0.524, 65% of test nodes
+                    at exactly 0.0. Left unweighted, because networkx's weighted
+                    variant normalises by the largest edge weight in the graph and
+                    would trade a direction bug for a scale dependence.
+  in_amount_sum     All three rescaled to a 60-day reference window (rule 3).
+  out_amount_sum    Unit unchanged — still rupees, read as "per 60 days
+  repeat_ratio      observed". On the shipped splits the factor is 1.0001-1.0003,
+                    so no published figure moves; what goes away is a dependence
+                    on window length that v3 held off by hand.
+
+WHAT DID NOT CHANGE, and is worth stating because it bounds the retrain
+None of the four can reorder accounts within one graph. Three are a multiplication
+by a single per-graph constant, and the fourth is a per-node recomputation on the
+same neighbourhood. So the trees see the same in-split orderings they always did,
+and the retrain is not expected to move the headline numbers much — the exception
+is `clustering_coefficient`, which is a genuinely different measurement and was
+the weakest feature in the set, so it has room to improve and little to lose.
 
 ─────────────────────────────────────────────────────────────────────────────
 v2 → v3 CHANGES
@@ -243,10 +353,10 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
     "out_degree": "number of distinct accounts paid out to",
     "degree_ratio": "ratio of payees to payers",
     "degree_balance": "how evenly split between paying in and out",
-    "in_amount_sum": "total value received",
-    "out_amount_sum": "total value sent",
+    "in_amount_sum": "total value received (per 60 days observed)",
+    "out_amount_sum": "total value sent (per 60 days observed)",
     "flow_passthrough": "money in ≈ money out (pass-through account)",
-    "pagerank": "centrality in the payment network",
+    "pagerank": "centrality, as a multiple of the average account's",
     "clustering_coefficient": "how tightly its counterparties inter-transact",
     "cycle_participation": "sits on a repeating circular payment path",
     "reciprocity": "share of counterparties it both pays and is paid by",
@@ -255,7 +365,7 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
     "burst_ratio": "transactions crammed into a single hour",
     "amount_cv": "variation across individual transaction amounts",
     "counterparty_amount_cv": "pays every counterparty near-identical amounts",
-    "repeat_ratio": "transactions per distinct counterparty",
+    "repeat_ratio": "transactions per counterparty (per 60 days observed)",
     "community_internal_ratio": "how closed its transaction community is",
 }
 
@@ -263,11 +373,22 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
 # Model identity
 # ──────────────────────────────────────────────────────────────────
 
-# Bumped from v2 because the feature contract changed. api/main.py derives the
-# path it loads from MODEL_NAME — it must never hard-code a filename, which is
-# how it ended up serving a stale v1 model against v2's threshold.
-MODEL_NAME = "sentinel_v3.xgb"
-MODEL_VERSION = "sentinel_v3"
+# Bumped from v3 because four feature DEFINITIONS changed while all eighteen
+# names stayed the same — see the v3 → v4 section above. That is the case the
+# version number is actually load-bearing for: `assert_feature_contract` below
+# compares names, so it cannot tell a v3 booster from a v4 one, and a stale
+# `sentinel_v3.xgb` would have been served against redefined features in silence.
+# Renaming the artefact makes the failure loud and immediate instead.
+#
+# api/main.py derives the path it loads from MODEL_NAME — it must never hard-code
+# a filename, which is how it ended up serving a stale v1 model against v2's
+# threshold. The same applies to `models/saved_models/metrics.json`, whose
+# `model_version` tests/test_baselines.py compares against this constant: until
+# `python -m models.train` has run, that file describes v3 and the suite fails on
+# purpose. A metrics file describing a model that no longer exists is a published
+# claim about nothing.
+MODEL_NAME = "sentinel_v4.xgb"
+MODEL_VERSION = "sentinel_v4"
 
 # Columns the extractor emits that are NOT fed to the model. Retained in the
 # CSVs for analysis, joins, dashboard display and CV grouping.

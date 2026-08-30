@@ -171,6 +171,13 @@ class ThresholdReport:
     counts (tp/fp/tn/fn) and the costs are always defined, so a degenerate
     operating point still reports its full confusion matrix and its rupees —
     which is what a reviewer actually needs to judge it.
+
+    `budget_feasible` / `strictest_nonempty_alerts_per_1000` are populated only by
+    `threshold_for_alert_budget`, and they exist because "flagged nothing" and
+    "flagged the affordable maximum" are both alert rates inside the budget, but
+    only one of them is a policy. See that method. They stay None on any report
+    that was not produced under a capacity constraint, so no caller can read a
+    feasibility verdict out of a report that never made one.
     """
     threshold: float
     tp: int
@@ -187,12 +194,24 @@ class ThresholdReport:
     plateau_lo: float | None = None
     plateau_hi: float | None = None
     n_equivalent: int = 1
+    budget_feasible: bool | None = None
+    strictest_nonempty_alerts_per_1000: float | None = None
 
     @property
     def plateau_width(self) -> float | None:
         if self.plateau_lo is None or self.plateau_hi is None:
             return None
         return self.plateau_hi - self.plateau_lo
+
+    @property
+    def flags_nothing(self) -> bool:
+        """True when this operating point raises no alerts at all.
+
+        Read this rather than testing `tp == 0`: a threshold can flag accounts
+        and still catch no mules, which is a bad policy but is a policy. An
+        empty queue is the absence of one.
+        """
+        return (self.tp + self.fp) == 0
 
     def as_dict(self) -> dict:
         """Flat, JSON-serialisable form for metrics.json."""
@@ -216,6 +235,13 @@ class ThresholdReport:
             "plateau_hi": _round_or_none(self.plateau_hi, 6),
             "plateau_width": _round_or_none(self.plateau_width, 6),
             "n_cost_equivalent_thresholds": int(self.n_equivalent),
+            # None (JSON null) on any report not produced under a capacity
+            # constraint — absence of a verdict, not a passing one.
+            "budget_feasible": self.budget_feasible,
+            "strictest_nonempty_alerts_per_1000": _round_or_none(
+                self.strictest_nonempty_alerts_per_1000, 1
+            ),
+            "flags_nothing": bool(self.flags_nothing),
         }
 
 
@@ -500,6 +526,13 @@ class PlattScaler:
     than the raw probability is what makes the map monotone AND leaves an
     already-calibrated model at slope 1, intercept 0, so the fitted parameters
     are readable as "how wrong were the probabilities, and in which direction".
+
+    `fit_on` names the split the parameters were estimated on, and it is a
+    CONSTRUCTOR ARGUMENT rather than the literal `"validation"` it used to be in
+    `as_dict`. A hardcoded provenance label is worse than none: it is published
+    into metrics.json where a reader takes it as evidence of the discipline, and
+    it would have kept saying "validation" if a caller ever fitted on test —
+    which is the single mistake the label exists to rule out.
     """
     slope: float
     intercept: float
@@ -508,6 +541,7 @@ class PlattScaler:
     converged: bool
     n_iterations: int
     eps: float
+    fit_on: str
 
     def transform(self, y_prob: np.ndarray) -> np.ndarray:
         """Apply the fitted map. Monotone, so it cannot change any ranking."""
@@ -521,7 +555,7 @@ class PlattScaler:
             "method": "platt_scaling_on_logits",
             "slope": round(float(self.slope), 6),
             "intercept": round(float(self.intercept), 6),
-            "fit_on": "validation",
+            "fit_on": str(self.fit_on),
             "n_fit": int(self.n_fit),
             "n_positive_fit": int(self.n_positive_fit),
             "converged": bool(self.converged),
@@ -533,6 +567,7 @@ def fit_platt_scaling(
     y_true: np.ndarray,
     y_prob: np.ndarray,
     *,
+    fit_on: str,
     eps: float = 1e-6,
     max_iter: int = 100,
     tol: float = 1e-10,
@@ -540,6 +575,12 @@ def fit_platt_scaling(
 ) -> PlattScaler:
     """
     Two-parameter Platt calibration, fitted by Newton-IRLS in numpy.
+
+    `fit_on` is required and keyword-only: it is the name of the split these two
+    arrays came from, and it is carried into metrics.json verbatim. Requiring it
+    means the provenance in the published artefact is supplied by the code that
+    knows the answer, and a caller cannot omit it and inherit a flattering
+    default. See `PlattScaler`.
 
     WHY PLATT AND NOT ISOTONIC
     ──────────────────────────
@@ -668,6 +709,7 @@ def fit_platt_scaling(
         slope=float(params[0]), intercept=float(params[1]),
         n_fit=int(y.size), n_positive_fit=n_pos,
         converged=converged, n_iterations=int(used), eps=float(eps),
+        fit_on=str(fit_on),
     )
 
 
@@ -1145,7 +1187,21 @@ class CostEvaluator:
         row, so the plotted curve cannot disagree with the reported optimum —
         which a separately-computed grid could, and would be a confusing thing
         for a reviewer to spot on screen mid-demo.
+
+        Three rows are therefore the floor, and asking for fewer is rejected
+        rather than absorbed. It used to be absorbed badly: with `num_steps=2`
+        the three required indices could not be dropped (the trim loop skips
+        them) and the loop's `next(...)` ran off the end of its generator,
+        surfacing as a bare `StopIteration` from a plotting helper — an exception
+        type that tells the caller nothing about what it did wrong, and one that
+        inside a generator would have been converted to a confusing
+        `RuntimeError` instead.
         """
+        if num_steps < 3:
+            raise ValueError(
+                f"num_steps must be >= 3 to retain both endpoints and the "
+                f"minimum-cost row, got {num_steps}"
+            )
         curve = self.sweep(y_true, y_proba)
         if len(curve) > num_steps:
             required = {0, len(curve) - 1, int(curve["total_cost"].idxmin())}
@@ -1154,6 +1210,7 @@ class CostEvaluator:
             keep |= required
             # Trim from the sampled points (never the required ones) if the
             # union still exceeds the budget, so `num_steps` is a real bound.
+            # `num_steps >= 3 >= len(required)` guarantees this terminates.
             while len(keep) > num_steps:
                 keep.discard(next(i for i in sorted(keep) if i not in required))
             curve = curve.iloc[sorted(keep)].reset_index(drop=True)
@@ -1182,18 +1239,60 @@ class CostEvaluator:
 
         Returns the report for the highest threshold whose alert rate does not
         exceed the budget, i.e. the best recall purchasable with that capacity.
+
+        WHEN THE BUDGET BUYS NOTHING AT ALL
+        ───────────────────────────────────
+        A budget can be too small to buy any queue. Scores tie: if 126 of 2,947
+        accounts share the maximum score, then EVERY non-empty cut flags at least
+        126 accounts — 42.8 per 1,000 — and a 20-per-1,000 cap admits none of
+        them. That is a real and common situation for a coarse single-feature
+        rule, where the top score is an integer-valued flag.
+
+        This used to be handled by `if affordable.empty: row = curve.iloc[0]`,
+        which never ran. The sweep's first row is a synthetic "flag nothing" cut
+        at a threshold one ulp above the maximum score, and its alert rate is
+        0.0, which is inside every non-negative budget — so `affordable` ALWAYS
+        contains at least that row and the emptiness test was unreachable. The
+        method therefore returned the flag-nothing row with nothing to
+        distinguish it from a policy, and downstream `train.py` published it into
+        the capacity-fair table as a rival that the model had beaten. A rule that
+        raised zero alerts, priced at the full cost of missing every mule, is not
+        a rival; it is an abstention, and reporting it as a beaten baseline
+        flatters the model with a comparison it never won.
+
+        So the verdict is now computed and attached. `budget_feasible` is False
+        exactly when no non-empty cut fits, and
+        `strictest_nonempty_alerts_per_1000` records the smallest queue the
+        scores can actually form, so a reader can see BY HOW MUCH the cap was
+        missed rather than just that it was. The returned row is unchanged in the
+        feasible case: alert rate is non-decreasing as the threshold descends, so
+        the affordable rows are a prefix of the frame and the last of them is the
+        last affordable non-empty one.
         """
         if alerts_per_1000 < 0:
             raise ValueError(f"alert budget must be >= 0, got {alerts_per_1000}")
         curve = self.sweep(y_true, y_proba)
-        affordable = curve[curve["alert_rate"] <= alerts_per_1000 / 1000.0]
-        if affordable.empty:            # budget below even one alert
-            row = curve.iloc[0]
-        else:
-            # Thresholds descend down the frame, so the last affordable row is
-            # the loosest threshold that still fits — the most recall for the money.
-            row = affordable.iloc[-1]
-        return self._row_to_report(row, n=int(np.asarray(y_true).size))
+        alert_rate = curve["alert_rate"].to_numpy()
+        affordable = curve[alert_rate <= alerts_per_1000 / 1000.0]
+
+        # The smallest non-empty queue available at ANY threshold, budget aside.
+        nonempty = curve[alert_rate > 0.0]
+        strictest = (float(nonempty["alert_rate"].min()) * 1000.0
+                     if not nonempty.empty else None)
+
+        # Thresholds descend down the frame and the alert rate is therefore
+        # non-decreasing, so the affordable rows form a prefix and its last row
+        # is the loosest threshold that still fits — the most recall for the
+        # money. Restricting to rows that actually raise an alert is what makes
+        # the infeasible case distinguishable.
+        buyable = affordable[affordable["alert_rate"] > 0.0]
+        feasible = not buyable.empty
+        row = buyable.iloc[-1] if feasible else affordable.iloc[-1]
+
+        report = self._row_to_report(row, n=int(np.asarray(y_true).size))
+        report.budget_feasible = feasible
+        report.strictest_nonempty_alerts_per_1000 = strictest
+        return report
 
     def sensitivity_to_cost_ratio(
         self,

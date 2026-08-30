@@ -155,16 +155,23 @@ def top_factors(
     lowering = [i for i in order[::-1] if contribs[i] <= 0]
     chosen = (raising + lowering)[:k]
 
-    return [
-        {
+    # `effect` is derived from the SAME rounded number that goes into the
+    # response, not from the raw contribution. Deriving them separately let a
+    # contribution of +4e-7 be published as `contribution: 0.0` with
+    # `effect: "raises_risk"` — a label the number beside it does not support,
+    # which is precisely the kind of detail that makes an analyst stop trusting
+    # the explanation pane.
+    factors = []
+    for i in chosen:
+        contribution = round(float(contribs[i]), 6)
+        factors.append({
             "feature": names[i],
             "description": FEATURE_DESCRIPTIONS.get(names[i], names[i]),
             "value": round(float(values[i]), 6),
-            "contribution": round(float(contribs[i]), 6),
-            "effect": "raises_risk" if contribs[i] > 0 else "lowers_risk",
-        }
-        for i in chosen
-    ]
+            "contribution": contribution,
+            "effect": "raises_risk" if contribution > 0 else "lowers_risk",
+        })
+    return factors
 
 
 def mean_abs_shap(contribs: np.ndarray, feature_names: list[str] | None = None) -> dict:

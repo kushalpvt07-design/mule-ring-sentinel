@@ -179,6 +179,15 @@ SPLIT_FRACTIONS = {"train": 1 / 3, "val": 1 / 3, "test": 1 / 3}
 # the last window inherits when the total range is not divisible by three.
 WINDOW_LENGTH_TOLERANCE_DAYS = 1.5
 
+# Tolerance for the equal-VOLUME invariant, as a fraction of the busiest window's
+# relationship-organic edge count. Equal window LENGTH does not imply equal
+# organic VOLUME: retire_hijacked_accounts once deleted post-window edges from
+# later windows only and density fell ~14% train->test. Reassignment made it
+# volume-neutral; the only spread now is cadence-firing variance across equal
+# thirds (a few percent), so 10% never fires on a clean run yet still catches a
+# regression to deletion. assert_balanced_window_volume() enforces it.
+WINDOW_VOLUME_TOLERANCE_FRACTION = 0.10
+
 # Rings per split.
 #
 # val and test carry the SAME count deliberately. Threshold selection happens
@@ -342,32 +351,40 @@ def _diurnal_in_span(start: datetime, end: datetime) -> datetime:
     WHAT THIS DOES *NOT* FIX — READ BEFORE ADDING AN HOUR-OF-DAY FEATURE
     ───────────────────────────────────────────────────────────────────
     Conditioning on the span is the right target but it is not the same as
-    matching the unconditional profile, and on a full regenerate the residual is
-    still visible:
+    matching the unconditional profile, and on a full regenerate a residual is
+    still visible on the shortest-burst archetype:
 
-        organic     3.69%   in 00:00-05:59
-        ring overall 6.62%  (was 14.43%)
+        organic     ~1.22%  in 00:00-05:59   (was 3.69% on shipped data, before
+                            the companion organic_subscription hour fix in
+                            build_relationships; 0.89*1.15% + 0.11*1.836%)
+        ring overall 6.62%  (was 14.43% when the burst branch was uniform)
         fan_in       3.59%  (was 18.75%)
-        fast_cycle   9.66%  (was 16.58%)  ← the residual
+        fast_cycle   9.66%  (was 16.58%)  <- the residual
 
     `fast_cycle` burns 2-12 hours. A burst whose origin lands at 02:00 has no
     daytime hour to be rejected *into* — every hour in its span is a night hour,
     so the sampler correctly returns the conditional profile and the conditional
     profile is nocturnal. Longer-burst archetypes (`fan_in`, `layered_fanin`)
-    always straddle a daytime stretch and so land on organic's figure. Fixing
-    this would mean rejecting burst ORIGINS that fall in the small hours, and the
-    block above measures what that does: it overshoots to 1.19%, i.e. it makes
-    fast rings *more* diurnal than real traffic. That is the same watermark with
-    its sign flipped, and a 3.4x deficit is no more honest than a 2.6x surplus.
+    always straddle a daytime stretch and so land near organic's figure.
 
-    So this is left as measured, not papered over. It is not currently
-    exploitable — no feature reads hour-of-day, and `burst_ratio` counts
-    transactions per bucket without caring which bucket — but a 2.6x night
-    enrichment on one archetype IS a real residual signal, and the first
-    `hour_of_day` or `night_share` feature anyone adds will find it. If that
-    feature is wanted, the generator needs a burst-origin model whose CONDITIONAL
-    hour profile is organic's, which is a different and harder change than
-    reweighting either draw alone.
+    Note the residual GREW in relative terms — 9.66% against ~1.22% organic is
+    ~8x, where against the old 3.69% it read ~2.6x. Nothing about fast_cycle
+    changed; the subscription bug had inflated organic's night baseline and was
+    partly MASKING this. Surfacing it is the honest outcome, not a regression.
+
+    The real remedy is to reject burst ORIGINS that fall in the small hours, and
+    that is a regenerate-gated follow-up, not a draw-reweighting this function can
+    do alone: it needs a burst-origin model whose CONDITIONAL hour profile is
+    organic's. An earlier note here quoted a "1.19% overshoot" for drawing the
+    origin diurnally, from an isolated simulation — but that same simulation put
+    the CURRENT fast_cycle share at 3.40% where the full pipeline ships 9.66%, so
+    its absolute numbers are not trustworthy and the figure has been dropped.
+
+    This is left as measured, not papered over. It is not currently exploitable —
+    no feature reads hour-of-day, and `burst_ratio` counts transactions per
+    bucket without caring which bucket — but an ~8x night enrichment on one
+    archetype IS a real residual signal, and the first `hour_of_day` or
+    `night_share` feature anyone adds will find it.
     """
     ts = _random_timestamp(start, end)
     for _ in range(_DIURNAL_TRIES):
@@ -602,8 +619,76 @@ def _round_to_nice(amount: float) -> float:
 def _relationship_amount(rel: Relationship) -> float:
     if rel.amount_jitter <= 0.0:
         return rel.base_amount
-    value = rel.base_amount * (1.0 + random.gauss(0.0, rel.amount_jitter))
+    # Multiplicative LOGNORMAL jitter, not additive Gaussian.
+    #
+    # The old form was base * (1 + gauss(0, sigma)). That factor goes negative
+    # whenever gauss < -1, and merely small whenever gauss is only moderately
+    # negative, so for the small-base roles (organic_frequent base 60-900,
+    # organic_merchant base 400-9000) a few percent of draws landed below the
+    # floor and were clamped by max(10.0, .). The result was a discrete SPIKE of
+    # 1,586 edges at exactly 10.00 rupees on the shipped data — organic_merchant
+    # 1044, organic_frequent 423, organic_burst 114, organic_payout 5 — a point
+    # mass no real amount distribution has and a value a tree can split on
+    # cleanly. lognormvariate(mu, sigma) is positive by construction, so the
+    # floor below is now UNREACHABLE in practice: a 200k-draw simulation at each
+    # role's (base range, sigma) clamps 0.0000% of the time. mu = -sigma**2/2
+    # keeps the multiplier mean-preserving (E[exp(N(mu, sigma**2))] = 1), so
+    # switching the shape does not shift any relationship's mean amount.
+    value = rel.base_amount * random.lognormvariate(
+        -0.5 * rel.amount_jitter * rel.amount_jitter, rel.amount_jitter
+    )
     return round(max(10.0, value), 2)
+
+
+# Ring and fan-in amounts are routed through _match_organic_granularity so they
+# carry the SAME coarse/whole/paise mix as organic amounts. Constants are the
+# per-source probabilities of the mixture; they are set against the measured
+# organic granularity (see the helper's docstring) and are the one knob to
+# retune if a regenerate moves organic's mix.
+_RING_AMT_P_NICE = 0.16    # -> _round_to_nice (billed-looking: 15,000 / 2,450)
+_RING_AMT_P_WHOLE = 0.15   # -> whole rupees, no paise (8,431)
+# remainder -> keep paise (8,431.57)
+
+
+def _match_organic_granularity(amount: float) -> float:
+    """Give a ring/fan-in amount the granularity fingerprint of organic money.
+
+    WHY THIS EXISTS. Ring amounts were round(base*(1+jitter), 2) and fan-in
+    amounts were round(uniform(4_000, 80_000), 2) — both keep paise almost
+    always. Organic amounts do not: obligations run through _round_to_nice and
+    subscriptions are whole rupees, so measured on the shipped data the two
+    populations separate cleanly on amount granularity alone:
+
+                       whole-rupee (.00)   multiple of 10   multiple of 50
+        organic              31.81%            18.34%           17.39%
+        ring                  0.80%             0.17%            0.05%
+        fan_in                0.55%             0.14%            0.03%
+
+    A model never needs the graph: "amount has paise" is very nearly the label.
+    burst_ratio and the amount-based features would each key straight onto it.
+
+    THE FIX is a two-source mixture that reproduces organic's mix on ALL THREE
+    axes at once (matching only the whole-rupee rate would leave the multiple-of
+    -10 axis wide open): with probability _RING_AMT_P_NICE the amount is billed-
+    rounded via _round_to_nice, with probability _RING_AMT_P_WHOLE it is whole
+    rupees, otherwise it keeps its paise. Simulated at 200k draws, (0.16, 0.15)
+    lands ring at whole 31.67% / mult-10 17.53% / mult-50 16.25% and fan-in at
+    31.66% / 17.52% / 16.26% — flush with organic on the first two axes and
+    within ~1pt on multiple-of-50, which is regenerate noise and not separable.
+
+    Targets are stated against CURRENT organic (31.81 / 18.34 / 17.39). The
+    companion lognormal-jitter fix turns the 1,467 organic edges that were
+    clamped to a whole, multiple-of-10 10.00 into paise, nudging organic's first
+    two axes down ~0.8pt toward ~31.0 / ~17.5 — which is where the mixture
+    already sits, so no retune is needed. Confirm on the regenerate; the two
+    _RING_AMT_P_* constants are the knob if organic's mix has shifted.
+    """
+    r = random.random()
+    if r < _RING_AMT_P_NICE:
+        return _round_to_nice(amount)
+    if r < _RING_AMT_P_NICE + _RING_AMT_P_WHOLE:
+        return float(round(amount))
+    return round(amount, 2)
 
 
 def build_relationships(pop: Population) -> list[Relationship]:
@@ -679,7 +764,16 @@ def build_relationships(pop: Population) -> list[Relationship]:
                 base_amount=float(random.choice((99, 149, 199, 299, 499, 649, 799))),
                 cadence_days=30.0,
                 amount_jitter=0.0,
-                hour=random.randrange(24),
+                # hour=-1 draws a fresh diurnal hour per charge (see the emission
+                # in generate_organic_transactions), exactly like the other
+                # variable-hour organic mandates. It used to be randrange(24) —
+                # UNIFORM over the clock — which was the last organic source that
+                # was not diurnal: it put 24.34% of subscription edges in
+                # 00:00-05:59 against the 1.836% the profile calls for, and
+                # dragged all-organic night activity up to 3.69%. That inflated
+                # baseline was partly MASKING the fast_cycle burst residual (see
+                # _diurnal_in_span); fixing it here is honest and unmasks it.
+                hour=-1,
                 role="organic_subscription",
             ))
 
@@ -1290,25 +1384,24 @@ def _ring_timestamp(
     Both branches respect the diurnal hour profile. The burst branch used to call
     `_random_timestamp` and so was uniform over the clock, which enriched night
     hours on bursting rings by 4-6x against organic traffic and planted a label
-    in hour-of-day — see `_diurnal_in_span`. Bursting is about compressing many
-    transactions into a short span, not about laundering at 3am; the two are
+    in hour-of-day. `_diurnal_in_span` now does the burst-span draw and carries
+    the authoritative night-share figures, MEASURED on the shipped pipeline
+    (fast_cycle 9.66%, ring overall 6.62%, fan_in 3.59% in 00:00-05:59, against
+    ~1.22% organic after the subscription fix). Bursting is about compressing
+    many transactions into a short span, not about laundering at 3am; the two are
     independent and only the first is intended here.
 
-    The burst ORIGIN stays uniform over the window, deliberately. Measured over
-    simulated rings at the real archetype parameters, the 00:00-05:59 share and
-    the L1 distance from `_HOUR_WEIGHTS` come out:
-
-        fast_cycle     origin uniform / within uniform   26.64%   0.675  ← was
-                       origin uniform / within diurnal    3.40%   0.384  ← now
-                       origin diurnal / within diurnal    1.19%   0.538
-        layered_fanin  origin uniform / within uniform   20.43%   0.600  ← was
-                       origin uniform / within diurnal    1.94%   0.175  ← now
-                       origin diurnal / within diurnal    1.51%   0.334
-
-    against 3.70% for shipped organic traffic. Drawing the origin diurnally too
-    compounds the weighting and overshoots — it pushes rings BELOW organic night
-    activity, which is the same leak with its sign flipped. One diurnal draw, not
-    two.
+    The burst ORIGIN stays uniform over the window, deliberately. Drawing it
+    diurnally too would compound the weighting and push rings BELOW organic night
+    activity — the same leak with its sign flipped — so it is ONE diurnal draw,
+    not two. A short-burst residual survives this (see `_diurnal_in_span`: a
+    burst that originates in the small hours has no daytime hour to be rejected
+    into). An earlier version of this docstring carried an isolated simulation
+    table here that put the current fast_cycle share at 3.40%; the full pipeline
+    ships 9.66%, so that table mis-modelled the burst dynamics by ~2.8x and has
+    been removed rather than left to contradict the data. Eliminating the
+    residual needs a burst-origin model, a regenerate-gated follow-up; no current
+    feature reads hour-of-day, so it is documented, not yet load-bearing.
     """
     if arch.burst_hours is None or burst_origin is None:
         return _diurnal_timestamp(window_start, window_end)
@@ -1407,12 +1500,32 @@ def _emit_camouflage(
     if not hijack_pool:
         return []
 
+    # Consume a PRIVATE copy of the remaining pool, WITHOUT replacement.
+    #
+    # This was random.choice(hijack_pool) — with replacement — so one civilian
+    # account could be drawn as the camouflage partner of mules in several
+    # different rings. Measured on shipped train: 54 of 131 partners (41%)
+    # bridged >=2 rings, up to 5 each. A bystander wired into five unrelated
+    # laundering rings is a ring-linking signal no real civilian carries, and
+    # community_internal_ratio and the degree features read it straight off.
+    # pop()-ing after a shuffle makes each partner exclusive to one mule, exactly
+    # as _seat_ring and the feeder sampler consume their accounts.
+    #
+    # The copy is deliberate. The caller's headroom assertion measures whether
+    # rings and feeders were starved — decided BEFORE camouflage runs — so it
+    # must not see camouflage consumption. Per-split hijack pools are disjoint,
+    # so exclusivity within a split is exclusivity everywhere. mule_accounts are
+    # purpose-built (MULE_ prefix) and the pool is hijacked civilians, so the two
+    # are disjoint and a partner can never be the mule itself.
+    pool = list(hijack_pool)
+    random.shuffle(pool)
+
     records: list[dict] = []
     for account in mule_accounts:
         for _ in range(random.randint(1, 3)):
-            other = random.choice(hijack_pool)
-            if other == account:
-                continue
+            if not pool:
+                break  # exhausted: rare, and the headroom floor bounds how rare
+            other = pool.pop()
             outbound = random.random() < 0.7
             for _ in range(random.randint(2, 6)):
                 records.append({
@@ -1503,7 +1616,7 @@ def generate_mule_rings_for_split(
                 records.append({
                     "sender": sender,
                     "receiver": receiver,
-                    "amount": round(max(100.0, amount), 2),
+                    "amount": _match_organic_granularity(max(100.0, amount)),
                     "timestamp": _ring_timestamp(
                         arch, window_start, window_end, burst_origin
                     ),
@@ -1530,7 +1643,8 @@ def generate_mule_rings_for_split(
                     records.append({
                         "sender": feeder,
                         "receiver": entry,
-                        "amount": round(random.uniform(4_000, 80_000), 2),
+                        "amount": _match_organic_granularity(
+                            random.uniform(4_000, 80_000)),
                         "timestamp": _ring_timestamp(
                             arch, window_start, window_end, burst_origin
                         ),
@@ -1598,29 +1712,52 @@ def retire_hijacked_accounts(
     windows: dict[str, tuple[datetime, datetime]],
 ) -> tuple[pd.DataFrame, int, int]:
     """
-    Freeze hijacked accounts once their ring's window closes.
+    Hand a hijacked account's post-ring organic life to a fresh successor.
 
     A ring seats some members by hijacking real accounts, because an account
     with genuine history is exactly what a launderer wants and exactly what
     makes detection realistic. That history is kept: organic traffic before and
     during the ring stays untouched.
 
-    What is removed is organic traffic *after* the ring window, for two reasons:
+    Organic traffic AFTER the ring window must not stay attached to the mule,
+    for two reasons:
 
-      1. It is what happens. An account caught mulling gets frozen, reported and
-         closed. It does not carry on buying groceries next quarter.
+      1. Otherwise the account is a labelled mule in `train` and, on its
+         post-window organic edges, a labelled legitimate node in `val`. That
+         contradiction is label noise: the model is taught "this profile is
+         fraud" and then penalised for saying so. It depressed measured
+         performance rather than inflating it — so it was never a leak — but it
+         is still a defect, and it hit 9.3% of train positives.
 
-      2. Without it, the same account is a labelled mule in `train` and a
-         labelled legitimate account in `val`. That contradiction is label
-         noise: the model is taught "this profile is fraud" and then penalised
-         for saying so. It depressed measured performance rather than inflating
-         it — so it was never a leak — but it is still a defect, and it hit 9.3%
-         of train positives.
+      2. A caught mule is frozen and reported; it does not carry on buying
+         groceries next quarter. Its legitimate economic ROLE, though, does not
+         evaporate — the landlord it paid still gets rent, from someone.
+
+    So the post-window organic edges are REASSIGNED to a fresh successor account
+    (`<acct>__SUCC`), not deleted. Reassignment is what makes retirement
+    VOLUME-NEUTRAL, and that is the real fix here. Deletion removed edges from
+    the later windows ONLY — `train` lost nothing, `test` lost the post-window
+    edges of every earlier window's rings — so organic density fell monotonically
+    (64,282 / 59,061 / 55,067 edges on the shipped data) across three windows the
+    length check certifies as "equal". Every count/sum/rate feature scales with
+    that volume, and it made `test` negatives systematically sparser and cleaner
+    (their cycle_participation fell 0.149 -> 0.093): a mild OPTIMISTIC bias, not
+    just noise. Reassigning keeps every edge, so each window keeps its original
+    volume; assert_balanced_window_volume checks that on the emitted splits.
+
+    The successor is a brand-new node id, never a ring member and carrying only
+    is_mule=0 edges, so it is an ordinary negative. The mapping is injective (one
+    successor per retired account) so degree distribution is preserved rather
+    than collapsed onto a single super-node, and the "__SUCC" suffix cannot
+    collide with a real id or a MULE_ prefix. Note a hijacked account legitimately
+    keeps both is_mule=1 (ring) and is_mule=0 (pre/in-window organic) edges inside
+    its OWN window — that is what hijacking a real account means, and it is not a
+    contradiction because it is one consistent positive node in one split.
 
     Only ring *members* are retired. Fan-in feeders are victims: they keep their
     label of 0 and go on transacting normally.
 
-    Returns (filtered_organic_df, n_accounts_retired, n_edges_removed).
+    Returns (organic_df_with_successors, n_accounts_retired, n_edges_reassigned).
     """
     ring_edges = mule_df[mule_df["edge_role"] == "ring"]
     if ring_edges.empty:
@@ -1635,7 +1772,7 @@ def retire_hijacked_accounts(
         window_end = windows[split_for_timestamp(row.timestamp, windows)][1]
         for account in (row.sender, row.receiver):
             if account.startswith(MULE_PREFIXES):
-                continue  # purpose-built mule: no organic life to freeze
+                continue  # purpose-built mule: no organic life to reassign
             current = freeze_after.get(account)
             if current is None or window_end < current:
                 freeze_after[account] = window_end
@@ -1646,14 +1783,24 @@ def retire_hijacked_accounts(
     cutoff = pd.Series(freeze_after)
     sender_cut = organic_df["sender"].map(cutoff)
     receiver_cut = organic_df["receiver"].map(cutoff)
-    edge_cut = pd.concat([sender_cut, receiver_cut], axis=1).min(axis=1)
 
-    retired = edge_cut.notna() & (organic_df["timestamp"] > edge_cut)
-    n_removed = int(retired.sum())
+    ts = organic_df["timestamp"]
+    sender_frozen = sender_cut.notna() & (ts > sender_cut)
+    receiver_frozen = receiver_cut.notna() & (ts > receiver_cut)
+    n_reassigned = int((sender_frozen | receiver_frozen).sum())
 
-    assert n_removed < len(organic_df), "retirement filter removed everything"
+    out = organic_df.copy()
+    out.loc[sender_frozen, "sender"] = out.loc[sender_frozen, "sender"] + "__SUCC"
+    out.loc[receiver_frozen, "receiver"] = (
+        out.loc[receiver_frozen, "receiver"] + "__SUCC"
+    )
 
-    return organic_df[~retired].reset_index(drop=True), len(freeze_after), n_removed
+    # Volume-neutral by construction: reassignment relabels endpoints, it never
+    # drops or adds a row. The old code deleted the frozen rows at this point,
+    # which is exactly what unbalanced the windows.
+    assert len(out) == len(organic_df), "reassignment must preserve every edge"
+
+    return out.reset_index(drop=True), len(freeze_after), n_reassigned
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1747,6 +1894,42 @@ def assert_equal_window_lengths(
         + f" (spread {spread:.4f}d > {WINDOW_LENGTH_TOLERANCE_DAYS}d). "
         "Every count/sum feature scales with window length, so the splits "
         "would not be comparable. Fix SPLIT_FRACTIONS."
+    )
+
+
+def assert_balanced_window_volume(splits: dict[str, pd.DataFrame]) -> None:
+    """Relationship-organic edge counts must be comparable across windows.
+
+    assert_equal_window_lengths checks only DURATION, and cannot see that
+    retire_hijacked_accounts once DELETED post-window organic edges from
+    hijacked accounts. Deletion took volume from the later windows only — `train`
+    lost nothing, `test` lost the post-window edges of every earlier window's
+    rings — so organic density fell monotonically (64,282 / 59,061 / 55,067 edges
+    on the shipped data, a 14% train->test drop) across windows the length check
+    calls "equal". Every count/sum/rate feature scales with that volume, and the
+    sparser `test` negatives were mildly cleaner and easier — an optimistic bias.
+
+    retire_hijacked_accounts now REASSIGNS those edges to successor accounts
+    rather than dropping them, so each window keeps its original volume. This
+    asserts the property on the emitted splits — the check the length assertion
+    could not make. Camouflage is excluded: it rides in the ring frame, scales
+    with rings-per-window, and is not what retirement touches.
+    """
+    org_edges: dict[str, int] = {}
+    for s, df in splits.items():
+        role = df["edge_role"]
+        mask = role.str.startswith("organic") & (role != "organic_camouflage")
+        org_edges[s] = int(mask.sum())
+
+    hi, lo = max(org_edges.values()), min(org_edges.values())
+    spread = (hi - lo) / max(hi, 1)
+    assert spread <= WINDOW_VOLUME_TOLERANCE_FRACTION, (
+        "UNBALANCED ORGANIC VOLUME across windows: "
+        + ", ".join(f"{s}={n:,}" for s, n in org_edges.items())
+        + f" (spread {spread:.1%} > {WINDOW_VOLUME_TOLERANCE_FRACTION:.0%}). "
+        "retire_hijacked_accounts must REASSIGN post-window organic edges to "
+        "successor accounts, not delete them, or the later windows lose volume "
+        "that train keeps and every count/sum feature drifts across splits."
     )
 
 
@@ -1991,10 +2174,11 @@ def main() -> None:
 
     # ── Step 5: retire hijacked accounts after their ring window ──
     print("[5/7] Retiring hijacked accounts post-ring...")
-    organic_df, n_retired, n_removed = retire_hijacked_accounts(
+    organic_df, n_retired, n_reassigned = retire_hijacked_accounts(
         organic_df, mule_df, windows
     )
-    print(f"  {n_retired} accounts retired, {n_removed:,} organic edges removed")
+    print(f"  {n_retired} accounts retired, {n_reassigned:,} post-window organic "
+          f"edges reassigned to successor accounts (volume-neutral)")
 
     # ── Step 6: merge, assign splits, verify ──
     print("[6/7] Merging and verifying invariants...")
@@ -2014,8 +2198,9 @@ def main() -> None:
     assert_temporal_order(splits)
     assert_no_entity_leakage(splits)
     assert_structural_sanity(splits)
-    print(f"  {sym('ok')} temporal order, entity/ring disjointness and "
-          f"structural sanity verified")
+    assert_balanced_window_volume(splits)
+    print(f"  {sym('ok')} temporal order, entity/ring disjointness, structural "
+          f"sanity and balanced window volume verified")
 
     # ── Step 7: save ──
     print("[7/7] Saving...")
