@@ -148,11 +148,18 @@ class ScoringRequest(BaseModel):
     threshold_override: float | None = Field(
         default=None,
         gt=0.0,
-        le=1.0,
+        lt=1.0,
         description=(
-            "Optional: override the decision threshold. Must be > 0 — a "
-            "threshold of exactly 0 flags every account, including "
-            "zero-risk ones, which is never the intent."
+            "Optional: override the decision threshold. Must be strictly inside "
+            "(0, 1). A threshold of exactly 0 flags every account including "
+            "zero-risk ones; a threshold of exactly 1 is the mirror image and was "
+            "admitted until recently. At t = 1 the CRITICAL cutoff is "
+            "t + (1 - t)/2 = 1, so the HIGH band [1, 1) is empty and the only "
+            "account that can be flagged at all is one scored at exactly 1.0. "
+            "Neither endpoint describes an operating point, so neither is accepted "
+            "here. `api/responder.py` still admits t = 1 because the tiering "
+            "arithmetic is well-defined there; this is the caller-facing surface, "
+            "and it is stricter on purpose."
         ),
     )
     include_context_accounts: bool = Field(
@@ -242,9 +249,43 @@ class ScoringContext(BaseModel):
     )
     threshold_source: Literal["metrics.json", "request_override"] = Field(
         ..., description="Where the decision threshold came from")
+    break_even_probability: float | None = Field(
+        default=None,
+        description=(
+            "The cost model's break-even probability p* = fp_cost / (fp_cost + "
+            "fn_cost), which is the floor of the MEDIUM/step-up band. Published "
+            "because it is the second number the tiering depends on and the "
+            "response was previously unreadable without it: given only "
+            "`threshold_used`, a caller could reconstruct the CRITICAL cutoff "
+            "(t + (1 - t)/2) but had no way to derive where ALLOW ends and "
+            "REQUIRE_ADDITIONAL_AUTH begins. It is NOT the alert cutoff — alerts "
+            "still start at `threshold_used`."
+        ),
+    )
+    context_provenance: str | None = Field(
+        default=None,
+        description=(
+            "What the historical context graph is, stated plainly. On the shipped "
+            "artefacts it is the validation split, edge for edge — so an account "
+            "scored here against its own validation history is being scored "
+            "in-sample with respect to the graph, and the precision and recall in "
+            "the README are the honest out-of-sample numbers rather than anything "
+            "measurable from this endpoint. Carried in the response so a reviewer "
+            "reading one JSON body does not have to know that."
+        ),
+    )
     n_submitted_transactions: int = Field(...)
     n_context_transactions_used: int = Field(
         ..., description="Historical transactions included in the graph")
+    n_duplicates_dropped: int = Field(
+        default=0,
+        description=(
+            "Submitted transactions that exactly replayed a context transaction "
+            "(same sender, receiver, amount and timestamp) and were counted once "
+            "rather than twice. Non-zero means the request was redundant, not "
+            "that anything was mis-scored."
+        ),
+    )
     n_nodes_in_graph: int = Field(
         ..., description="Accounts in the merged graph features were computed on")
     observation_window_days: float = Field(
@@ -256,8 +297,12 @@ class ScoringContext(BaseModel):
         ...,
         description=(
             "False if the effective window differs enough from training that "
-            "magnitude features (in_amount_sum, txn_velocity) are on a "
-            "different scale, making scores unreliable."
+            "magnitude features are on a different scale, making scores "
+            "unreliable. The features measured to scale with window length are "
+            "in_amount_sum, out_amount_sum and repeat_ratio (2.00x, 2.00x and "
+            "1.84x when the window doubles). `txn_velocity` is NOT one of them "
+            "despite being named here previously — it divides by the account's "
+            "own active span, so it is a rate."
         ),
     )
     warnings: list[str] = Field(default_factory=list)
@@ -286,7 +331,20 @@ class HealthResponse(BaseModel):
     model_loaded: bool = False
     model_version: str = "unknown"
     model_file: str | None = None
-    optimal_threshold: float = 0.5
+    optimal_threshold: float | None = Field(
+        default=None,
+        description=(
+            "The operating threshold in force, or None when the service could not "
+            "read one and is therefore refusing to score. Optional rather than "
+            "defaulted, because every concrete default is a lie in the degraded "
+            "case: 0.0 names the one value `classify_risk` rejects outright (it "
+            "flags every account), and 0.5 is a plausible-looking number that a "
+            "reader would take for a real operating point. `api/main.py` passes "
+            "`STATE.threshold`, which is `float | None`, so a non-optional "
+            "annotation here also made /health raise a ValidationError in exactly "
+            "the degraded state /health exists to report."
+        ),
+    )
     threshold_source: str = "default"
     n_features: int = 0
     feature_contract_verified: bool = Field(

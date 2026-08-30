@@ -19,11 +19,12 @@ expensive.
 
 1. IT SERVED A DIFFERENT MODEL THAN THE ONE THAT WAS EVALUATED.
    `MODEL_PATH` hard-coded `sentinel_v1.xgb` and `_model_version` hard-coded
-   "sentinel_v1", while `models/features.py` declared `sentinel_v3.xgb` and
+   "sentinel_v1", while `models/features.py` declared a later version and
    training wrote that file. So the API loaded a retired 12-feature model and
    applied the CURRENT model's cost-optimal threshold to its scores — two
    unrelated calibrations bolted together. The path now derives from
-   `features.MODEL_NAME` and can't drift.
+   `features.MODEL_NAME` and can't drift. No version literal appears in this
+   file for the same reason.
 
 2. IT DECLARED ITS OWN FEATURE LIST.
    A local 12-name `FEATURE_COLS` sat here, including `net_flow` (dropped in v3)
@@ -34,7 +35,9 @@ expensive.
 
 3. IT COMPUTED FEATURES ON A GRAPH OF THE REQUEST ALONE.
    `extract_features_from_batch` built a DiGraph from just the submitted
-   transactions. On a 4-edge graph `pagerank` is ~1/n by construction,
+   transactions. On a 4-edge graph `pagerank` is uniform by construction (the
+   feature is now emitted as pagerank × N, so that reads as a flat 1.0 rather
+   than a flat 1/n — equally constant either way),
    `clustering_coefficient` is 0 because there are no triangles, and
    `cycle_participation` is 0 because a ring's cycle is not inside the batch — so
    the graph features that carry the entire thesis of this project were fed to
@@ -90,13 +93,23 @@ KNOWN LIMITATIONS — read before quoting a latency figure
   rank correlation > 0.9999, which moved no decision. It is bounded and
   negligible, unlike the community defect above, which was neither.
 
-• Scores are only comparable to the reported metrics when the observation window
-  matches the trained one, because `in_amount_sum`, `out_amount_sum` and
-  `txn_velocity` all scale with how long an account was watched. The window is
-  enforced per request and `context.window_comparable` says whether it holds. A
-  request whose window keeps NO historical context is refused with 422 rather than
-  scored: the graph features are constants at that point, and a tier derived from
-  them is a threshold calibrated on a 60-day graph applied to a handful of edges.
+• Scores are comparable to the reported metrics on magnitude, but not on
+  structure. The three magnitude features (`in_amount_sum`, `out_amount_sum`,
+  `repeat_ratio`) are rescaled to a 60-day reference window, so window length no
+  longer distorts them. `txn_velocity` needs no rescaling because it is already a
+  rate — it divides by the account's own active span — and treating it as a
+  window-scaling magnitude would be a warning about a bug that no longer exists.
+  What a mismatched window still changes is the graph's STRUCTURE, which no
+  per-graph constant can correct: over a different window the counterparty set,
+  the reciprocal pairs and the repeated-edge cycle core are built from a different
+  amount of evidence than training used, which moves `degree_balance`,
+  `reciprocity`, `clustering_coefficient` and `cycle_participation`. Distinct
+  counterparties saturate rather than scale, so that residual does not divide out.
+  The window is still enforced per request and `context.window_comparable` says
+  whether it holds. A request whose window keeps NO historical context is refused
+  with 422 rather than scored: the graph features are constants at that point, and
+  a tier derived from them is a threshold calibrated on a 60-day graph applied to
+  a handful of edges.
 
 • An account with no history in the context graph is scored on the submitted
   transactions alone, so its graph features are weak by construction. Those
@@ -134,6 +147,7 @@ from data.extractor import (
     compute_louvain_communities,
     compute_node_features,
     partition_fingerprint,
+    undirected_projection,
 )
 from models.explain import shap_contributions, top_factors
 from models.features import (
@@ -167,6 +181,31 @@ CONTEXT_EDGES_PATH = ROOT / "data" / "raw" / "serving_context_edges.csv"
 CONTEXT_COLS = ["sender", "receiver", "amount", "timestamp"]
 LABEL_COLS_NEVER_READ = ["is_mule", "edge_role", "ring_id", "ring_type", "split"]
 
+# What the context file IS, said in the response rather than only in the README.
+#
+# data/generator.py writes serving_context_edges.csv from the validation split, so
+# on the shipped artefacts it is edge-for-edge identical to val_edges.csv. That has
+# a consequence worth stating to anyone reading a single response body: an account
+# scored against this context is being scored in-sample with respect to the GRAPH.
+# Its neighbours, its ring, its community — all of it was visible when the
+# threshold was selected. The model file itself never saw validation labels, and
+# the split integrity checks in models/train.py are about labels, so nothing here
+# invalidates them; but a precision figure computed from this endpoint's output
+# would be optimistic and is not a number this project publishes.
+#
+# The honest out-of-sample figures are the test-split ones in README.md, which come
+# from models/report.py reading metrics.json. Regenerating the context from a
+# fourth, held-out window would remove the caveat, and is the right fix if this
+# ever serves anything real; documenting it is the honest thing to do meanwhile.
+CONTEXT_PROVENANCE = (
+    "serving_context_edges.csv is the validation split, edge for edge. Accounts "
+    "are therefore scored in-sample with respect to the graph: their neighbourhood "
+    "was visible when the operating threshold was selected. No labels leak — the "
+    "model never trained on validation — but precision measured from this "
+    "endpoint's output would be optimistic. The out-of-sample figures are the "
+    "test-split ones in README.md."
+)
+
 # Used only to measure the window length the model was trained on. There is no
 # WINDOW_DAYS constant to import: data/generator.py derives each window as a
 # third of the timeline and asserts the three come out equal, so the length is a
@@ -177,11 +216,26 @@ TRAIN_EDGES_PATH = ROOT / "data" / "raw" / "train_edges.csv"
 # slack, so the API and the generator agree on what "equal windows" means.
 WINDOW_TOLERANCE_DAYS = 1.5
 
-# Max deviation tolerated between sigmoid(sum of SHAP contributions + bias) and
-# the model's own predicted probability. Exact TreeSHAP satisfies this identity
-# to floating-point precision; anything larger means the attribution does not
-# explain the score, and a wrong explanation on a fraud alert is worse than none.
-SHAP_IDENTITY_TOLERANCE = 1e-4
+# Max deviation tolerated between the SHAP reconstruction of the margin
+# (contributions.sum(1) + bias) and the model's own `predict(output_margin=True)`.
+# LOG-ODDS, matching MARGIN_TOLERANCE in models/train.py — same quantity, same
+# constant, so training and serving hold the attributions to one standard.
+#
+# It replaced SHAP_IDENTITY_TOLERANCE, which was the same 1e-4 applied in
+# PROBABILITY space. Sigmoid saturates, so that number meant something different
+# at every score: near p = 0.9999 it tolerated over 1.5 log-odds of attribution
+# error, and past a clip at ±60 it tolerated anything at all. XGBoost accumulates
+# tree outputs in float32 and the two paths sum in different orders, so exact
+# equality is not available; 1e-4 log-odds is ~three orders above that noise floor.
+MARGIN_IDENTITY_TOLERANCE = 1e-4
+
+# Max spread tolerated in the TreeSHAP bias column across a batch. For a binary
+# booster with a scalar base_score and no per-row base_margin it is one value
+# repeated, so this is 0 up to float32 accumulation. It is the ONLY check that can
+# catch the bias column being read from the wrong end of `pred_contribs` — the
+# summation identity cannot, because the row sum is invariant to the split. See
+# `attribute`.
+BIAS_CONSTANT_TOLERANCE = 1e-6
 
 TOP_FACTORS_PER_ACCOUNT = 3
 
@@ -509,10 +563,24 @@ async def lifespan(app: FastAPI):
         # Freezing it here is also the honest deployment shape: community
         # assignment is a batch job that runs on the account graph, not something
         # a scoring call gets to redraw.
+        #
+        # `undirected_projection`, NOT `.to_undirected()`. This line used to read
+        # `compute_louvain_communities(build_graph(ctx).to_undirected())` while
+        # `compute_node_features` projected with `undirected_projection` — the
+        # train/serve skew data/extractor.py names at its own docstring. networkx
+        # resolves a reciprocal pair by letting one direction's attribute dict
+        # overwrite the other's, and `best_partition` optimises WEIGHTED
+        # modularity, so the frozen partition was an optimum of a graph nothing
+        # else in the system used. Measured on this context file: 1,092 of 18,426
+        # undirected pairs are reciprocal, carrying 11.1% of all transaction
+        # weight, so last-wins discarded ~5.7% of the graph's weight. Worse, the
+        # partition then went to `extend_partition`, whose heaviest-neighbour
+        # tie-break runs on the summed projection — two weight definitions in one
+        # path.
         try:
             t0 = time.perf_counter()
             STATE.reference_partition = compute_louvain_communities(
-                build_graph(ctx).to_undirected())
+                undirected_projection(build_graph(ctx)))
             STATE.partition_fingerprint = partition_fingerprint(
                 STATE.reference_partition)
             print(f"  reference partition: "
@@ -598,9 +666,10 @@ def merge_with_context(
 
     Rules, and the reasoning behind each:
 
-      • The window ends at the latest transaction in the merged set, so "now" is
-        the most recent thing actually observed rather than wall-clock time,
-        which lets a historical batch be scored reproducibly.
+      • The window ends at the latest CONTEXT transaction, not the latest
+        transaction overall. See "WHY THE WINDOW IS ANCHORED TO THE CONTEXT"
+        below: anchoring it to the merged maximum let the submitted batch's dates
+        decide how much of unrelated accounts' history survived.
 
       • CONTEXT is trimmed to that window. It is the part that can be dropped
         without discarding the question being asked.
@@ -609,11 +678,65 @@ def merge_with_context(
         window rule that silently drops the request is worse than a wide window,
         which at least gets reported.
 
+      • Exact duplicates between the two are dropped, keeping the context copy.
+        See "WHY THE MERGE DE-DUPLICATES" below.
+
+    ─────────────────────────────────────────────────────────────────────────
+    WHY THE WINDOW IS ANCHORED TO THE CONTEXT
+    ─────────────────────────────────────────────────────────────────────────
+    This was `window_end = max(submitted.max(), context.max())`, with only the
+    context trimmed. A batch dated after the context end therefore slid the
+    window forward and deleted the OLDEST context edges — history belonging to
+    accounts with nothing to do with the request. Measured against the shipped
+    context (60,379 edges, 2025-03-02 → 2025-04-30) with a four-transaction batch
+    dated n days past the context end: 1 day dropped 1,004 edges, 10 days dropped
+    9,694, and 20 days dropped 19,829 — a third of the graph — every one of them
+    reported as `window_comparable: true` with no warning.
+
+    The comparability check could not see it by construction. `observed_days` was
+    measured on the MERGED frame, and sliding the window forward keeps that
+    pinned near the trained length however much context is deleted, so drift
+    stayed inside tolerance while the graph emptied. The 50%-of-context floor did
+    not trip until roughly 30 days out.
+
+    The window is now anchored to `context["timestamp"].max()`, which is the
+    graph the reference partition was frozen on and the graph the reported
+    metrics describe. Nothing the caller sends can move it. A batch dated outside
+    that window still scores — its own edges are never trimmed — but it is
+    scored against the full historical graph rather than a truncated one, and
+    `submitted_outside_window` records how far outside it fell.
+
+    The trim is also reported whenever it removes ANYTHING, not only past a 50%
+    floor. `window_days` is read from train_edges.csv while the context file is
+    its own slightly shorter span, so on the shipped data the trim removes
+    nothing at all; if that ever stops being true it should be visible on the
+    first request rather than the ten-thousandth.
+
+    ─────────────────────────────────────────────────────────────────────────
+    WHY THE MERGE DE-DUPLICATES
+    ─────────────────────────────────────────────────────────────────────────
+    This was a bare `pd.concat`. `build_graph` then aggregates
+    `weight=("amount", "size")` and `total_amount=("amount", "sum")`, so a
+    transaction present in both the request and the context file counted twice —
+    inflating `in_amount_sum`, `out_amount_sum`, `repeat_ratio`, `txn_velocity`
+    and `burst_ratio` for both endpoints of that edge.
+
+    That is not an exotic input. The 422 below tells the caller to "Date the
+    transactions inside the context window", the context file ships in the repo,
+    and copying rows out of it is the obvious way to build a request that scores.
+    The natural first attempt at using this API was silently mis-scored.
+
+    Exact matches on (sender, receiver, amount, timestamp) are dropped, keeping
+    the context copy, and the count is reported. Two genuinely distinct
+    transactions that agree on all four fields to the microsecond are
+    indistinguishable from a replay in this data and are the far rarer case; the
+    shipped context file contains no such pair.
+
     Returns the merged frame and a diagnostics dict.
     """
     diagnostics: dict = {"warnings": []}
 
-    window_end = max(submitted["timestamp"].max(), context["timestamp"].max())
+    window_end = context["timestamp"].max()
 
     if window_days is None:
         window_days = float(
@@ -629,7 +752,16 @@ def merge_with_context(
 
     kept = context[(context["timestamp"] >= window_start)
                    & (context["timestamp"] <= window_end)]
-    merged = (pd.concat([kept, submitted], ignore_index=True)
+
+    # Drop request rows that replay a context transaction exactly. `keep="first"`
+    # on a frame with the context first means the context copy survives, so the
+    # de-duplication cannot silently discard the caller's row in favour of a
+    # different one — they are identical in all four fields by construction.
+    key = ["sender", "receiver", "amount", "timestamp"]
+    stacked = pd.concat([kept, submitted], ignore_index=True)
+    duplicated = stacked.duplicated(subset=key, keep="first")
+    n_duplicates = int(duplicated.sum())
+    merged = (stacked.loc[~duplicated]
               .sort_values("timestamp", kind="mergesort")
               .reset_index(drop=True))
 
@@ -637,9 +769,24 @@ def merge_with_context(
         (merged["timestamp"].max() - merged["timestamp"].min())
         .total_seconds() / 86_400.0)
 
+    # How far the request falls outside the reference window, in days, signed:
+    # positive is later than the context ends, negative is earlier than it starts.
+    # Reported rather than acted on — submitted edges are never trimmed — because
+    # it is the cause of which `observed_days` drift is only the symptom.
+    outside = submitted[(submitted["timestamp"] < window_start)
+                        | (submitted["timestamp"] > window_end)]
+    late_days = float(
+        (submitted["timestamp"].max() - window_end).total_seconds() / 86_400.0)
+    early_days = float(
+        (window_start - submitted["timestamp"].min()).total_seconds() / 86_400.0)
+
     diagnostics.update({
         "n_context_used": int(len(kept)),
         "n_context_available": int(len(context)),
+        "n_duplicates_dropped": n_duplicates,
+        "n_submitted_outside_window": int(len(outside)),
+        "submitted_days_after_window_end": round(max(late_days, 0.0), 3),
+        "submitted_days_before_window_start": round(max(early_days, 0.0), 3),
         "observed_days": observed_days,
         "window_days": float(window_days),
         "window_start": window_start,
@@ -650,6 +797,16 @@ def merge_with_context(
         # `seen_in_context` would overstate the evidence behind its score.
         "context_accounts": set(kept["sender"]) | set(kept["receiver"]),
     })
+
+    if n_duplicates:
+        diagnostics["warnings"].append(
+            f"{n_duplicates:,} of {len(submitted):,} submitted transactions "
+            f"exactly replay a transaction already in the context file (same "
+            f"sender, receiver, amount and timestamp) and were counted once, not "
+            f"twice. Without this, each replayed edge would have doubled its own "
+            f"weight and amount, inflating in_amount_sum, out_amount_sum, "
+            f"repeat_ratio, txn_velocity and burst_ratio for both endpoints. The "
+            f"scores are correct; the request is redundant.")
 
     # The failure that matters: the batch is dated outside the context range, so
     # the trim removed everything and we are back to scoring a bare batch graph —
@@ -666,11 +823,36 @@ def merge_with_context(
             f"to ~1/n, clustering and cycle participation to 0. These scores are "
             f"not comparable to the reported metrics. Date the transactions "
             f"inside the context window.")
-    elif len(kept) < 0.5 * len(context):
+    elif len(kept) < len(context):
+        # ANY trim is reported, not only a trim past some floor. The old 50% floor
+        # meant a third of the graph could vanish silently; and now that the window
+        # is anchored to the context rather than to the request, a trim is a
+        # property of the deployment (a context file spanning longer than the
+        # trained window) rather than of one caller, so it is worth saying once
+        # per request until someone shortens the file.
+        dropped = len(context) - len(kept)
+        severity = ("Only " if len(kept) < 0.5 * len(context) else "")
         diagnostics["warnings"].append(
-            f"Only {len(kept):,} of {len(context):,} context transactions fall "
-            f"inside the window, so the graph is sparser than the one the model "
-            f"was trained on and graph features are correspondingly weaker.")
+            f"{severity}{len(kept):,} of {len(context):,} context transactions "
+            f"fall inside the {window_days:.1f}-day observation window "
+            f"({dropped:,} older edges trimmed, {100 * dropped / len(context):.1f}"
+            f"%), so the graph is sparser than the one the model was trained on "
+            f"and graph features are correspondingly weaker. The context file "
+            f"spans longer than the trained window; trimming it to match would "
+            f"remove this warning without changing any score.")
+
+    if len(outside):
+        diagnostics["warnings"].append(
+            f"{len(outside):,} of {len(submitted):,} submitted transactions fall "
+            f"outside the reference window "
+            f"({window_start.date()} to {window_end.date()}): up to "
+            f"{max(late_days, 0.0):.1f} days after it ends and "
+            f"{max(early_days, 0.0):.1f} days before it starts. They are scored "
+            f"anyway — the request is never trimmed — but they widen the effective "
+            f"window without adding history, so the magnitude features below are "
+            f"measured over a longer span than training used. The window itself is "
+            f"anchored to the context file and does not move, so no other "
+            f"account's history was dropped to accommodate them.")
 
     if window_days > 0:
         drift = abs(observed_days - window_days)
@@ -680,12 +862,37 @@ def merge_with_context(
     diagnostics["comparable"] = bool(comparable)
 
     if not comparable:
+        # WHAT THIS WARNING IS ABOUT IN v4, WHICH IS NOT WHAT IT WAS ABOUT IN v3.
+        #
+        # v3's version named the three features MEASURED to scale with window
+        # length — in_amount_sum 2.00x, out_amount_sum 1.99x, repeat_ratio 1.88x
+        # when the window doubles — because nothing corrected them and a
+        # mismatched window put them on a different scale than training. (An
+        # earlier draft named `txn_velocity` instead of `repeat_ratio`, which was
+        # backwards: txn_velocity divides by the account's own active span so it is
+        # already a rate.)
+        #
+        # `data/extractor.py` now rescales all three to a 60-day reference window,
+        # so magnitude is no longer the problem and claiming it is would be a
+        # warning about a fixed bug. What a mismatched window still changes is the
+        # graph's STRUCTURE, which no per-graph constant can correct: distinct
+        # counterparties saturate rather than scale (1.00 median / 1.10 by totals
+        # over a doubled window), so `degree_balance`, `reciprocity`,
+        # `clustering_coefficient` and the repeated-edge cycle core are all
+        # measured over a different amount of evidence than training used. That is
+        # the residual, it is real, and it is smaller and differently shaped than
+        # what this text used to describe.
         diagnostics["warnings"].append(
             f"Effective observation window is {observed_days:.1f} days against a "
-            f"trained window of {window_days:.1f} days. in_amount_sum, "
-            f"out_amount_sum and txn_velocity scale with window length, so they "
-            f"are on a different scale than in training and these scores should "
-            f"be treated as indicative only.")
+            f"trained window of {window_days:.1f} days. The three magnitude "
+            f"features (in_amount_sum, out_amount_sum, repeat_ratio) are rescaled "
+            f"to a 60-day reference window and so remain comparable, but graph "
+            f"STRUCTURE is not rescalable: over a different window the "
+            f"counterparty set, the reciprocal pairs and the repeated-edge cycle "
+            f"core are all built from a different amount of evidence than training "
+            f"used, which moves degree_balance, reciprocity, "
+            f"clustering_coefficient and cycle_participation. Treat these scores "
+            f"as indicative only.")
 
     return merged, diagnostics
 
@@ -698,15 +905,56 @@ def attribute(
     """
     Per-account SHAP attributions, with the summation identity checked first.
 
-    Exact TreeSHAP guarantees `sigmoid(contributions.sum() + bias)` equals the
-    model's predicted probability. Verifying it here is not ceremony: the two
-    ways this silently breaks in XGBoost are an `iteration_range` mismatch after
-    early stopping (contributions from all trees, prediction from the best
-    subset) and mistaking the trailing bias column for a feature, which shifts
-    every attribution by one and produces confident, wrong explanations. If the
-    identity fails, factors are dropped and the caller is told — a fraud alert
-    with no reason attached is recoverable; one with a fabricated reason sends an
-    analyst down the wrong path.
+    Exact TreeSHAP guarantees `contributions.sum() + bias` equals the model's raw
+    margin. Verifying it here is not ceremony: the two ways this silently breaks in
+    XGBoost are an `iteration_range` mismatch after early stopping (contributions
+    from all trees, prediction from the best subset) and mistaking the trailing
+    bias column for a feature, which shifts every attribution by one and produces
+    confident, wrong explanations. If a check fails, factors are dropped and the
+    caller is told — a fraud alert with no reason attached is recoverable; one with
+    a fabricated reason sends an analyst down the wrong path.
+
+    ─────────────────────────────────────────────────────────────────────────
+    WHY THE IDENTITY IS CHECKED ON THE MARGIN AND NOT ON THE PROBABILITY
+    ─────────────────────────────────────────────────────────────────────────
+    This used to compare `sigmoid(clip(contribs.sum(1) + bias, -60, 60))` against
+    `probabilities` at 1e-4 in PROBABILITY space, while `models/train.py` had
+    already been corrected to compare margins at 1e-4 in LOG-ODDS. Same constant,
+    two different meanings, and the serving copy was the loose one.
+
+    Sigmoid saturates, so a fixed probability tolerance is a wildly varying margin
+    tolerance. At a true margin of 9 (p = 0.99988) a reconstruction error of about
+    +1.66 log-odds slips through; past ±40 the clip makes the check vacuous
+    outright. For scale, the whole HIGH→CRITICAL band is well under half a log-odd
+    wide at the shipped threshold — so the undetectable error was several times a
+    tier band, on precisely the CRITICAL accounts an analyst opens first. Comparing
+    margins directly makes the tolerance mean one thing everywhere.
+
+    The probability agreement is still reported when it fails, because that is the
+    number a reader intuits and the number the API serves, but it is a CONSEQUENCE
+    of the margin check rather than the gate: |dp| <= |dm| / 4 for any margin.
+
+    ─────────────────────────────────────────────────────────────────────────
+    WHY THE BIAS COLUMN IS CHECKED SEPARATELY
+    ─────────────────────────────────────────────────────────────────────────
+    The docstring here used to claim the summation identity catches "mistaking the
+    trailing bias column for a feature". It cannot, and this is worth being precise
+    about because the claim was load-bearing. `pred_contribs` returns
+    `n_features + 1` columns whose row sum is the margin; `contribs.sum(1) + bias`
+    therefore equals that same row sum for ANY split of the columns. So
+    `raw[:, :-1] / raw[:, -1]` (correct, and what models/explain.py ships) and
+    `raw[:, 1:] / raw[:, 0]` (the off-by-one) produce bit-identical totals and both
+    pass. Under the misindex every score stays right and every factor NAME shifts
+    by one position — the worst available failure for an analyst-facing
+    explanation, and invisible to the check that advertised catching it.
+
+    What does distinguish the two ends: for a binary booster with a scalar
+    `base_score` and no per-row `base_margin`, the bias column is the same value in
+    every row. A real feature's contributions are not — that is what makes it a
+    feature. So `np.ptp(bias) == 0` holds for the correct split and fails
+    immediately under the misindex. It is checked with a tolerance rather than
+    exactly, since the value arrives through float32 accumulation, and it is
+    skipped for a single row, where every column is trivially constant.
     """
     warnings: list[str] = []
     try:
@@ -716,16 +964,45 @@ def attribute(
             f"Per-account attribution unavailable ({type(exc).__name__}: {exc}). "
             f"Scores are unaffected; explanations are omitted."]
 
-    reconstructed = 1.0 / (1.0 + np.exp(-np.clip(contribs.sum(axis=1) + bias,
-                                                 -60, 60)))
-    deviation = float(np.max(np.abs(reconstructed - probabilities))) \
-        if len(X) else 0.0
-    if deviation > SHAP_IDENTITY_TOLERANCE:
+    if not len(X):
+        return [], warnings
+
+    # THE IDENTITY, in the space TreeSHAP is additive in. `output_margin=True`
+    # applies the same early-stopping iteration range `predict_proba` does, which
+    # is the whole point — a hand-rolled log(p / (1 - p)) would not, and would be
+    # catastrophically imprecise at the saturated ends where it matters most.
+    margin_from_shap = contribs.sum(axis=1) + bias
+    margin_direct = np.asarray(
+        model.predict(X, output_margin=True), dtype=float).ravel()
+    drift = float(np.abs(margin_from_shap - margin_direct).max())
+
+    if drift > MARGIN_IDENTITY_TOLERANCE:
+        prob_drift = float(np.abs(
+            1.0 / (1.0 + np.exp(-np.clip(margin_from_shap, -60, 60)))
+            - probabilities).max())
         return [[] for _ in range(len(X))], [
-            f"SHAP contributions do not reconstruct the predicted "
-            f"probabilities (max deviation {deviation:.2e} > "
-            f"{SHAP_IDENTITY_TOLERANCE:.0e}), so they do not explain these "
-            f"scores. Explanations withheld rather than served misleadingly."]
+            f"SHAP contributions do not reconstruct the model's own margins (max "
+            f"deviation {drift:.2e} log-odds > {MARGIN_IDENTITY_TOLERANCE:.0e}; "
+            f"{prob_drift:.2e} in probability), so they do not explain these "
+            f"scores. Most likely the early-stopping iteration range in "
+            f"models/explain.py disagrees with the one used for scoring. "
+            f"Explanations withheld rather than served misleadingly."]
+
+    # THE BIAS COLUMN, checked on the one property that separates it from a
+    # feature: it is constant down the batch. Needs at least two rows to say
+    # anything — with one row every column is constant.
+    if len(X) > 1:
+        bias_spread = float(np.ptp(np.asarray(bias, dtype=float)))
+        if bias_spread > BIAS_CONSTANT_TOLERANCE:
+            return [[] for _ in range(len(X))], [
+                f"The TreeSHAP bias column varies across the batch (spread "
+                f"{bias_spread:.2e} > {BIAS_CONSTANT_TOLERANCE:.0e}), but this "
+                f"booster has a scalar base_score and no per-row base_margin, so "
+                f"it cannot. The most likely cause is an off-by-one in the "
+                f"column split in models/explain.py, which leaves every score "
+                f"correct and shifts every feature NAME by one position. "
+                f"Explanations withheld: a confidently mislabelled reason is "
+                f"worse than no reason."]
 
     values = X.to_numpy(dtype=float)
     factors = [
@@ -887,8 +1164,14 @@ async def score_transactions(request: ScoringRequest):
             model_version=STATE.model_version,
             partition_fingerprint=STATE.partition_fingerprint,
             threshold_source=threshold_source,
+            # The second number the tiering rests on. Without it the response
+            # named the alert cutoff but not the ALLOW/step-up boundary, so a
+            # caller could not tell why an account tiered MEDIUM.
+            break_even_probability=break_even,
+            context_provenance=CONTEXT_PROVENANCE,
             n_submitted_transactions=len(request.transactions),
             n_context_transactions_used=diag["n_context_used"],
+            n_duplicates_dropped=diag["n_duplicates_dropped"],
             n_nodes_in_graph=int(graph.number_of_nodes()),
             observation_window_days=round(diag["observed_days"], 2),
             trained_window_days=(round(STATE.trained_window_days, 2)

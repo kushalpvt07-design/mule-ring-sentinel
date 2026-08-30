@@ -41,10 +41,19 @@ v2 → v3 CHANGES
    The whole enum is now checked when this module loads, so the process refuses
    to start instead of failing in production.
 
-4. TIERS ARE COMPUTED ON THE SCORE AS REPORTED.
+4. TIERS ARE COMPUTED ON THE SCORE AS REPORTED, AND AGAINST A THRESHOLD ON THE
+   SAME GRID.
    Rounding after classifying let a score of 0.0697999 be reported as `0.0698`
    with tier MEDIUM while the displayed threshold was also `0.0698` — a response
    that contradicts itself on its face. Rounding now happens first.
+
+   That was half the fix. The score was quantized to six decimals and the
+   threshold was left raw, so the comparison straddled two grids and the residue
+   ran one way: a score genuinely at or above the operating point could round down
+   across it and come back MEDIUM instead of HIGH, i.e. a step-up instead of an
+   analyst. The band is about 4e-7 wide, which is a statement about how often, not
+   about which way — and the direction is alert suppression. Both sides are now
+   quantized by `quantize`; see SCORE_DECIMALS for the worked example.
 
 5. THE ACTION RAIL IS AN ALLOWLIST, NOT A BLOCKLIST.
    The blocklist leaked. `LOCK_ACCOUNT` passed the exact-name set, because it is
@@ -58,13 +67,22 @@ v2 → v3 CHANGES
    independent check, with the verbs the leak exposed added to them.
 
 6. THE MEDIUM FLOOR COMES FROM THE COST MODEL, NOT FROM A FRACTION.
-   The floor was `threshold * 0.6`, which at the shipped threshold of 0.5908 sits
-   at 0.3545. But the project's own cost model prices an account as worth
-   attention above the break-even probability p* = fp/(fp + fn) = 0.0698, and the
-   test-oracle cutoff is 0.2665 — both well inside the band the old floor called
-   LOW. So the API answered ALLOW on scores its own economics called reviewable.
-   The floor is now p* itself, passed in alongside the threshold it comes from.
-   Note what this does NOT do: p* is used as the queue yardstick the README
+   The floor was `threshold * 0.6`. But the project's own cost model prices an
+   account as worth attention above the break-even probability
+   p* = fp/(fp + fn), and on every operating point this repo has shipped, 0.6·t
+   has sat well ABOVE p* — so the API answered ALLOW across a whole band its own
+   economics called reviewable. The floor is now p* itself, passed in alongside
+   the threshold it comes from.
+
+   No number is quoted here on purpose. This paragraph used to say "at the
+   shipped threshold of 0.5908 sits at 0.3545", and both figures went stale the
+   next time anyone retrained: the shipped `optimal_threshold` moved to roughly a
+   third of that, and the docstring kept describing a band the code no longer
+   produced. The live values are `optimal_threshold` and
+   `cost_config.break_even_probability` in models/saved_models/metrics.json, and
+   `/health` reports the one the service actually loaded.
+
+   Note what the floor does NOT do: p* is used as the queue yardstick the README
    describes, never as the alert cutoff. HOLD_FOR_REVIEW still begins at the
    empirically-selected operating threshold, because this model is deliberately
    uncalibrated and p* applied to an inflated score would alert on a large
@@ -78,13 +96,18 @@ The precision and recall in metrics.json describe ONE binary decision: score >=
 threshold, or not. They say nothing about the four tiers below.
 
 Concretely, MEDIUM sits BELOW the threshold, so accounts in it are ones the model
-declined to flag. It spans [p*, threshold) — on the shipped numbers 0.0698 to
-0.5908, which is wide on purpose: every score in it is one the cost model says is
-worth more than nothing and less than an analyst. Its step-up-auth action is a
-cheap hedge, not a measured detection, and its precision is necessarily far worse
-than the reported figure. Splitting the flagged side into HIGH and CRITICAL is
-likewise a triage ordering for a human queue, not four separately validated
-classifiers. Anyone quoting a per-tier number needs to measure that tier.
+declined to flag. It spans [p*, t) — wide on purpose: every score in it is one
+the cost model says is worth more than nothing and less than an analyst. Its
+step-up-auth action is a cheap hedge, not a measured detection, and its precision
+is necessarily far worse than the reported figure. Splitting the flagged side into
+HIGH and CRITICAL is likewise a triage ordering for a human queue, not four
+separately validated classifiers. Anyone quoting a per-tier number needs to
+measure that tier.
+
+The band is written symbolically because its endpoints are artefacts, not
+constants. Both live in metrics.json; neither is hardcoded anywhere in this
+module, and `tests/test_responder.py` reads them from there rather than from a
+copy, precisely so a stale copy cannot make a tiering test pass.
 """
 
 from __future__ import annotations
@@ -221,14 +244,52 @@ _assert_action_enum_is_defense_only()
 # Risk tiering
 # ──────────────────────────────────────────────────────────────────
 
+# Decimals every score and every tier boundary is resolved to.
+#
+# The score has to be rounded somewhere: `risk_score` is serialised into JSON and
+# an analyst reads it. v3 moved that rounding to BEFORE classification, because
+# rounding after it let a raw 0.0697999 be reported as 0.0698 with tier MEDIUM
+# while the displayed threshold was also 0.0698 — a response that contradicted
+# itself on its face.
+#
+# That fix was half of one. The score was quantized and the THRESHOLD was not, so
+# the comparison ran between a value on the 1e-6 grid and one off it, and the
+# residue was one-sided. Worked example at a shipped operating point
+# t = 0.18356411904…: a raw score of 0.183564_2 is genuinely above t, rounds to
+# 0.183564, and 0.183564 < t — so it came back MEDIUM and REQUIRE_ADDITIONAL_AUTH
+# instead of HIGH and HOLD_FOR_REVIEW. The band runs from t up to the next
+# half-grid point, about 3.8e-7 wide here, and every account in it was tiered DOWN.
+#
+# The width is negligible. The direction is not: alert suppression is the one way a
+# fraud system must not fail quietly, and "it is only 4e-7 of the probability axis"
+# is an argument about how often, not about which way. Quantizing the threshold to
+# the same grid makes the comparison grid-to-grid, so the boundary can be displaced
+# by at most half a step and is displaced symmetrically rather than always against
+# the alert.
+SCORE_DECIMALS = 6
+
+
+def quantize(value: float) -> float:
+    """
+    Put a score or a threshold on the grid tiering is decided on.
+
+    Used on BOTH sides of every comparison. Applying it to one side only is the
+    defect described above; applying it twice is harmless, since it is idempotent.
+    """
+    return round(float(value), SCORE_DECIMALS)
+
+
 def critical_cutoff(threshold: float) -> float:
     """
     Score at or above which an account is CRITICAL: halfway from the operating
     threshold to certainty.
 
     Exposed rather than inlined so the dashboard can draw the same boundary the
-    API applies, instead of a second copy that drifts.
+    API applies, instead of a second copy that drifts. The threshold is quantized
+    first for the same reason — a boundary drawn from an unrounded threshold is not
+    the boundary this module applies.
     """
+    threshold = quantize(threshold)
     return threshold + (1.0 - threshold) / 2.0
 
 
@@ -240,14 +301,15 @@ def medium_cutoff(threshold: float, break_even_probability: float) -> float:
     Above p*, the expected cost of acting on an account is below the expected cost
     of ignoring it, so it is worth *something* — and the cheapest something is a
     step-up, not an analyst. That is why the floor is p* and not a fraction of the
-    threshold: `threshold * 0.6` was 0.3545 here, which returned ALLOW across a
-    whole band this project's own economics price as reviewable.
+    threshold: `threshold * 0.6` returned ALLOW across a whole band this project's
+    own economics price as reviewable, and it did so by a margin that changed
+    every time the threshold moved. p* moves only when the cost model does.
 
     `min` because a caller may override the threshold to below p*, and a MEDIUM
     floor above the HIGH floor is not a band, it is a contradiction. Under such an
     override the band is simply empty and everything above the threshold is HIGH.
     """
-    return min(break_even_probability, threshold)
+    return min(quantize(break_even_probability), quantize(threshold))
 
 
 def classify_risk(
@@ -293,11 +355,19 @@ def classify_risk(
             "probability."
         )
 
-    if risk_score >= critical_cutoff(threshold):
+    # Both sides on the same grid. The HIGH boundary is compared against the
+    # quantized threshold rather than the raw one, so a score genuinely at or above
+    # the operating point cannot round down across it and be tiered DOWN. See
+    # SCORE_DECIMALS. Validation above deliberately runs on the values as passed,
+    # so an out-of-range argument is reported as the caller wrote it.
+    score = quantize(risk_score)
+    threshold = quantize(threshold)
+
+    if score >= critical_cutoff(threshold):
         return RiskLevel.CRITICAL
-    if risk_score >= threshold:
+    if score >= threshold:
         return RiskLevel.HIGH
-    if risk_score >= medium_cutoff(threshold, break_even_probability):
+    if score >= medium_cutoff(threshold, break_even_probability):
         return RiskLevel.MEDIUM
     return RiskLevel.LOW
 
@@ -355,9 +425,11 @@ def build_node_response(
     every alert, so it described the model rather than the account.
 
     Rounding happens before classification so the tier can never contradict the
-    score printed next to it.
+    score printed next to it — and `classify_risk` quantizes the THRESHOLD to the
+    same grid, which is what stops a score genuinely above the operating point from
+    rounding down across it and being tiered down. See SCORE_DECIMALS.
     """
-    reported_score = round(float(risk_score), 6)
+    reported_score = quantize(risk_score)
     risk_level = classify_risk(reported_score, threshold, break_even_probability)
     action = determine_action(risk_level)
 
