@@ -31,7 +31,7 @@ Real-world payment graphs carry no ground-truth labels for unflagged accounts, w
 
 * **Topological ground truth vs. single-row fraud.** Simulators like PaySim label individual transaction rows, not multi-hop network objects. A topological detector needs ring-level entities (`ring_id`, `ring_type`, `hijack_prob`) to build ring-disjoint temporal splits and to measure per-archetype recall (fast cycles vs. stealth cycles) — something row-level labels cannot express.
 * **The UPI organic substrate.** Graph-typology simulators such as AMLSim do inject rings, but their transaction dynamics are not calibrated to UPI: instant, 24×7, zero-fee VPA-to-VPA micropayments. Detection difficulty lives in how well a ring hides inside *realistic* background traffic — salary-day bursts, kirana merchant fan-ins, high-velocity P2P reciprocity — and reproducing that substrate required a UPI-specific generator rather than adapting a simulator built for a different payment regime.
-* **Temporal containment as a serving-scope boundary.** Constraining 100% of a ring's timeline to a single 60-day split guarantees zero positive-entity leakage across train/val/test (verified: ring-ID overlap across splits is 0) and mirrors the API's fixed 60-day serving context. Rings that straddle a window edge in production are an explicit out-of-scope boundary for v3, not an oversight.
+* **Temporal containment as a serving-scope boundary.** Constraining 100% of a ring's timeline to a single 60-day split guarantees zero positive-entity leakage across train/val/test (verified: ring-ID overlap across splits is 0) and mirrors the API's fixed 60-day serving context. Rings that straddle a window edge in production are an explicit out-of-scope boundary for v4, not an oversight.
 * **Engineered prevalence.** Real money-mule prevalence is a fraction of a percent. Synthetic prevalence was deliberately elevated to ~4–7% to give XGBoost enough positive-class representation to learn from without extreme-imbalance degradation. The decision *economics* — not the base rate — are reintroduced downstream through the rupee cost matrix; absolute precision figures are therefore reported at the elevated prevalence and would compress at production base rates (see [Limitations](#limitations)).
 
 ## Results
@@ -154,8 +154,8 @@ extra steps.
 
 ## What "honest metrics" is being taken to mean
 
-The track bar asks for honest metrics including false-positive cost. Four things
-follow from taking that literally, and all four are load-bearing here.
+The track bar asks for honest metrics including false-positive cost. Five things
+follow from taking that literally, and all five are load-bearing here.
 
 **A number is only honest next to its baseline.** ROC-AUC on an imbalanced
 fraud task is easy to make look good and hard to interpret. So every headline
@@ -201,6 +201,20 @@ evaluates once on test at that frozen value, and
 `tests/test_baselines.py::TestSensitivityTableDoesNotPeekAtTest` fails the build
 if any published operating point is ever re-optimised on test again — including
 under renamed columns.
+
+**The live demo is in-sample, and the response says so.** The threshold is
+selected on validation, and the graph the API scores against —
+`serving_context_edges.csv` — is the validation split, edge for edge. So a
+`/score` call against a context account computes that account's features over the
+exact transactions the threshold was tuned on: it is in-sample with respect to the
+graph and the operating point, and a precision figure read off a running demo
+would be optimistic. No labels leak — the model never trains on validation, and
+the split-integrity checks are about labels — so nothing above is weakened; the
+honest out-of-sample figures are the test-split ones in [Results](#results), not
+anything measurable from the endpoint. Every `/score` response carries this in its
+`context.context_provenance` field, so a reviewer reading one JSON body does not
+have to infer it — and serving the context from a fourth, held-out window is the
+documented fix if this is ever pointed at something real.
 
 ---
 
@@ -320,8 +334,15 @@ perturbation, so deleting that plumbing breaks the build.
 
 PageRank is the one exemption, and it is a principled one: it is a global fixpoint
 over a normalised rank vector, so strictly every node shifts when any node is
-added. That is the definition, not a bug. It is therefore held to a *bound*
-rather than to identity — measured max |Δ| 9.5e-06 against a 1e-4 tolerance.
+added. That is the definition, not a bug, so it is held to a *bound* rather than
+to identity. v4 emits it as `pagerank × N` — mean 1.0 rather than a value that
+tracks node count — which also cancels most of the drift to first order, since
+adding accounts rescales every raw value by about N/(N+k) and the ×N undoes that
+term. The bound is `PAGERANK_PERTURBATION_TOLERANCE` = 1e-3 on that mean-1.0
+column, chosen as a bound the cancellation argument clears comfortably rather than
+as a measurement; the v3-era ~1e-5 reading was taken on the old 1/N-scale column,
+and the true v4 residual is confirmed on the retrain. See rule 5 in
+`models/features.py`.
 
 ---
 
@@ -368,7 +389,7 @@ the output — which means a fresh clone must run them before anything else work
 ```bash
 python -m data.generator     # → data/raw/{train,val,test,serving_context}_edges.csv
 python -m data.extractor     # → data/processed/{train,val,test}_features.csv
-python -m models.train       # → models/saved_models/sentinel_v3.xgb + metrics.json
+python -m models.train       # → models/saved_models/<features.MODEL_NAME> + metrics.json
 python -m models.report --write   # fills the Results section of this README
 ```
 
@@ -452,7 +473,7 @@ Stated, not hidden — and separated into the two kinds, because a scope boundar
 * **Elevated prevalence base rate.** Absolute precision and rupee cost are measured at the deliberately elevated synthetic prevalence described under [Why a Custom Synthetic Generator?](#why-a-custom-synthetic-generator), and would compress at real base rates, where mule prevalence is a fraction of a percent. Recall, false-positive rate and ROC-AUC are within-class quantities and do not move with the base rate; precision and total cost do. Rather than leave that as a caveat, Results carries the shipped operating point re-projected down a ladder of prevalences, marking the row that was actually measured and the point at which projected precision falls below break-even p\* — below that base rate the alert queue costs more to work than to ignore, which is the number a reviewer should actually want. The projection is arithmetic on the measured recall and false-positive rate, not a second experiment: it assumes the ranking transfers to the new base rate, which is exactly the assumption a real deployment would have to test.
 * **Synthetic topology scope.** The generator establishes a *mechanism* — these graph features separate these three ring archetypes, and the leakage gate demonstrates no single column carries the label. It does not establish that real mule rings take these shapes, and no amount of work inside this repo could; that needs labelled production data. So this is a scope boundary and is deliberately not "addressed". What is done instead: the archetypes are stated explicitly, recall is reported per archetype so a reader can see which shape is hardest, and no claim is made beyond "the mechanism holds on the stated shapes".
 * **Uncalibrated probabilities.** `scale_pos_weight` buys recall under imbalance by inflating scores, so a predicted score is not a probability. The shipped threshold is therefore a rank cutoff chosen by cost on validation, *not* the break-even p\*, and conflating the two is the mistake this repo is most careful about. Results publishes the size of the gap — Brier score and expected calibration error, before and after a two-parameter Platt map fitted on validation and measured on test — alongside ROC-AUC on both scales. The map is reported and **not** applied: the shipped threshold was selected on the raw scale, and rescaling scores underneath a threshold chosen for the old scale would move the operating point while looking like a free improvement. A Platt map is monotone non-decreasing, so it cannot reorder accounts and the ranking metrics are unchanged — an invariance the suite asserts rather than assumes.
-* **Fixed-length window dependence.** Every magnitude feature is a count or a sum over a fixed 60-day window, so the model would need re-fitting for a different window length; these are levels, not rates. Normalising them per-day would remove the dependence, and it is deliberately *not* done in v3 — it would change all 18 features at once and invalidate the shipped model, its threshold, the stability guarantees and every number in Results together. The constraint is enforced where it can do damage instead: the API states the window it was fitted for and warns when a submitted payload implies a different span, rather than silently scoring it as though the span matched.
+* **Fixed-length window dependence.** v4 divides the 60-day window length out of the three features that scaled with it directly: `in_amount_sum`, `out_amount_sum` and `repeat_ratio` are rescaled to a 60-day reference window, so on the shipped equal-length splits the factor is 1.0001–1.0003 and no number in Results moves. What the rescale cannot touch is structure — window length changes the graph itself, because distinct counterparties saturate sublinearly, and that moves `degree_balance`, `reciprocity` and the cycle core. So equal-length windows remain a correctness requirement rather than a convenience: `assert_equal_window_lengths()` in the generator enforces it, `tests/test_leakage.py` covers it, and anything that builds a graph to score against must span one window — including `serving_context_edges.csv`. The API still states the window it was fitted for and warns when a submitted payload implies a different span, because a graph built over a different length is a different measurement even after the magnitudes are normalised.
 * **Queue capacity constraints.** The cost matrix prices a false alert but otherwise assumes an analyst team large enough to work whatever queue the threshold produces. A capacity-constrained operating point is reported next to the unconstrained one, and the cap is applied to **every** policy in the comparison rather than only to the model — the earlier version priced the model with a capped queue while the baselines it was measured against could alert without limit, which is not a comparison so much as a handicap applied to one side. The residual limitation is real: the cap is a single assumed number, and where a validation-selected threshold overflows it on test the overflow is *reported* rather than re-solved, because re-fitting a threshold on the test split would be selection on test wearing a capacity argument as a disguise.
 * **Demo surface coverage.** The Streamlit page is a demo, and in v2 it was worse than untested — its cost panel added the ground-truth label into the score it displayed, so every precision, recall and rupee figure on screen was fiction, computed against a score that already knew the answer. That path is gone: the dashboard scores through the real booster or renders the reason it cannot, and `tests/test_dashboard.py` pins the guarantees behaviourally — the label never reaches the model, column order is part of the contract, the threshold has no safe default, a stale `metrics.json` stops the page rather than mislabelling it, and neither a simulated score nor a random draw has come back. What remains genuinely untested is the *rendering*: nothing here drives a browser, so a chart could be mislabelled or a panel could show the wrong split without a test noticing. The numbers behind the page are pinned; their presentation is not.
 
