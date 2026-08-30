@@ -230,8 +230,17 @@ class TestTheDashboardCannotInventScores:
 
         Sample data for a *demo input form* is a different thing, so this checks
         the modules that compute and display results, not the whole package.
+
+        `APP_SOURCE` IS IN THE LIST NOW. It was omitted while the constant was
+        defined in this file and used by four of its siblings, which left the one
+        module where the rupee figures are actually computed out of the scan — the
+        most likely home for the defect, unchecked. Nothing in app.py touches
+        `random` today, so adding it costs nothing; the point is that it can no
+        longer start to without failing here. The sibling above
+        (`test_no_simulated_score_has_come_back`) already scans all four, so the
+        omission was this test's alone.
         """
-        for path in (SCORING_SOURCE, *COMPONENT_SOURCES):
+        for path in (APP_SOURCE, SCORING_SOURCE, *COMPONENT_SOURCES):
             uses = sorted({
                 _attribute_path(n) for n in ast.walk(_tree(path))
                 if isinstance(n, ast.Attribute)
@@ -272,10 +281,15 @@ class TestTheDashboardCannotInventScores:
 class TestTheThresholdHasNoSafeDefault:
     """
     v2 used `metrics.get("optimal_threshold", 0.5)`. With a miss priced at 13.3x
-    a false alert the real operating point sits near 0.07, so that default throws
-    away most of the recall the model was tuned for — and reports the result as
-    the model's performance. The threshold is an economic quantity; there is no
-    value to guess.
+    a false alert the real operating point is 0.1836 on the shipped model, so that
+    default throws away most of the recall the model was tuned for — and reports
+    the result as the model's performance. The threshold is an economic quantity;
+    there is no value to guess.
+
+    (This paragraph used to say the operating point "sits near 0.07", i.e. at the
+    break-even probability p*. That is where the optimum would sit if the booster's
+    scores were calibrated, and they are not; the fitted minimiser on validation is
+    2.6x higher. The distinction is the whole subject of the last test below.)
     """
 
     def test_a_missing_threshold_stops_the_page(self):
@@ -296,23 +310,105 @@ class TestTheThresholdHasNoSafeDefault:
         with pytest.raises(ModelUnavailable, match="out-of-range"):
             resolve_threshold({"optimal_threshold": bad})
 
-    def test_the_shipped_threshold_is_below_the_break_even(self, metrics):
+    # How far the fitted operating point may sit from the break-even probability
+    # before the dashboard is presumed to be reading the wrong file. Two-sided and
+    # deliberately wide: the ratio is the output of a fitting run, so a retrain is
+    # allowed to move it. What it is not allowed to do is leave the neighbourhood.
+    #
+    # Measured on the shipped metrics.json: threshold 0.183564, p* 0.069767,
+    # ratio 2.631. The ceiling is set at 6.0 because a file carrying v2's
+    # cost-insensitive 0.5 default lands at 0.5 / 0.069767 = 7.17x, so 6.0 catches
+    # that with room to spare on either side of the real value. The floor at 0.25x
+    # catches the opposite failure — a threshold collapsed far below anything the
+    # cost matrix justifies, which would render a queue of most of the network.
+    P_STAR_RATIO_FLOOR = 0.25
+    P_STAR_RATIO_CEILING = 6.0
+
+    def test_the_shipped_threshold_sits_in_the_neighbourhood_of_break_even(
+            self, metrics):
         """
         Not a re-test of the model — a check that what the dashboard will resolve
-        is the cost-sensitive operating point and not something near 0.5. Under
-        this cost matrix the optimum sits well below break-even p*, so a
-        threshold above it means the page is reading a different model's file.
+        is the cost-sensitive operating point and not something near 0.5.
+
+        THIS TEST USED TO BE CALLED `test_the_shipped_threshold_is_below_the_break_even`
+        AND ITS NAME WAS FALSE. It loaded `p_star` into a local and then never
+        mentioned it again, so the claim in the name — and the matching sentence in
+        the docstring, "the optimum sits well below break-even p*" — was never
+        compared against anything. Measured, the shipped threshold is 0.183564 and
+        p* is 0.069767: the operating point is **2.631x ABOVE** p*, the opposite of
+        what the test was named for, and the test was green.
+
+        WHY IT IS ABOVE, WHICH IS NOT A DEFECT. p* = fp / (fp + fn) is the
+        cost-minimising cut for a *calibrated* probability — the point where the
+        expected cost of alerting equals the expected cost of not. XGBoost's
+        sigmoid output is not calibrated, so the empirically cost-minimising cut on
+        validation has no reason to land on p*, and here it lands higher: at the
+        margin the booster is more confident than a calibrated score would be, so
+        the same expected cost is reached at a higher number. p* remains the floor
+        of the step-up band in api/responder.py, which is a different job — it is
+        where the cost model says "stop calling this benign", not where the fitted
+        model says "alert".
+
+        WHAT IS ASSERTED INSTEAD. Two things that survive a retrain:
+
+          1. p* recomputed from the two prices equals the p* metrics.json
+             publishes. It is an identity over fn_cost and fp_cost, so a file where
+             they disagree is internally inconsistent, and every band in the
+             responder is derived from the published side.
+          2. The threshold sits within a bounded factor of p* (see the constants
+             above) and below 0.5. A ratio, not a direction: pinning the direction
+             would be pinning one fitting run, which is exactly the failure this
+             test already committed once.
+
+        The two assertions this replaces did no work. `assert 0.0 < threshold < 1.0`
+        restates the out-of-range refusal that `resolve_threshold` raises on — and
+        which `test_an_out_of_range_threshold_is_refused` above already covers — so
+        it can only fire on a value that never got this far. `assert p_star > 0.0`
+        could not fail on any file with a positive fn_cost, and p* is now a divisor,
+        so it is load-bearing rather than decorative.
+
+        MUTATION RESULT, since that is the bar. Six mutants: threshold 0.5, 0.49,
+        0.01; fn_cost halved, fp_cost doubled, and break_even_probability set to 0.5,
+        each with the other side left stale. The body above catches all six. The
+        body it replaces caught ONE — threshold 0.5, and only because 0.5 is not
+        strictly below 0.5; nudging the mutant to 0.49 defeated it. The band admits
+        0.25x through 5.88x p* and rejects from 6.02x, so the shipped 2.631x has
+        room on both sides.
         """
         threshold = resolve_threshold(metrics)
-        p_star = metrics["cost_config"]["break_even_probability"]
-        assert 0.0 < threshold < 1.0
+        cost = metrics["cost_config"]
+        p_star = cost["break_even_probability"]
+
+        fn_cost, fp_cost = cost["fn_cost"], cost["fp_cost"]
+        recomputed = fp_cost / (fp_cost + fn_cost)
+        assert recomputed == pytest.approx(p_star, abs=1e-6), (
+            f"metrics.json publishes break_even_probability={p_star} but its own "
+            f"prices give fp/(fp+fn) = {fp_cost}/({fp_cost}+{fn_cost}) = "
+            f"{recomputed:.6f}. The published value is what api/responder.py uses "
+            f"as the floor of the step-up band, so an inconsistent file moves the "
+            f"tier boundaries away from the cost model they claim to implement.\n"
+            f"  Fix: python -m models.train"
+        )
+
         assert threshold < 0.5, (
             f"the dashboard would operate at {threshold}, near the default a "
-            f"cost-insensitive model would use. At "
-            f"{metrics['cost_config']['fn_fp_ratio']}:1 the optimum is far "
-            f"below 0.5 — check which metrics.json this is."
+            f"cost-insensitive model would use. At {cost['fn_fp_ratio']}:1 the "
+            f"optimum is far below 0.5 — check which metrics.json this is."
         )
-        assert p_star > 0.0
+
+        ratio = threshold / p_star
+        assert self.P_STAR_RATIO_FLOOR <= ratio <= self.P_STAR_RATIO_CEILING, (
+            f"the shipped threshold is {threshold:.6f}, which is {ratio:.3f}x the "
+            f"break-even probability {p_star:.6f} — outside the "
+            f"[{self.P_STAR_RATIO_FLOOR}, {self.P_STAR_RATIO_CEILING}] band this "
+            f"test allows. A fitted operating point is allowed to move away from "
+            f"p* (uncalibrated scores; the shipped value is 2.631x above it), but "
+            f"this far out means either the dashboard is resolving a threshold "
+            f"from a different model's file, or the cost matrix and the training "
+            f"run no longer describe the same problem.\n"
+            f"  Fix: confirm models/saved_models/metrics.json is the file the "
+            f"current `python -m models.train` wrote."
+        )
 
 
 # ══════════════════════════════════════════════════════════════════

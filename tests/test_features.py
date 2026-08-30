@@ -10,7 +10,7 @@ models/features.py, which cites this file by name:
 
        tests/test_features.py asserts this: perturb the graph with disconnected
        accounts, require bit-identical values for every feature except pagerank,
-       and require pagerank within 1e-4.
+       and require pagerank within PAGERANK_PERTURBATION_TOLERANCE.
 
 ─────────────────────────────────────────────────────────────────────────────
 WHY THIS IS THE MOST IMPORTANT TEST IN THE FILE
@@ -29,14 +29,18 @@ customers. Nothing raised, and no metric would have shown it.
 The fix is not to drop the feature but to stop redrawing communities per request:
 serving computes the partition once and passes it into `compute_node_features`,
 which extends it deterministically. This file asserts the fixed path holds the
-line — every feature except pagerank bit-identical, pagerank within 1e-4 — so
-that deleting the `partition=` plumbing fails the build instead of silently
-reintroducing the defect.
+line — every feature except pagerank bit-identical, pagerank within
+PAGERANK_PERTURBATION_TOLERANCE — so that deleting the `partition=` plumbing fails
+the build instead of silently reintroducing the defect.
 
 PageRank is exempt because it is a global fixpoint over a normalised rank vector:
 strictly every node shifts when any node is added. That is the definition, not a
-bug. What matters is the magnitude — measured at 9.5e-06, four orders of
-magnitude below the 0.317 that made the community feature unusable.
+bug. What matters is the magnitude, and it stays negligible next to the 0.29 that
+made community_internal_ratio unusable. The bound is
+PAGERANK_PERTURBATION_TOLERANCE (1e-3 on the v4 mean-1.0 column); see its
+definition below for why it is a bound rather than the v3 measurement of 9.5e-06,
+which was taken on the differently scaled raw column and no longer describes what
+is emitted. The Windows retrain re-measures it.
 
 Usage:
     pytest tests/test_features.py -v
@@ -53,9 +57,21 @@ from models.features import FEATURE_COLS, LABEL_META_COLS, METADATA_COLS, TARGET
 
 SPLITS = ("train", "val", "test")
 
-# Design rule 5's tolerance for pagerank, quoted from models/features.py.
-# Measured on the shipped val graph: 9.5e-06.
-PAGERANK_TOLERANCE = 1e-4
+# Design rule 5's tolerance for pagerank. models/features.py names this constant
+# and defers its value to here: it is a BOUND, not a measurement.
+#
+# v4 emits pagerank as pagerank × N (a multiple of the uniform 1/N baseline), so
+# the column's mean is 1.0 by construction. The v3 guard allowed an absolute 1e-4
+# on a raw column whose mean was 1/N ≈ 3.4e-4 — 29% of a typical value, while the
+# largest drift ever seen there was 1.0e-5, so "within 1e-4" sounded tight and was
+# nearly vacuous. On the mean-1.0 column, 1e-3 is ~290x tighter in relative terms;
+# and because the ×N scaling cancels the 1/N-renormalisation term that was most of
+# that 1e-5 drift to first order, the residual should be smaller still. It is set
+# as a bound the cancellation argument clears comfortably, because the perturbation
+# cannot be re-measured until the Windows retrain runs. If that run shows the true
+# residual orders of magnitude below 1e-3, tighten this and record the figure — an
+# unmeasured tolerance is how the v3 one drifted to 29%.
+PAGERANK_PERTURBATION_TOLERANCE = 1e-3
 
 # Features that are mathematically confined to [0, 1]. Asserted on the emitted
 # data because a value outside the range means the arithmetic is wrong, not that
@@ -177,16 +193,24 @@ class TestPerturbationStability:
 
         It is a global fixpoint, so every node shifts by construction; the
         question is whether the shift is small enough to be irrelevant to a
-        decision. Measured: 9.5e-06 against a 1e-4 budget.
+        decision. The bound is PAGERANK_PERTURBATION_TOLERANCE — 1e-3 on the v4
+        mean-1.0 column, a bound the cancellation argument clears comfortably
+        rather than a re-measurement (see the constant's definition). The v3
+        figure of 9.5e-06 was measured on the raw 1/N-scaled column and does not
+        carry over to what is emitted now; the Windows retrain re-measures it.
         """
         common = base_features.index
         before = base_features["pagerank"].to_numpy(dtype=float)
         after = perturbed_features.loc[common, "pagerank"].to_numpy(dtype=float)
         worst = float(np.abs(after - before).max())
-        assert worst <= PAGERANK_TOLERANCE, (
-            f"pagerank moved by up to {worst:.3e}, above the {PAGERANK_TOLERANCE:.0e} "
-            f"budget in design rule 5. A global centrality is allowed to drift when "
-            f"the graph grows, but not enough to change a verdict."
+        assert worst <= PAGERANK_PERTURBATION_TOLERANCE, (
+            f"pagerank moved by up to {worst:.3e}, above the "
+            f"{PAGERANK_PERTURBATION_TOLERANCE:.0e} budget in design rule 5. A "
+            f"global centrality is allowed to drift when the graph grows, but not "
+            f"enough to change a verdict. If this fires just over the bound, "
+            f"re-measure on the retrained graph before loosening it: the ×N scaling "
+            f"should cancel most of the 1/N drift, so a large residual is more "
+            f"likely a regression in that scaling than a real centrality shift."
         )
 
     def test_no_pre_existing_account_changes_community(

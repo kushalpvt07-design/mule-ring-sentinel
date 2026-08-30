@@ -86,14 +86,48 @@ from api.responder import (  # noqa: E402
 from api.schemas import ActionCode, ContributingFactor, NodeRiskScore, RiskLevel  # noqa: E402
 
 # The cost model's break-even probability, p* = fp_cost / (fp_cost + fn_cost) at
-# ₹15,000 and ₹2,00,000. It is the floor of the step-up band. Written out here
-# rather than read from metrics.json so these tests describe the tiering rule
-# itself and not whatever the last training run happened to publish.
+# ₹15,000 and ₹2,00,000. It is the floor of the step-up band.
+#
+# This one IS written out, and that is safe for a reason the operating threshold
+# below does not share: p* is an identity over two prices this project chose, not
+# an artefact of a fitting run. Retraining cannot move it. Two tests hold it in
+# place from both sides — `test_the_step_up_floor_is_the_break_even_probability`
+# recomputes it from 15,000 / 2,15,000, and
+# `test_the_break_even_literal_matches_the_published_cost_model` requires it to
+# equal what metrics.json publishes. So changing the cost model fails this file
+# rather than diverging from it quietly.
 BREAK_EVEN = 0.069767
 
-# The operating threshold metrics.json ships for sentinel_v3, used where a test
-# needs to reproduce the real geometry of the bands rather than a round number.
-SHIPPED_THRESHOLD = 0.5908352434635162
+
+def shipped_threshold(metrics: dict) -> float:
+    """
+    The operating threshold the loaded metrics.json actually publishes.
+
+    THIS USED TO BE A MODULE CONSTANT, `SHIPPED_THRESHOLD = 0.5908352434635162`,
+    and it was wrong: the shipped `optimal_threshold` had moved to roughly a third
+    of that. The damage was not a stale comment. `SHIPPED_THRESHOLD` fed
+    `classify_risk` in three tests, so those tests were checking the band geometry
+    of a threshold no longer in service — and the regression test below was green
+    ONLY because of the stale value. Corrected to the real threshold, five of its
+    seven fixed scores move MEDIUM → HIGH, because the operating point had
+    descended past them.
+
+    A test that pins a fitted quantity by copying it cannot notice the fit moving.
+    Read the number from the artefact that owns it, via the session-scoped
+    `metrics` fixture in conftest.py, which skips on a fresh checkout.
+    """
+    threshold = metrics.get("optimal_threshold")
+    if threshold is None:
+        pytest.skip("metrics.json publishes no optimal_threshold; "
+                    "run `python -m models.train`")
+    threshold = float(threshold)
+    if not (0.0 < threshold <= 1.0):
+        pytest.fail(
+            f"metrics.json publishes optimal_threshold={threshold!r}, which is "
+            f"not an operating point in (0, 1]. classify_risk rejects it, so the "
+            f"service could not serve this file."
+        )
+    return threshold
 
 # Enforcement action names, written from the outside. Not one of these is read
 # from api/responder.py — that is the entire point (see the header). `LOCK_ACCOUNT`
@@ -289,31 +323,97 @@ class TestRiskTiering:
     def test_classification_at_threshold_half(self, score, expected):
         assert classify_risk(score, 0.5, BREAK_EVEN) == expected
 
-    def test_no_score_above_break_even_is_ever_allowed(self):
+    def test_no_score_above_break_even_is_ever_allowed(self, metrics):
         """
-        THE REGRESSION, at the real operating point.
+        THE REGRESSION, as the property it protects rather than as one tier.
 
-        The step-up floor was `threshold * 0.6` = 0.3545 at the shipped threshold
-        of 0.5908, so every score in [0.0698, 0.3545) came back LOW and ALLOW —
-        including 0.2665, the cutoff the test-set oracle picked, and 0.2903, the
-        mean predicted probability of the [0.2, 0.4) reliability bin. Above p* the
-        cost model prices an account as worth more than nothing, and ALLOW is
-        nothing.
+        The step-up floor was `threshold * 0.6`, so a whole band above p* came back
+        LOW and ALLOW — including the cutoff the test-set oracle picked and the mean
+        predicted probability of the [0.2, 0.4) reliability bin. Above p* the cost
+        model prices an account as worth more than nothing, and ALLOW is nothing.
+
+        WHY THIS NO LONGER ASSERTS `== MEDIUM`. It used to, against a hardcoded
+        threshold of 0.5908, over seven fixed scores. Both parts were wrong
+        together and that is what kept it green: the real `optimal_threshold` is
+        about a third of 0.5908, and at the real value five of those seven scores
+        are above the operating point — so they are HIGH, and HIGH is a stronger
+        answer than the test demanded. Pinning the tier turned a safety property
+        into a snapshot of one fitting run, and the snapshot had already expired.
+
+        The property is: no score at or above p* may tier LOW or earn ALLOW. It
+        holds at every threshold, because the floor is `min(p*, t)` — at or above
+        p* a score is at least MEDIUM when t >= p*, and HIGH when t < p*. So it can
+        be swept across the band instead of sampled, and it needs no copy of the
+        operating point to be meaningful.
+
+        WHAT THE SWEEP CANNOT SEE. Its step is 0.001, so it detects an ALLOW hole
+        opened anywhere in the band down to about that width and no narrower —
+        checked by mutation, where holes of 0.01, 0.005 and 0.002 are all caught
+        and one of 0.0005 is not. Sub-step defects are real: `build_node_response`
+        rounds the score to six decimals before classifying while the threshold it
+        compares against is unrounded, which is a band far below this resolution.
+        This test does not cover that. It is a boundary-arithmetic question and
+        belongs in a test that reasons about the rounding, not in a sweep.
         """
-        for score in (BREAK_EVEN, 0.1, 0.2665, 0.2903, 0.3544, 0.35450, 0.5):
-            level = classify_risk(score, SHIPPED_THRESHOLD, BREAK_EVEN)
-            assert level == RiskLevel.MEDIUM, (
-                f"score {score} at the shipped threshold tiered {level.value}"
+        threshold = shipped_threshold(metrics)
+
+        # The band, densely. `threshold * 0.6` sits above p* at every threshold
+        # this repo has shipped, so the mutant loses the low end of this sweep.
+        scores = [BREAK_EVEN + i * 0.001 for i in range(int((1.0 - BREAK_EVEN) / 0.001))]
+        # Plus the scores the old bug was caught on, kept by name so the history
+        # stays checkable: the test-oracle cutoff, the reliability-bin mean, and
+        # the two sides of the old `0.6 * 0.5908` floor.
+        scores += [BREAK_EVEN, 0.1, 0.2665, 0.2903, 0.3544, 0.35450, 0.5, 1.0]
+
+        for score in scores:
+            level = classify_risk(score, threshold, BREAK_EVEN)
+            action = determine_action(level)
+            assert level != RiskLevel.LOW, (
+                f"score {score:.6f} is at or above p* = {BREAK_EVEN} but tiered "
+                f"LOW at threshold {threshold}. The cost model prices it as worth "
+                f"more than nothing."
             )
-            assert determine_action(level) == ActionCode.REQUIRE_ADDITIONAL_AUTH
+            assert action != ActionCode.ALLOW, (
+                f"score {score:.6f} tiered {level.value} and still earned ALLOW. "
+                f"Whatever the tier, a score above break-even cannot be waved "
+                f"through."
+            )
 
-    def test_the_step_up_floor_is_the_break_even_probability(self):
+    def test_the_break_even_literal_matches_the_published_cost_model(self, metrics):
+        """
+        The one thing `BREAK_EVEN` being a literal can get wrong.
+
+        p* cannot move when the model is refitted, which is why it is written out
+        above. It CAN move if someone reprices a miss or a false alert — and then
+        every tiering test in this file would go on describing the old economics
+        while the service applied the new ones. So the literal is required to equal
+        what the cost model publishes.
+        """
+        published = (metrics.get("cost_config") or {}).get("break_even_probability")
+        if published is None:
+            pytest.skip("metrics.json has no cost_config.break_even_probability")
+        assert float(published) == pytest.approx(BREAK_EVEN, abs=1e-6), (
+            f"metrics.json publishes p* = {published}, this file assumes "
+            f"{BREAK_EVEN}. The cost model was repriced; the step-up floor moved "
+            f"with it, and the tiering cases here describe the old prices."
+        )
+
+    def test_the_step_up_floor_is_the_break_even_probability(self, metrics):
         """
         Stated directly, because it is an economic claim and not a tuning choice:
         p* = fp_cost / (fp_cost + fn_cost) = 15,000 / 2,15,000.
+
+        Checked at the shipped threshold and at a spread of others above p*, so the
+        claim is "the floor IS p* wherever the operating point lands", not "the
+        floor happened to be p* at one fitted value".
         """
-        assert medium_cutoff(SHIPPED_THRESHOLD, BREAK_EVEN) == BREAK_EVEN
         assert BREAK_EVEN == pytest.approx(15_000 / (15_000 + 200_000), abs=1e-6)
+        for threshold in (shipped_threshold(metrics), 0.07, 0.3, 0.6, 1.0):
+            assert threshold >= BREAK_EVEN, (
+                f"threshold {threshold} is below p*; that case is "
+                f"test_the_step_up_band_cannot_invert_under_a_low_override"
+            )
+            assert medium_cutoff(threshold, BREAK_EVEN) == BREAK_EVEN
 
     def test_the_step_up_band_cannot_invert_under_a_low_override(self):
         """
@@ -333,7 +433,7 @@ class TestRiskTiering:
         cutoffs = [critical_cutoff(t) for t in (0.05, 0.1, 0.3, 0.6, 0.9)]
         assert cutoffs == sorted(cutoffs)
 
-    def test_the_tiers_are_ordered_across_the_whole_score_range(self):
+    def test_the_tiers_are_ordered_across_the_whole_score_range(self, metrics):
         """
         One sweep, because the three boundaries are now set by two independent
         numbers and a mistake in either would show up as a tier that goes
@@ -341,7 +441,7 @@ class TestRiskTiering:
         """
         rank = {RiskLevel.LOW: 0, RiskLevel.MEDIUM: 1,
                 RiskLevel.HIGH: 2, RiskLevel.CRITICAL: 3}
-        for threshold in (0.07, SHIPPED_THRESHOLD, 0.95):
+        for threshold in (0.07, shipped_threshold(metrics), 0.95):
             ranks = [rank[classify_risk(s / 1000.0, threshold, BREAK_EVEN)]
                      for s in range(0, 1001)]
             assert ranks == sorted(ranks), (

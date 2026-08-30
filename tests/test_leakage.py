@@ -22,12 +22,14 @@ Three leaks it could not see:
      node level the model is actually trained on.
 
   2. UNEQUAL OBSERVATION WINDOWS. v2 split the timeline 60/18/22, producing
-     windows of 108 / 32 / 39 days. `in_amount_sum`, `out_amount_sum` and
-     `txn_velocity` are magnitudes: watch an account three times as long and they
-     roughly triple with no change in behaviour. Train features were on a
-     different scale from test features, which the strictly-ordered timestamps
-     were perfectly happy about. The window contract is now asserted on day
-     spans, and — more usefully — on the feature values themselves.
+     windows of 108 / 32 / 39 days. `in_amount_sum` and `out_amount_sum` are
+     magnitudes: watch an account three times as long and they roughly triple with
+     no change in behaviour (`repeat_ratio` drifts the same way, sub-linearly).
+     Train features were on a different scale from test features, which the
+     strictly-ordered timestamps were perfectly happy about. v4 rescales those
+     three to a 60-day reference window; the window contract is still asserted on
+     day spans and — more usefully — on the feature values themselves, because
+     window length also changes graph STRUCTURE, which no rescale can correct.
 
   3. SERVING SKEW. `serving_context_edges.csv` spanned train+val, a third scale
      again, so the API computed features the model had never seen the like of.
@@ -71,12 +73,33 @@ ADJACENT = (("train", "val"), ("val", "test"))
 ALL_PAIRS = (("train", "val"), ("train", "test"), ("val", "test"))
 
 # Ratio between the largest and smallest per-split mean of a magnitude feature,
-# measured over NEGATIVES only so a difference in ring prevalence cannot explain
-# it. Measured on the shipped data: 1.04-1.06 for every feature below. v2's
-# unequal windows produced roughly 3x, so 1.25 fails loudly on the defect while
-# leaving ample room for ordinary sampling noise.
-MAGNITUDE_RATIO_CEILING = 1.25
+# taken over NEGATIVES only so a difference in ring prevalence between splits
+# cannot masquerade as scale drift.
+#
+# THE CEILING IS A BOUND, NOT A MEASUREMENT. The shipped splits sit at 1.09-1.11
+# for every feature below. An earlier version of this comment claimed 1.04-1.06;
+# that was wrong, and a guard whose stated margin is fictitious is worse than
+# none — it invites someone to "tighten it to the measured range" and trip a
+# false failure. 1.18 is chosen to clear the observed 1.11 with headroom for
+# regeneration noise, not measured: the true post-regen ratio cannot be known
+# until the pipeline is re-run on this machine. If the regen shows it well below
+# 1.18, tighten this and record the figure here.
+#
+# This is a SECONDARY guard. `test_split_windows_are_equal_length` bounds the
+# window spread to WINDOW_LENGTH_TOLERANCE_DAYS directly, which caps the
+# window-driven component of any magnitude ratio at ~2.5% on a ~60-day window;
+# v2's unequal windows produced roughly 3x and would fail THAT test first. What
+# this ceiling adds is a check on the effect the model actually sees, catching a
+# rescale regression that skews magnitudes without touching the day spans — e.g.
+# the v4 reference-window rescale of the amount sums being dropped.
+MAGNITUDE_RATIO_CEILING = 1.18
 
+# Per-split scale-stability probes. in_amount_sum and out_amount_sum are the
+# rescaled magnitudes this primarily guards — a dropped v4 rescale spikes their
+# ratio on unequal windows. txn_velocity is a rate and in_/out_degree are counts;
+# they are included because a large cross-split drift in ANY of them betrays
+# unequal windows regardless of feature kind. Named for the dominant case, not a
+# claim that every member is a magnitude.
 MAGNITUDE_FEATURES = (
     "in_amount_sum",
     "out_amount_sum",
@@ -87,6 +110,22 @@ MAGNITUDE_FEATURES = (
 
 
 def _span_days(df: pd.DataFrame) -> float:
+    """
+    Elapsed days between a split's first and last transaction.
+
+    `total_seconds() / 86_400` measures absolute elapsed time rather than
+    wall-clock days, and that is the right measure here rather than an accident of
+    convenience. Every timestamp that reaches this arithmetic is UTC: the
+    generator writes naive UTC, and the API converts each incoming edge to UTC in
+    `api/schemas.py` before `api/main.py` normalises the column with
+    `pd.to_datetime(..., utc=True)`. UTC has no daylight-saving discontinuity, so
+    a day is always 86,400 seconds and the ratio is exact.
+
+    Were a local-time series ever passed in, a DST transition would move a single
+    span by one hour — 0.042d against `WINDOW_LENGTH_TOLERANCE_DAYS` of 1.5d, so
+    even then it could not flip these assertions. Recording that here because the
+    division looks like the naive-day bug it is often mistaken for.
+    """
     return float(
         (df["timestamp"].max() - df["timestamp"].min()).total_seconds() / 86_400.0)
 
@@ -115,13 +154,27 @@ class TestTemporalOrder:
         )
 
     def test_train_val_test_are_strictly_ordered(self, raw_edges):
-        """Transitivity too, so a mis-ordered val cannot hide behind two pairs."""
+        """
+        Transitivity too, so a mis-ordered val cannot hide behind two pairs.
+
+        Strictly increasing, not merely sorted. The previous form compared each
+        list against `sorted(...)`, which is satisfied by ties: three splits that
+        all opened at the same instant would have passed. Nothing in the repo
+        makes that reachable today — the adjacent-boundary test above forces
+        `train_max < val_min < val_max < test_min`, which orders these lists
+        strictly as a side effect — but an assertion that only holds because a
+        sibling test holds is not the guard its docstring claims to be, and it is
+        the sibling that would be deleted first if the boundary rule ever changed.
+        """
         maxima = [raw_edges[s]["timestamp"].max() for s in SPLITS]
         minima = [raw_edges[s]["timestamp"].min() for s in SPLITS]
-        assert minima == sorted(minima) and maxima == sorted(maxima), (
-            f"splits are not in chronological order: "
-            f"starts {minima}, ends {maxima}"
-        )
+        for label, values in (("starts", minima), ("ends", maxima)):
+            assert all(a < b for a, b in zip(values, values[1:])), (
+                f"splits are not in strictly increasing order by {label}: "
+                + ", ".join(f"{s}={v}" for s, v in zip(SPLITS, values))
+                + ".\nEqual boundaries mean two windows open or close at the same "
+                  "instant, which is not a chronological ordering."
+            )
 
     def test_no_identical_transaction_in_two_splits(self, raw_edges):
         """
@@ -156,7 +209,26 @@ class TestEntityDisjointness:
     @pytest.mark.parametrize("a,b", ALL_PAIRS)
     def test_ring_members_are_disjoint_at_edge_level(self, raw_edges, a, b):
         """Uses the shipped definition of a ring member, not a copy of it."""
-        shared = ring_member_nodes(raw_edges[a]) & ring_member_nodes(raw_edges[b])
+        members_a = ring_member_nodes(raw_edges[a])
+        members_b = ring_member_nodes(raw_edges[b])
+        # Guard against a vacuous pass BEFORE trusting the disjointness below.
+        # `ring_member_nodes` keys off the edge-role column; rename or drop that
+        # column upstream and it returns the empty set for every split, at which
+        # point `empty & empty` is empty and this test goes green while asserting
+        # nothing about leakage. An empty result is itself a defect — the
+        # generator plants rings in every split (measured 209/136/124 members for
+        # train/val/test) — so require both operands non-empty first.
+        assert members_a, (
+            f"ring_member_nodes('{a}') returned no accounts. The generator plants "
+            f"rings in every split (measured 209/136/124 for train/val/test), so an "
+            f"empty set means the ring-member definition has stopped matching the "
+            f"data — and the disjointness assertion below would pass vacuously."
+        )
+        assert members_b, (
+            f"ring_member_nodes('{b}') returned no accounts — see the '{a}' "
+            f"assertion above; an empty operand makes the disjointness check vacuous."
+        )
+        shared = members_a & members_b
         assert not shared, (
             f"ENTITY LEAKAGE: {len(shared)} account(s) sit on a ring edge in both "
             f"'{a}' and '{b}'. Examples: {sorted(shared)[:5]}\n"
@@ -292,8 +364,10 @@ class TestEqualObservationWindows:
         assert drift <= WINDOW_LENGTH_TOLERANCE_DAYS, (
             f"SERVING SKEW: serving_context_edges.csv spans {context_span:.2f}d "
             f"against a trained window of {train_span:.2f}d (drift {drift:.2f}d).\n"
-            f"in_amount_sum, out_amount_sum and txn_velocity would be on a "
-            f"different scale at serving time than in training."
+            f"The amount features are rescaled to a reference window, but graph "
+            f"structure — degrees, reciprocity, clustering, cycle participation — "
+            f"is not, and would be measured over a different window at serving time "
+            f"than in training."
         )
 
     @pytest.mark.parametrize("feature", MAGNITUDE_FEATURES)
@@ -321,6 +395,60 @@ class TestEqualObservationWindows:
             f"distribution shift the model cannot see or correct for. The usual "
             f"cause is unequal observation windows."
         )
+
+    def test_window_scale_maps_window_length_to_the_reference(self):
+        """
+        The Tier-3a rescale, unit-tested directly — because the ratio ceiling above
+        cannot see it. The shipped splits are equal by construction
+        (`test_split_windows_are_equal_length`), so `window_scale` returns ~1.0 on
+        every one of them and dropping it would move no cross-split ratio far enough
+        to trip the 1.18 bound. The function the whole scale-free story rests on
+        therefore had no test that goes red when it breaks; this is that test.
+
+        `window_scale(w)` is what makes in_amount_sum, out_amount_sum and
+        repeat_ratio comparable between graphs of different length: a magnitude
+        watched over `w` days is multiplied by REFERENCE_WINDOW_DAYS / w, so a graph
+        watched twice as long is scaled back down by half. Two properties are
+        load-bearing:
+
+          • the reference window is a no-op, and the correction runs the right way
+            (longer window -> smaller multiplier). An inverted ratio would scale a
+            long-window graph UP and double the very skew the rescale exists to
+            remove, while still passing on the near-equal shipped splits.
+
+          • below MIN_WINDOW_DAYS_FOR_RESCALE the rescale switches OFF and returns
+            exactly 1.0. Without the floor a near-empty serving window divides by a
+            tiny number and multiplies every magnitude into nonsense, and a zero
+            window is a ZeroDivisionError rather than a score.
+        """
+        pytest.importorskip("networkx", reason="data.extractor imports networkx")
+        from data.extractor import (
+            MIN_WINDOW_DAYS_FOR_RESCALE,
+            REFERENCE_WINDOW_DAYS,
+            window_scale,
+        )
+
+        assert window_scale(REFERENCE_WINDOW_DAYS) == 1.0, (
+            "the reference window must be a no-op; a feature already measured over "
+            "REFERENCE_WINDOW_DAYS should not be touched."
+        )
+        assert window_scale(2 * REFERENCE_WINDOW_DAYS) == pytest.approx(0.5), (
+            "a graph watched twice as long must be scaled DOWN by half. A multiplier "
+            "of 2.0 here means the ratio is inverted and the rescale doubles the "
+            "skew instead of removing it."
+        )
+        assert window_scale(REFERENCE_WINDOW_DAYS / 2) == pytest.approx(2.0)
+        # Direction as an ordering, so a subtler sign error is still caught.
+        assert (window_scale(REFERENCE_WINDOW_DAYS / 2)
+                > window_scale(REFERENCE_WINDOW_DAYS)
+                > window_scale(2 * REFERENCE_WINDOW_DAYS)), (
+            "longer windows must map to smaller multipliers"
+        )
+
+        # The floor: strictly below the minimum, and at a zero window, the
+        # multiplier is exactly 1.0 rather than a blow-up or a divide-by-zero.
+        assert window_scale(MIN_WINDOW_DAYS_FOR_RESCALE / 2) == 1.0
+        assert window_scale(0.0) == 1.0
 
 
 # ══════════════════════════════════════════════════════════════════

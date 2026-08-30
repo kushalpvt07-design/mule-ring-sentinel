@@ -137,11 +137,19 @@ def frozen_partition(val_graph):
     This is exactly what api/main.py freezes at startup and passes into
     `compute_node_features`, and the reason design rule 5 holds at all — see
     tests/test_features.py.
+
+    `undirected_projection`, not `val_graph.to_undirected()`. The fixture used to
+    call the latter, mirroring what api/main.py did, and that pairing is why
+    tests/test_contract.py's TRAIN/SERVE parity check could not see the skew: a
+    fixture that reproduces the serving bug makes the two sides agree, so the
+    check passed on a projection neither training nor feature extraction used.
+    A fixture must be built the way production is *supposed* to be built, or it
+    tests the defect into place.
     """
     pytest.importorskip("community",
                         reason="python-louvain is required to partition")
-    from data.extractor import compute_louvain_communities
-    return compute_louvain_communities(val_graph.to_undirected())
+    from data.extractor import compute_louvain_communities, undirected_projection
+    return compute_louvain_communities(undirected_projection(val_graph))
 
 
 @pytest.fixture(scope="session")

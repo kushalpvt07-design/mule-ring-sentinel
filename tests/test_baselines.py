@@ -410,16 +410,24 @@ class TestSensitivityTableDoesNotPeekAtTest:
         """
         At the ratio the project actually ships, the sensitivity table must land
         on the very threshold the headline uses — because both are selected the
-        same way, on validation. Under the bug this was 0.2665 against a
-        validation threshold of 0.5908.
+        same way, on validation.
+
+        The bug this catches optimised the row on test labels. On the single run
+        where it was caught it put 0.2665 against a validation threshold of 0.5908,
+        a gap of 0.32. Those three figures are a record of that run and nothing
+        else: both thresholds are fitted quantities and have since moved. Read them
+        as the size of the failure, not as the geometry to expect — the assertion
+        below compares the table against whatever metrics.json currently publishes,
+        which is the only comparison that stays true across retrains.
         """
         _require_current_metrics(metrics)
         row = self._row_nearest_shipped_ratio(metrics)
         val_threshold = float(metrics["validation"]["cost_optimal"]["threshold"])
         got = float(row["val_threshold"])
-        # Tolerance covers the 13.33-vs-13.3333 rounding in the ratio grid,
-        # which can nudge the plateau; it is far tighter than the 0.32 gap the
-        # oracle bug produced.
+        # Tolerance covers the 13.33-vs-13.3333 rounding in the ratio grid, which
+        # can nudge the plateau. It is far tighter than the 0.32 gap the oracle bug
+        # produced on the run above — though note that gap scales with the
+        # threshold, so a smaller operating point makes this a weaker net.
         assert abs(got - val_threshold) < 0.05, (
             f"the sensitivity row at ratio {row['fn_fp_ratio']} reports "
             f"threshold {got:.4f}, but the validation-selected threshold is "
@@ -716,6 +724,18 @@ class TestEveryPolicyIsPricedUnderTheSameBudget:
         The budget must bind on VALIDATION, the split each threshold was chosen
         on. This is the constraint the table exists to impose; a row over the
         budget here means `threshold_for_alert_budget` was not what produced it.
+
+        TWO-SIDED ON PURPOSE
+        ────────────────────
+        `alerts <= budget` alone is satisfied by flagging nothing, which is the
+        one way a policy can appear in this table without being one. That is not
+        hypothetical: a one-line rule on a tie-heavy feature has no non-empty cut
+        that fits the cap, `threshold_for_alert_budget` returns its flag-nothing
+        operating point, and this assertion passed on a row reporting zero alerts
+        and the cost of every miss — while the column that was supposed to mark it
+        read `True` because it was a literal. So a policy declared feasible must
+        also raise at least one alert, and a policy declared infeasible must say
+        why.
         """
         _require_current_metrics(metrics)
         table = _block_or_skip(metrics, "capacity_fair_comparison")
@@ -723,12 +743,70 @@ class TestEveryPolicyIsPricedUnderTheSameBudget:
         for row in table:
             if row.get("val_threshold") is None:
                 continue                    # trivial policies have no threshold
-            assert float(row["val_alerts_per_1000"]) <= budget + 1e-6, (
+            alerts = float(row["val_alerts_per_1000"])
+            assert alerts <= budget + 1e-6, (
                 f"policy {row['policy']!r} raises "
                 f"{row['val_alerts_per_1000']} alerts per 1,000 on validation, "
                 f"over the stated budget of {budget}. The point of this table is "
                 f"that the constraint binds on every policy, not just the model."
             )
+            assert "feasible_under_budget" in row, (
+                f"policy {row['policy']!r} does not report "
+                f"feasible_under_budget. Keys present: {sorted(row)}. Without it "
+                f"an abstention is indistinguishable from a policy."
+            )
+            if row["feasible_under_budget"]:
+                assert alerts > 0.0, (
+                    f"policy {row['policy']!r} is marked feasible under the cap "
+                    f"but raises {alerts} alerts per 1,000 on validation. An "
+                    f"empty queue is affordable at every budget and is not a "
+                    f"policy; priced at the cost of every miss it becomes a "
+                    f"rival the model 'beats' without competing. Either the "
+                    f"feasibility verdict is hardcoded or "
+                    f"threshold_for_alert_budget stopped computing it."
+                )
+            else:
+                floor = row.get("val_strictest_nonempty_alerts_per_1000")
+                assert floor is not None and float(floor) > budget + 1e-6, (
+                    f"policy {row['policy']!r} is marked infeasible under the cap "
+                    f"but does not show a strictest non-empty queue above it "
+                    f"({floor!r} against a budget of {budget}). Infeasible has "
+                    f"exactly one meaning here — every non-empty cut this policy "
+                    f"can form is unaffordable — and the number that establishes "
+                    f"it has to be on the record."
+                )
+
+    def test_an_abstention_is_never_counted_as_a_policy(self, metrics):
+        """
+        `flag nothing` must be marked infeasible.
+
+        It is trivially inside every budget, which is exactly why it needs
+        excluding: it raises no alerts, so it pays for every miss, so it is
+        expensive, so any model at all "beats" it. models/report.py picks the
+        cheapest FEASIBLE non-model row as the rival to compare against, and with
+        this row eligible the comparison could be won against an abstention.
+
+        This is a value-level guard, not a reading of the code: the column was
+        `True` for every scored policy as a literal, and no test noticed.
+        """
+        _require_current_metrics(metrics)
+        table = _block_or_skip(metrics, "capacity_fair_comparison")
+        by_name = {str(r.get("policy")): r for r in table}
+        row = by_name.get("flag nothing")
+        assert row is not None, (
+            f"the capacity table has no 'flag nothing' row. Policies present: "
+            f"{sorted(by_name)}. It is the cost floor every real policy must "
+            f"beat and it is published so a reader can see that floor."
+        )
+        assert row["feasible_under_budget"] is False, (
+            "'flag nothing' is marked feasible under the cap. It is affordable "
+            "at any budget and it is an abstention, not a policy — leaving it "
+            "eligible lets the model's capped win be scored against a queue "
+            "nobody would staff because it is empty."
+        )
+        assert float(row["test_alerts_per_1000"]) == 0.0, (
+            "the 'flag nothing' row raises alerts, so it is mislabelled."
+        )
 
     def test_a_test_side_overflow_is_reported_not_hidden(self, metrics):
         """
@@ -888,11 +966,20 @@ class TestCalibrationDoesNotChangeTheRanking:
             f"not a calibrator — it is an undocumented change to the model."
         )
 
-    def test_the_calibrator_is_fitted_off_the_test_split(self, metrics):
+    def test_the_calibrator_is_fitted_off_the_test_split(self, metrics, node_features):
         """
         Fitting on test and reporting the improvement on test would measure what a
         calibrator can memorise. The block must state validation, for the same
         reason every threshold in this project does.
+
+        The three string assertions are necessary but forgeable: a calibrator
+        fitted on test still passes every one of them if `fitted_on="validation"`
+        was set by hand, or if `fit_platt_scaling(..., fit_on="validation")` was
+        called on the test scores. So this also checks the fit against the DATA.
+        The scaler publishes the sample count and positive count it was fitted on
+        (`n_fit`, `n_positive_fit`); those must equal the VALIDATION split's sizes.
+        A fit taken on test reports the test split's counts — which differ — and
+        fails here whatever the strings say.
         """
         _require_current_metrics(metrics)
         block = _block_or_skip(metrics, "probability_calibration")
@@ -902,6 +989,28 @@ class TestCalibrationDoesNotChangeTheRanking:
         )
         assert block["scaler"]["fit_on"] == "validation"
         assert block["measured_on"] == "test"
+
+        # The strings above are labels; these are the split's actual sizes. The
+        # Platt scaler is fitted on every validation row — X_val is a column subset
+        # of frames["val"] with no row filtering (models/train.py), so n_fit is the
+        # validation row count and n_positive_fit its positive count, exactly.
+        n_fit = int(block["scaler"]["n_fit"])
+        n_positive_fit = int(block["scaler"]["n_positive_fit"])
+        val_size = len(node_features["val"])
+        val_positives = int(node_features["val"][TARGET_COL].sum())
+        test_size = len(node_features["test"])
+        assert n_fit == val_size, (
+            f"the calibrator reports n_fit={n_fit}, but the validation split has "
+            f"{val_size} rows (test has {test_size}). A scaler fitted on validation "
+            f"is fitted on every validation row, so this mismatch means it was "
+            f"fitted on some other split — most likely test — whatever fitted_on "
+            f"claims."
+        )
+        assert n_positive_fit == val_positives, (
+            f"the calibrator reports n_positive_fit={n_positive_fit}, but the "
+            f"validation split carries {val_positives} positives. The fit was not "
+            f"taken on validation, whatever fitted_on claims."
+        )
 
     def test_the_calibration_gap_is_actually_reported(self, metrics):
         """
@@ -943,7 +1052,7 @@ class TestCalibrationDoesNotChangeTheRanking:
         y = (rng.uniform(size=4000) < 0.045).astype(int)
         raw = 1.0 / (1.0 + np.exp(-(2.4 * (rng.normal(size=4000) + 1.7 * y - 1.2))))
 
-        scaler = fit_platt_scaling(y, raw)
+        scaler = fit_platt_scaling(y, raw, fit_on="synthetic")
         calibrated = scaler.transform(raw)
         assert roc_auc(y, calibrated) == pytest.approx(roc_auc(y, raw), abs=1e-9)
 
@@ -968,7 +1077,7 @@ class TestCalibrationDoesNotChangeTheRanking:
         # Over-confident and biased high, the direction scale_pos_weight produces.
         skewed = 1.0 / (1.0 + np.exp(-(2.0 * np.log(truth / (1 - truth)) + 1.5)))
 
-        scaler = fit_platt_scaling(y, skewed)
+        scaler = fit_platt_scaling(y, skewed, fit_on="synthetic")
         fixed = scaler.transform(skewed)
         assert scaler.converged
         assert brier_score(y, fixed) < brier_score(y, skewed)
@@ -985,7 +1094,8 @@ class TestCalibrationDoesNotChangeTheRanking:
         return a confident-looking artefact.
         """
         with pytest.raises(ValueError, match="single-class"):
-            fit_platt_scaling(np.zeros(50, dtype=int), np.full(50, 0.3))
+            fit_platt_scaling(np.zeros(50, dtype=int), np.full(50, 0.3),
+                              fit_on="synthetic")
 
     def test_an_empty_reliability_bin_reports_no_frequency(self):
         """

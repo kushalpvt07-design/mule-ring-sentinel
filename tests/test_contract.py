@@ -76,8 +76,17 @@ CONTRACT_OWNER = PROJECT_ROOT / "models" / "features.py"
 # Names allowed to hold a list of feature names, each a DECLARED SUBSET of
 # FEATURE_COLS and checked as such below. Anything else that looks like a feature
 # list is a second source of truth and fails the scan.
+#
+# `FEATURE_COLS` is deliberately NOT here. It used to be — "the contract itself" —
+# but models/features.py, the one place that name legitimately holds a literal, is
+# already exempt as CONTRACT_OWNER below and never reaches this set. Listing the
+# name here instead granted the exemption to EVERY module: a 12-name v1 list
+# re-added to api/main.py under `FEATURE_COLS = [...]` would have been waved
+# through, which is the precise defect this scan exists to catch. Every other
+# module gets the contract by `from models.features import FEATURE_COLS` or
+# `list(FEATURE_COLS)` — an import or a call, neither of which is a list literal —
+# so removing the exemption cannot make a legitimate module fail.
 DECLARED_SUBSETS = {
-    "FEATURE_COLS",          # the contract itself
     "GRAPH_FEATURES",        # models/train.py — graph-ablation baseline
     "NON_GRAPH_FEATURES",    # models/train.py — its complement
     "LOG1P_COLS",            # models/train.py — heavy-tailed columns
@@ -184,18 +193,61 @@ class TestContractEnforcement:
 
         Parsed rather than grepped so a mention inside a docstring or a comment
         cannot satisfy it — only a real call site does.
+
+        AND the call site has to be on the path startup actually runs. The earlier
+        form collected every `Call` in the module and asked only whether
+        `assert_feature_contract` appeared among them, so a call left behind in a
+        dead helper — `def _unused(): assert_feature_contract(...)` — or parked
+        under `if False:` would satisfy it while the model loaded unchecked. That
+        is the same shape of defect the whole file guards: a guard that is present
+        but not reached. So this pins two things instead: the call is lexically
+        inside the `lifespan` coroutine, and `lifespan` is the one handed to
+        `FastAPI(lifespan=...)`, i.e. the code the server runs on the way up.
         """
         tree = ast.parse((PROJECT_ROOT / "api" / "main.py").read_text(
             encoding="utf-8"))
-        called = {
+
+        lifespan = next(
+            (n for n in ast.walk(tree)
+             if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
+             and n.name == "lifespan"),
+            None)
+        assert lifespan is not None, (
+            "api/main.py has no `lifespan` function. Startup is where the feature "
+            "contract has to be enforced — a model whose columns do not line up "
+            "with FEATURE_COLS scores every account wrong without raising."
+        )
+
+        called_in_lifespan = {
             node.func.id
-            for node in ast.walk(tree)
+            for node in ast.walk(lifespan)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         }
-        assert "assert_feature_contract" in called, (
-            "api/main.py never CALLS assert_feature_contract. This is exactly how "
-            "a stale sentinel_v1.xgb was served against v3's threshold: the check "
-            "was written, imported, and never invoked."
+        assert "assert_feature_contract" in called_in_lifespan, (
+            "api/main.py never CALLS assert_feature_contract on the startup path. "
+            "This is exactly how a stale sentinel_v1.xgb was served against v3's "
+            "threshold: the check was written, imported, and never invoked. A call "
+            "elsewhere in the module — a dead helper, an `if False:` — does not "
+            "count, because the server does not run it."
+        )
+
+        def _is_fastapi(func: ast.expr) -> bool:
+            return ((isinstance(func, ast.Name) and func.id == "FastAPI")
+                    or (isinstance(func, ast.Attribute) and func.attr == "FastAPI"))
+
+        registered = any(
+            _is_fastapi(node.func)
+            and any(kw.arg == "lifespan"
+                    and isinstance(kw.value, ast.Name)
+                    and kw.value.id == "lifespan"
+                    for kw in node.keywords)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+        )
+        assert registered, (
+            "api/main.py defines `lifespan` but does not pass it to "
+            "FastAPI(lifespan=lifespan). An unregistered lifespan never runs, so "
+            "the contract check inside it would not fire at startup."
         )
 
 
@@ -424,6 +476,156 @@ class TestTrainServeParity:
             f"actual training span of {expected:.3f}d"
         )
 
+    def test_the_score_path_threads_the_frozen_partition(self):
+        """
+        The serving path must score against the partition frozen at startup, not
+        one recomputed per request.
+
+        This is the api/main.py half of design rule 5, and it had no test. The
+        stability guarantee in tests/test_features.py is asserted by handing
+        `compute_node_features(partition=frozen_partition)` the frozen partition on
+        BOTH sides of the perturbation — which proves the extractor RESPECTS a
+        frozen partition, but says nothing about whether the serving code still
+        PASSES one. Deleting `partition=STATE.reference_partition` from
+        score_transactions, or replacing it with a per-request
+        `compute_louvain_communities(...)`, would silently reintroduce the exact
+        defect rule 5 exists to prevent — two strangers in the same request batch
+        moving an unrelated account's community feature — and every test in
+        test_features.py would stay green, because none of them run this function.
+
+        Static rather than behavioural for the reason section 5 gives: exercising
+        the real path needs a loaded booster, the context graph and a populated
+        STATE, i.e. standing the service up. The deletion worth catching is
+        structural and visible in the AST, so it is caught here where it needs
+        nothing installed.
+        """
+        tree = ast.parse((PROJECT_ROOT / "api" / "main.py").read_text(
+            encoding="utf-8"))
+
+        score_fn = next(
+            (n for n in ast.walk(tree)
+             if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
+             and n.name == "score_transactions"),
+            None)
+        assert score_fn is not None, (
+            "api/main.py has no `score_transactions` — the serving entry point "
+            "this check pins the frozen partition to."
+        )
+
+        def _is_frozen_partition(value: ast.expr) -> bool:
+            # STATE.reference_partition — the partition computed once at startup.
+            return (isinstance(value, ast.Attribute)
+                    and value.attr == "reference_partition"
+                    and isinstance(value.value, ast.Name)
+                    and value.value.id == "STATE")
+
+        threaded = any(
+            (isinstance(node.func, ast.Name)
+             and node.func.id == "compute_node_features")
+            and any(kw.arg == "partition" and _is_frozen_partition(kw.value)
+                    for kw in node.keywords)
+            for node in ast.walk(score_fn)
+            if isinstance(node, ast.Call)
+        )
+        assert threaded, (
+            "score_transactions does not call compute_node_features(partition="
+            "STATE.reference_partition). Without the frozen partition threaded in, "
+            "the serving path repartitions per request, and two unrelated accounts "
+            "submitted together can move each other's community_internal_ratio — "
+            "the defect design rule 5 and tests/test_features.py exist to prevent, "
+            "which those tests cannot see because they never run this function."
+        )
+
+        repartitions = [
+            node.func.id
+            for node in ast.walk(score_fn)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "compute_louvain_communities"
+        ]
+        assert not repartitions, (
+            "score_transactions calls compute_louvain_communities — it "
+            "repartitions on the request. The partition is frozen ONCE at startup "
+            "(STATE.reference_partition) precisely so that the accounts in one "
+            "request cannot change one another's community feature."
+        )
+
+    def test_startup_freezes_the_partition_on_the_projection_not_the_multigraph(
+        self
+    ):
+        """
+        The startup half of finding 4. The reference partition is frozen on the
+        WEIGHTED UNDIRECTED PROJECTION of the context graph —
+        `undirected_projection(build_graph(ctx))` — because that is the graph
+        `compute_node_features` scores against. The test above pins the request
+        half (that the frozen partition is threaded into scoring); this pins that
+        the thing frozen is the right graph in the first place.
+
+        The defect is `.to_undirected()` in place of `undirected_projection`. On
+        the context MultiDiGraph networkx resolves a reciprocal pair by letting one
+        direction's attribute dict overwrite the other's, and `best_partition`
+        optimises WEIGHTED modularity — so the frozen partition became an optimum of
+        a graph that discarded ~5.7% of the context file's transaction weight and
+        that nothing else in the system ever built. Every request then scored
+        against a partition fitted to the wrong graph.
+
+        Static, and by AST rather than substring: the comment on the fixed line
+        quotes `.to_undirected()` verbatim to say what the code must NOT do, so a
+        text search would match the very comment documenting the fix. The AST
+        carries no comments, so a `.to_undirected()` call is visible here only if
+        the code actually makes one.
+        """
+        tree = ast.parse((PROJECT_ROOT / "api" / "main.py").read_text(
+            encoding="utf-8"))
+
+        lifespan = next(
+            (n for n in ast.walk(tree)
+             if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
+             and n.name == "lifespan"),
+            None)
+        assert lifespan is not None, (
+            "api/main.py has no `lifespan` — the startup path this check pins the "
+            "frozen partition's construction to."
+        )
+
+        def _sets_reference_partition(assign: ast.Assign) -> bool:
+            return any(
+                (isinstance(t, ast.Attribute) and t.attr == "reference_partition")
+                or (isinstance(t, ast.Name) and t.id == "reference_partition")
+                for t in assign.targets)
+
+        partition_assigns = [
+            n for n in ast.walk(lifespan)
+            if isinstance(n, ast.Assign) and _sets_reference_partition(n)]
+        assert partition_assigns, (
+            "lifespan never assigns reference_partition — the partition is no "
+            "longer frozen at startup at all."
+        )
+
+        on_projection = any(
+            any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                and c.func.id == "undirected_projection"
+                for c in ast.walk(a.value))
+            for a in partition_assigns)
+        assert on_projection, (
+            "the reference partition is frozen on something other than "
+            "undirected_projection(...). Built on build_graph(ctx) directly or on "
+            "`.to_undirected()`, Louvain optimises weighted modularity over a graph "
+            "the scoring path never uses, and the frozen partition is an optimum of "
+            "the wrong graph."
+        )
+
+        to_undirected = [
+            n for n in ast.walk(lifespan)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "to_undirected"]
+        assert not to_undirected, (
+            "lifespan calls `.to_undirected()`. On the context MultiDiGraph that "
+            "collapses reciprocal pairs by last-write-wins and discards transaction "
+            "weight; the projection the features are computed on is "
+            "`undirected_projection`, which sums parallel edges. Freezing the "
+            "partition on the wrong one is finding 4."
+        )
+
     @pytest.mark.slow
     def test_merge_with_context_reassembles_the_graph_exactly(
         self, raw_edges, frozen_partition, val_graph
@@ -489,6 +691,200 @@ class TestTrainServeParity:
             f"TRAIN/SERVE SKEW: {len(drifted)} feature(s) differ between the "
             f"training-time computation and the same edges routed through "
             f"merge_with_context: {drifted}"
+        )
+
+    def test_a_late_batch_neither_moves_the_window_nor_trims_the_context(
+        self, raw_edges
+    ):
+        """
+        FINDING 5. The observation window is anchored to the latest CONTEXT
+        transaction, so a batch dated after the context end still scores — its own
+        edges are never trimmed — but it cannot slide the window forward and delete
+        the oldest context edges, which belong to accounts with nothing to do with
+        the request.
+
+        The defect was `window_end = max(submitted.max(), context.max())`. Against
+        the shipped context a four-transaction batch dated 20 days late dropped a
+        third of the graph, every request still reporting the window comparable.
+        This submits a batch dated well past the context end and asserts the window
+        did not move and no context was trimmed — while also asserting the batch
+        really did fall outside, so the test cannot pass by the batch quietly
+        landing in-window.
+        """
+        pytest.importorskip("fastapi", reason="api.main imports FastAPI")
+        pytest.importorskip("xgboost", reason="api.main imports xgboost")
+        import pandas as pd
+
+        from api.main import merge_with_context
+
+        cols = ["sender", "receiver", "amount", "timestamp"]
+        context = (raw_edges["val"][cols]
+                   .sort_values("timestamp", kind="mergesort")
+                   .reset_index(drop=True))
+        ctx_max = context["timestamp"].max()
+        span_days = float(
+            (ctx_max - context["timestamp"].min()).total_seconds() / 86_400.0)
+
+        # A batch dated 20 days AFTER the context ends. Under the old anchor this
+        # slides window_end to ctx_max + 20d and trims 20 days off the FRONT of the
+        # context.
+        late = pd.DataFrame({
+            "sender": ["LATE_A", "LATE_B"],
+            "receiver": ["LATE_C", "LATE_D"],
+            "amount": [11.0, 22.0],
+            "timestamp": [ctx_max + pd.Timedelta(days=20),
+                          ctx_max + pd.Timedelta(days=20)],
+        })
+        # Window a hair wider than the true span, so on the fixed code the trim
+        # keeps every context edge and the only thing that could drop one is the
+        # window sliding.
+        _, diag = merge_with_context(late, context, window_days=span_days + 0.01)
+
+        assert diag["window_end"] == ctx_max, (
+            f"the window moved to {diag['window_end']} — a submitted batch dated "
+            f"after the context end ({ctx_max}) slid it forward. The window must be "
+            f"anchored to the context, not to the merged maximum."
+        )
+        assert diag["n_context_used"] == len(context), (
+            f"{len(context) - diag['n_context_used']} context edges were trimmed by "
+            f"a batch that postdates the context. Nothing the caller sends may drop "
+            f"an unrelated account's history."
+        )
+        # Prove the batch genuinely fell outside the window — otherwise the two
+        # assertions above would hold vacuously for an in-window batch.
+        assert diag["n_submitted_outside_window"] == len(late), (
+            "the late batch was not recognised as outside the window; this test is "
+            "not exercising the anchoring rule it claims to."
+        )
+        assert diag["submitted_days_after_window_end"] > 0
+
+    def test_an_exact_replay_of_a_context_edge_is_de_duplicated_and_counted(
+        self, raw_edges
+    ):
+        """
+        FINDING 8. `build_graph` aggregates weight and total_amount, so a
+        transaction present in BOTH the request and the context file would be
+        counted twice, inflating in_amount_sum, out_amount_sum, repeat_ratio,
+        txn_velocity and burst_ratio for both endpoints. The 422 for an
+        out-of-window batch tells the caller to date transactions inside the
+        context window, and the context file ships in the repo — so replaying a
+        context row is the obvious first request, and it was silently mis-scored.
+
+        Exact matches on (sender, receiver, amount, timestamp) are dropped keeping
+        the context copy, and the count is reported. This submits three exact
+        replays of context rows alongside two genuinely new edges, and asserts the
+        three were counted and dropped while the two new ones survived.
+        """
+        pytest.importorskip("fastapi", reason="api.main imports FastAPI")
+        pytest.importorskip("xgboost", reason="api.main imports xgboost")
+        import pandas as pd
+
+        from api.main import merge_with_context
+
+        cols = ["sender", "receiver", "amount", "timestamp"]
+        context = (raw_edges["val"][cols]
+                   .sort_values("timestamp", kind="mergesort")
+                   .reset_index(drop=True))
+        # The de-dup count is only unambiguous if the context has no internal
+        # 4-field duplicate to begin with — which the serving context is documented
+        # not to. Assert it, so a future context file that breaks the assumption
+        # explains itself here instead of skewing the count.
+        assert not context.duplicated(subset=cols).any(), (
+            "the context split already contains rows identical on "
+            "(sender, receiver, amount, timestamp); the replay count below would "
+            "not be attributable to the submitted batch alone."
+        )
+
+        replays = context.head(3).copy()          # three exact replays
+        ctx_max = context["timestamp"].max()
+        fresh = pd.DataFrame({                      # two genuinely new, in-window
+            "sender": ["NEW_A", "NEW_B"],
+            "receiver": ["NEW_C", "NEW_D"],
+            "amount": [1.0, 2.0],
+            "timestamp": [ctx_max, ctx_max],
+        })
+        submitted = pd.concat([replays, fresh], ignore_index=True)
+
+        span_days = float(
+            (ctx_max - context["timestamp"].min()).total_seconds() / 86_400.0)
+        merged, diag = merge_with_context(
+            submitted, context, window_days=span_days + 0.01)
+
+        assert diag["n_duplicates_dropped"] == 3, (
+            f"expected 3 exact replays to be counted, got "
+            f"{diag['n_duplicates_dropped']}. A bare concat reports none and "
+            f"double-counts every replayed edge's weight and amount."
+        )
+        assert len(merged) == len(context) + 2, (
+            f"merged graph has {len(merged)} edges; expected {len(context) + 2} "
+            f"(the full context plus the two new edges, the three replays dropped). "
+            f"Without de-duplication it would be {len(context) + 5}."
+        )
+
+    def test_the_comparability_warning_names_the_v4_rescaled_features(
+        self, raw_edges
+    ):
+        """
+        FINDING 9. When the effective window drifts from the trained one the
+        warning must describe the v4 residual, not the v3 one. v3 named the three
+        MAGNITUDE features as the risk; data/extractor.py now rescales
+        in_amount_sum, out_amount_sum and repeat_ratio to a 60-day reference
+        window, so magnitude is no longer the problem and what remains is graph
+        STRUCTURE. An earlier draft named `txn_velocity` as the third scaling
+        feature, which was backwards — txn_velocity divides by the account's own
+        active span, so it is already a rate.
+
+        This forces the not-comparable branch with a trained window far from the
+        observed span (no trim, no replay, no out-of-window edge, so this is the
+        only warning raised) and asserts the message names repeat_ratio and does
+        NOT name txn_velocity — the exact wording error the v3 text carried.
+        """
+        pytest.importorskip("fastapi", reason="api.main imports FastAPI")
+        pytest.importorskip("xgboost", reason="api.main imports xgboost")
+        import pandas as pd
+
+        from api.main import merge_with_context
+
+        cols = ["sender", "receiver", "amount", "timestamp"]
+        context = (raw_edges["val"][cols]
+                   .sort_values("timestamp", kind="mergesort")
+                   .reset_index(drop=True))
+        ctx_max = context["timestamp"].max()
+        span_days = float(
+            (ctx_max - context["timestamp"].min()).total_seconds() / 86_400.0)
+
+        one_in_window = pd.DataFrame({
+            "sender": ["Q1"], "receiver": ["Q2"], "amount": [5.0],
+            "timestamp": [ctx_max],
+        })
+        # Trained window far longer than the observed span: drift is large, so the
+        # comparability check trips. window_start lands well before the context
+        # begins, so nothing is trimmed and no other warning fires.
+        _, diag = merge_with_context(
+            one_in_window, context, window_days=span_days + 50.0)
+
+        assert diag["comparable"] is False, (
+            "the not-comparable branch did not fire; this test is not exercising "
+            "the comparability warning."
+        )
+        # Isolate the comparability warning by its unique closing phrase, so the
+        # de-dup warning (which legitimately names txn_velocity) can never be the
+        # one inspected.
+        warnings = [w for w in diag["warnings"] if "indicative only" in w]
+        assert len(warnings) == 1, (
+            f"expected exactly one comparability warning, got {len(warnings)}: "
+            f"{diag['warnings']}"
+        )
+        message = warnings[0]
+        assert "repeat_ratio" in message, (
+            "the comparability warning does not name repeat_ratio among the "
+            "rescaled magnitude features. The v3 text named txn_velocity here, "
+            "which is a rate, not a level."
+        )
+        assert "txn_velocity" not in message, (
+            "the comparability warning still names txn_velocity as a window-scaling "
+            "feature. It is normalised by the account's active span and does not "
+            "scale with the observation window; naming it here is the v3 error."
         )
 
 
