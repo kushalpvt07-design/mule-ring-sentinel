@@ -430,7 +430,10 @@ def _node_tooltip(
                 lines.append(f"{feature}: {float(row[feature]):.4f}")
 
     lines.append("")
-    lines.append(f"in-degree {graph.in_degree(node)} / out-degree {graph.out_degree(node)}")
+    lines.append(
+        f"degree within this view: {graph.in_degree(node)} in / "
+        f"{graph.out_degree(node)} out"
+    )
     return "\n".join(lines)
 
 
@@ -676,17 +679,27 @@ def render_graph_visualization(data: dict) -> None:
         seeds = _top_seeds(nodes, pd.Series(True, index=nodes.index), seed_count, ascending=False)
         subtitle = "The accounts the model considers riskiest, whatever the truth turns out to be."
     elif mode == "Worst false positives":
-        seeds = _top_seeds(nodes, nodes["is_mule"] == 0, seed_count, ascending=False)
+        # A false positive is a LEGITIMATE account the model FLAGS (score ≥ t),
+        # not merely a high-scoring legitimate one. Consult the threshold so the
+        # label holds by construction, not just usually at the shipped t.
+        fp_mask = (nodes["is_mule"] == 0) & (nodes["risk_score"] >= threshold)
+        seeds = _top_seeds(nodes, fp_mask, seed_count, ascending=False)
         subtitle = (
-            "The legitimate accounts the model scores highest. This is the "
-            "false-positive cost the track's bar asks about, with faces on it — "
-            "each one is a customer who would have been frozen or called."
+            "Legitimate accounts the model flags at the current threshold — the "
+            "false-positive cost the track's bar asks about, with faces on it. "
+            "Each one is a customer whose account would have gone to an analyst "
+            "for review."
         )
     elif mode == "Missed mules":
-        seeds = _top_seeds(nodes, nodes["is_mule"] == 1, seed_count, ascending=True)
+        # A missed mule is a labelled mule the model does NOT flag (score < t) —
+        # threshold-aware too, so this is a real miss and not merely the
+        # lowest-scoring mule, which may itself still be above the threshold.
+        miss_mask = (nodes["is_mule"] == 1) & (nodes["risk_score"] < threshold)
+        seeds = _top_seeds(nodes, miss_mask, seed_count, ascending=True)
         subtitle = (
-            "Labelled mules the model scores lowest. Look at what they lack: "
-            "usually a closed cycle, which is the signal the detector leans on."
+            "Labelled mules the model leaves below the current threshold. Look "
+            "at what they lack: usually a closed cycle, which is the signal the "
+            "detector leans on."
         )
     else:
         typed = st.text_input("Account id", key="graph_account").strip()
@@ -724,13 +737,6 @@ def render_graph_visualization(data: dict) -> None:
     # ── Stats ─────────────────────────────────────────────────────────────
     view_nodes = nodes[nodes["node"].isin(kept_nodes)]
     in_view_mules = int((view_nodes["is_mule"] == 1).sum())
-    if have_scores:
-        flagged_mask = view_nodes["risk_score"] >= threshold
-        in_view_flagged = int(flagged_mask.sum())
-        in_view_fp = int((flagged_mask & (view_nodes["is_mule"] == 0)).sum())
-        in_view_fn = int((~flagged_mask & (view_nodes["is_mule"] == 1)).sum())
-    else:
-        in_view_flagged = in_view_fp = in_view_fn = 0
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Accounts shown", graph.number_of_nodes())
@@ -738,9 +744,22 @@ def render_graph_visualization(data: dict) -> None:
                 help=f"{len(kept_edges):,} individual transactions collapsed into "
                      f"one edge per ordered pair.")
     col3.metric("Labelled mules in view", in_view_mules)
-    col4.metric("Flagged in view", in_view_flagged,
-                delta=f"{in_view_fp} false / {in_view_fn} missed",
-                delta_color="inverse")
+    if have_scores:
+        flagged_mask = view_nodes["risk_score"] >= threshold
+        in_view_flagged = int(flagged_mask.sum())
+        in_view_fp = int((flagged_mask & (view_nodes["is_mule"] == 0)).sum())
+        in_view_fn = int((~flagged_mask & (view_nodes["is_mule"] == 1)).sum())
+        col4.metric("Flagged in view", in_view_flagged,
+                    delta=f"{in_view_fp} false / {in_view_fn} missed",
+                    delta_color="inverse")
+    else:
+        # The model is unavailable, so there is nothing to flag. Showing 0 here
+        # (with "0 false / 0 missed") would read as "the model flagged nothing
+        # and made no errors" — a fabricated clean bill of health, the same
+        # zero-for-unknown this page was rebuilt to avoid. Say so instead.
+        col4.metric("Flagged in view", "—",
+                    help="Model scores are unavailable, so nothing in this view "
+                         "is flagged — this is 'no information', not zero alerts.")
 
     # ── Legend, generated from the same dict that paints the nodes ────────
     legend = " &nbsp;|&nbsp; ".join(

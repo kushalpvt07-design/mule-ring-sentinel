@@ -52,11 +52,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dashboard.scoring import ModelUnavailable, ScoredSplit, score_split  # noqa: E402
+from dashboard.scoring import (  # noqa: E402
+    ModelUnavailable,
+    ScoredSplit,
+    resolve_threshold,
+    score_split,
+)
 from models.cost_matrix import (  # noqa: E402
     DEFAULT_FN_COST,
     DEFAULT_FP_COST,
     CostEvaluator,
+    _fmt,
 )
 
 SLIDER_MIN = 0.01
@@ -64,7 +70,7 @@ SLIDER_MAX = 0.99
 SLIDER_STEP = 0.005
 
 
-@st.cache_data(show_spinner="Scoring the held-out split with the real model...")
+@st.cache_data(show_spinner="Scoring the selected split with the real model...")
 def _scored(split: str) -> tuple[np.ndarray, np.ndarray, pd.Series, pd.DataFrame]:
     """
     Cached real scores, plus the feature frame they came from.
@@ -86,13 +92,14 @@ def _plot_cost_curve(
     optimal_threshold: float,
     baseline_cost: float | None,
     baseline_label: str | None,
+    split_label: str,
 ) -> go.Figure:
     """Cost and precision/recall against threshold, with the baseline drawn in."""
     fig = make_subplots(
         rows=2,
         cols=1,
         subplot_titles=(
-            "Total financial cost vs. threshold (held-out split, real model)",
+            f"Total financial cost vs. threshold ({split_label} split, real model)",
             "Precision / recall / F1 tradeoff",
         ),
         vertical_spacing=0.15,
@@ -266,10 +273,13 @@ def render_cost_slider(data: dict) -> None:
 
     st.markdown(
         "Every number on this page is computed from **real `predict_proba` "
-        "output** of the trained model on the **held-out test split** — the "
-        "split neither training nor threshold selection ever saw. Move the "
-        "slider to trade missed mules (FN) against false alarms on legitimate "
-        "accounts (FP)."
+        "output** of the trained model — no stored scalars. Pick the split to "
+        "evaluate below. The operating threshold is always the one **selected "
+        "on the validation split** (never on the split being scored), so the "
+        "cost you read on *test* is an honest out-of-sample number rather than "
+        "the oracle you would get by tuning the threshold on the same data you "
+        "then report. Move the slider to trade missed mules (FN) against false "
+        "alarms on legitimate accounts (FP)."
     )
 
     split = st.radio(
@@ -293,8 +303,14 @@ def render_cost_slider(data: dict) -> None:
                "memorisation, not detection.")
         )
 
+    # The radio shows "validation" but the file on disk is val_features.csv.
+    # Same alias graph_viz.py:600 and app.py already use; without it the
+    # "validation" button raises ModelUnavailable and tells the viewer to
+    # regenerate data that is already correct.
+    file_split = {"validation": "val"}.get(split, split)
+
     try:
-        y_true, y_proba, ring_type, frame = _scored(split)
+        y_true, y_proba, ring_type, frame = _scored(file_split)
     except ModelUnavailable as exc:
         st.error(str(exc))
         return
@@ -321,7 +337,6 @@ def render_cost_slider(data: dict) -> None:
         )
 
     evaluator = CostEvaluator(fn_cost=fn_cost, fp_cost=fp_cost)
-    optimal = evaluator.find_optimal_threshold(y_true, y_proba)
     break_even = evaluator.break_even_probability
 
     st.caption(
@@ -331,17 +346,62 @@ def render_cost_slider(data: dict) -> None:
         f"threshold is an economic quantity, not a default of 0.5."
     )
 
+    # ── Threshold SELECTION happens on validation, never on the split shown ──
+    # find_optimal_threshold's own docstring: it "MUST be given validation data.
+    # Running it on the test split and then reporting the result is
+    # threshold-selection-on-test." Selecting it on `y_true`/`y_proba` (the
+    # displayed split, default test) is exactly that, and train.py files the
+    # identical call's output under `oracle_threshold_diagnostic` with a "never
+    # quote these numbers as performance" warning. So it is selected on `val`.
+    val_y_true, val_y_proba, _, _ = _scored("val")
+    optimal = evaluator.find_optimal_threshold(val_y_true, val_y_proba)
+
+    # At the published prices the honest operating point is the one metrics.json
+    # already published (chosen on validation at train time); the slider opens
+    # there so this page and the Overview agree on the same split. When the
+    # viewer edits the prices that published point no longer applies, so it opens
+    # on the optimum just re-selected on validation at their prices.
+    default_prices = (
+        int(fn_cost) == int(DEFAULT_FN_COST)
+        and int(fp_cost) == int(DEFAULT_FP_COST)
+    )
+    published: float | None = None
+    if default_prices:
+        try:
+            published = resolve_threshold(metrics)
+        except ModelUnavailable:
+            published = None
+    if published is not None:
+        operating = published
+        threshold_source = "selected on validation and published in metrics.json"
+    else:
+        operating = optimal.threshold
+        threshold_source = (
+            "re-selected on the validation split at your FN/FP prices"
+            if not default_prices
+            else "re-selected on validation (metrics.json carried no threshold)"
+        )
+
     st.markdown("### Decision threshold")
-    default_threshold = float(np.clip(optimal.threshold, SLIDER_MIN, SLIDER_MAX))
+    default_threshold = float(np.clip(operating, SLIDER_MIN, SLIDER_MAX))
     threshold = st.slider(
         "Threshold",
         min_value=SLIDER_MIN, max_value=SLIDER_MAX,
         value=default_threshold, step=SLIDER_STEP,
-        help="Accounts with risk score ≥ threshold are flagged for human review.",
+        help=(
+            f"Opens at the operating threshold {threshold_source}. Accounts "
+            "with risk score ≥ threshold are flagged for human review."
+        ),
     )
 
     report = evaluator.evaluate_at_threshold(y_true, y_proba, threshold)
     cost_df = evaluator.cost_curve(y_true, y_proba)
+    # The val-selected optimum's cost ON THE DISPLAYED SPLIT — evaluate (never
+    # re-select) on what is shown, so every "vs optimal" comparison below is like
+    # for like with `report`, which is also on the displayed split.
+    optimal_on_display = evaluator.evaluate_at_threshold(
+        y_true, y_proba, optimal.threshold
+    )
 
     baseline_name, baseline = None, None
     selected = _baseline_rule(metrics)
@@ -355,12 +415,12 @@ def render_cost_slider(data: dict) -> None:
     col1, col2, col3, col4 = st.columns(4)
     col1.metric(
         "Total cost", f"₹{report.total_cost:,.0f}",
-        delta=f"₹{report.total_cost - optimal.total_cost:+,.0f} vs optimal",
+        delta=f"₹{report.total_cost - optimal_on_display.total_cost:+,.0f} vs optimal",
         delta_color="inverse",
     )
-    col2.metric("Precision", f"{report.precision:.3f}")
-    col3.metric("Recall", f"{report.recall:.3f}")
-    col4.metric("F1", f"{report.f1:.3f}")
+    col2.metric("Precision", _fmt(report.precision, ".3f"))
+    col3.metric("Recall", _fmt(report.recall, ".3f"))
+    col4.metric("F1", _fmt(report.f1, ".3f"))
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("True positives", report.tp)
@@ -412,9 +472,9 @@ def render_cost_slider(data: dict) -> None:
             ],
             f"Model @ {threshold:.3f}": [
                 f"₹{report.total_cost:,.0f}",
-                f"{report.precision:.3f}",
-                f"{report.recall:.3f}",
-                f"{report.f1:.3f}",
+                _fmt(report.precision, ".3f"),
+                _fmt(report.recall, ".3f"),
+                _fmt(report.f1, ".3f"),
                 f"{report.fp:,}",
                 f"{report.fn:,}",
                 f"{report.alert_rate:.1%}",
@@ -438,24 +498,35 @@ def render_cost_slider(data: dict) -> None:
         )
 
     if abs(threshold - optimal.threshold) > SLIDER_STEP:
-        extra = report.total_cost - optimal.total_cost
+        extra = report.total_cost - optimal_on_display.total_cost
+        if extra >= 0:
+            tail = f"Your {threshold:.3f} costs ₹{extra:,.0f} more on this split."
+        else:
+            tail = (
+                f"Your {threshold:.3f} happens to cost ₹{-extra:,.0f} less on "
+                f"this split — the validation-selected point need not be the "
+                f"minimum of another split's cost curve, and that gap is the "
+                f"price of not tuning on the data you report."
+            )
         st.info(
-            f"The cost-optimal threshold at these prices is "
-            f"**{optimal.threshold:.4f}** (total cost ₹{optimal.total_cost:,.0f}). "
-            f"Your {threshold:.3f} costs ₹{extra:,.0f} more."
+            f"The cost-optimal threshold at these prices, **selected on "
+            f"validation**, is **{optimal.threshold:.4f}** "
+            f"(₹{optimal_on_display.total_cost:,.0f} on this split). {tail}"
         )
 
     if optimal.plateau_width is not None:
         st.caption(
-            f"The optimum sits on a cost plateau {optimal.plateau_lo:.4f}–"
-            f"{optimal.plateau_hi:.4f} wide ({optimal.n_equivalent} thresholds "
-            f"tie on cost); the reported value is its midpoint. A single "
-            f"minimum-cost point would be an artefact of one account's score."
+            f"On the validation split the optimum sits on a cost plateau "
+            f"spanning {optimal.plateau_lo:.4f}–{optimal.plateau_hi:.4f} "
+            f"(width {optimal.plateau_width:.4f}; {optimal.n_equivalent} "
+            f"thresholds tie on minimum cost there), and the reported value is "
+            f"its midpoint. A single minimum-cost point would be an artefact of "
+            f"one account's score."
         )
 
     st.plotly_chart(
         _plot_cost_curve(cost_df, threshold, optimal.threshold,
-                         baseline_cost, baseline_label),
+                         baseline_cost, baseline_label, split),
         use_container_width=True,
     )
 
