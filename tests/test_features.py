@@ -10,7 +10,7 @@ models/features.py, which cites this file by name:
 
        tests/test_features.py asserts this: perturb the graph with disconnected
        accounts, require bit-identical values for every feature except pagerank,
-       and require pagerank within PAGERANK_PERTURBATION_TOLERANCE.
+       and require pagerank to hold both its scale and its rank order.
 
 ─────────────────────────────────────────────────────────────────────────────
 WHY THIS IS THE MOST IMPORTANT TEST IN THE FILE
@@ -29,18 +29,20 @@ customers. Nothing raised, and no metric would have shown it.
 The fix is not to drop the feature but to stop redrawing communities per request:
 serving computes the partition once and passes it into `compute_node_features`,
 which extends it deterministically. This file asserts the fixed path holds the
-line — every feature except pagerank bit-identical, pagerank within
-PAGERANK_PERTURBATION_TOLERANCE — so that deleting the `partition=` plumbing fails
-the build instead of silently reintroducing the defect.
+line — every feature except pagerank bit-identical, and pagerank holding both its
+scale and its rank order — so that deleting the `partition=` plumbing fails the
+build instead of silently reintroducing the defect.
 
-PageRank is exempt because it is a global fixpoint over a normalised rank vector:
-strictly every node shifts when any node is added. That is the definition, not a
-bug. What matters is the magnitude, and it stays negligible next to the 0.29 that
-made community_internal_ratio unusable. The bound is
-PAGERANK_PERTURBATION_TOLERANCE (1e-3 on the v4 mean-1.0 column); see its
-definition below for why it is a bound rather than the v3 measurement of 9.5e-06,
-which was taken on the differently scaled raw column and no longer describes what
-is emitted. The Windows retrain re-measures it.
+PageRank is exempt from BIT-identity because it is a global fixpoint over a
+normalised rank vector, and the solver that computes it stops at a tolerance
+rather than at a fixed point. It is not exempt from the invariant, and the
+invariant here is stronger than "small": for a disconnected addition the emitted
+`pagerank × N` column is EXACTLY unchanged in exact arithmetic, because the ×N
+cancels the teleport rescale in full. See
+PAGERANK_PERTURBATION_RELATIVE_TOLERANCE below for that derivation and for why
+the v3 figure of 9.5e-06 — measured on the differently scaled raw column — could
+not be carried over, and why the absolute 1e-3 that replaced it was the wrong
+shape of bound rather than the wrong number.
 
 Usage:
     pytest tests/test_features.py -v
@@ -57,29 +59,75 @@ from models.features import FEATURE_COLS, LABEL_META_COLS, METADATA_COLS, TARGET
 
 SPLITS = ("train", "val", "test")
 
-# Design rule 5's tolerance for pagerank. models/features.py names this constant
-# and defers its value to here: it is a BOUND, not a measurement.
+# Design rule 5's budget for pagerank. models/features.py names this constant and
+# defers its value to here.
 #
-# v4 emits pagerank as pagerank × N (a multiple of the uniform 1/N baseline), so
-# the column's mean is 1.0 by construction. The v3 guard allowed an absolute 1e-4
-# on a raw column whose mean was 1/N ≈ 3.4e-4 — 29% of a typical value, while the
-# largest drift ever seen there was 1.0e-5, so "within 1e-4" sounded tight and was
-# nearly vacuous. On the mean-1.0 column, 1e-3 is ~290x tighter in relative terms;
-# and because the ×N scaling cancels the 1/N-renormalisation term that was most of
-# that 1e-5 drift to first order, the residual should be smaller still. It is set
-# as a bound the cancellation argument clears comfortably, because the perturbation
-# cannot be re-measured until the Windows retrain runs. If that run shows the true
-# residual orders of magnitude below 1e-3, tighten this and record the figure — an
-# unmeasured tolerance is how the v3 one drifted to 29%.
-PAGERANK_PERTURBATION_TOLERANCE = 1e-3
+# WHY IT IS RELATIVE AND NOT ABSOLUTE
+# ───────────────────────────────────
+# v3 allowed an absolute 1e-4 on the raw column, whose mean is 1/N ≈ 3.4e-4. When
+# v4 began emitting `pagerank × N`, that budget was moved to 1e-3 — one order of
+# magnitude, eyeballed — on a column whose scale had grown by a factor of
+# N ≈ 3,000. The retrain measured 6.9e-3 and the test failed. Widening it again
+# would be the third guess at a number that should never have been absolute:
+# `pagerank` is defined as a multiple of the graph's OWN uniform baseline, so a
+# fixed budget on it means a different thing in every graph it is applied to.
+#
+# WHAT THE CORRECT BOUND IS, DERIVED RATHER THAN FITTED
+# ────────────────────────────────────────────────────
+# For the perturbation this file applies — two new accounts transacting only with
+# each other — the emitted column is EXACTLY invariant, not approximately. The
+# probe pair is a closed component: no edge enters it from the main graph and none
+# leaves it. PageRank's teleport is uniform, so the only quantity the addition
+# changes for a main-component node is the teleport magnitude, (1-d)/N → (1-d)/N'.
+# The main component's linear system is otherwise untouched, so every pre-existing
+# RAW value scales by exactly N/N' — and emitting `raw × N'` cancels that
+# precisely: raw_i · (N/N') · N' = raw_i · N. The expected drift is ZERO.
+#
+# So the 6.9e-3 that was measured is neither a centrality shift nor a regression
+# in the scaling. It is `nx.pagerank`'s power-iteration residual (it stops when
+# the L1 change falls below N · tol, with tol=1e-6) read on a column N times
+# larger than the vector the solver actually converged. That residual is a
+# property of the solver, the platform and the networkx version, so pinning it
+# tightly would buy flakiness rather than safety.
+#
+# The budget below is therefore relative to the column's own largest value, with
+# deliberate headroom: measured 4.1e-4 of the maximum on val (6.9e-3 against a max
+# of 16.9), bounded at 1e-2. It is the backstop, not the real guard. The two sharp
+# assertions sit beside it, and neither can be satisfied by noise:
+# PAGERANK_PERTURBATION_RANK_CORRELATION pins the ordering the trees actually
+# split on, and TestEmittedValues::test_pagerank_is_a_multiple_of_the_uniform_
+# baseline pins the ×N scaling itself. That last one is load-bearing for this
+# constant: without it a relative budget would pass VACUOUSLY if someone deleted
+# the scaling, because a raw 1/N column drifts by ~1e-5 in absolute terms and
+# clears any relative bound trivially.
+PAGERANK_PERTURBATION_RELATIVE_TOLERANCE = 1e-2
+
+# Spearman correlation required between the pre- and post-perturbation pagerank
+# columns. This is the assertion that matches the claim data/extractor.py and
+# api/main.py both make in prose — "rank correlation > 0.9999, which moved no
+# decision" — and it is the one that matters for this model: gradient-boosted
+# trees split on order, so order is the thing that has to hold.
+PAGERANK_PERTURBATION_RANK_CORRELATION = 0.9999
 
 # Features that are mathematically confined to [0, 1]. Asserted on the emitted
 # data because a value outside the range means the arithmetic is wrong, not that
 # the data is unusual.
+#
+# `pagerank` is deliberately NOT in this list. It was, and it belonged here while
+# the raw pagerank vector was emitted: that sums to 1, so every entry is in [0, 1]
+# by construction. v4 emits `pagerank × N`, a multiple of the uniform baseline
+# with mean exactly 1.0, and a value above 1 is the normal case rather than an
+# arithmetic error — the shipped splits reach 13.6 / 16.9 / 21.4. Leaving it here
+# asserted the OLD definition, so it failed on correct output. Its replacement
+# invariant is test_pagerank_is_a_multiple_of_the_uniform_baseline, which is
+# strictly stronger than a range check: a bound of [0, ∞) would have been
+# satisfied by any non-negative garbage, while "mean is exactly 1.0" can only be
+# satisfied by the scaling actually being applied. Removing it from this tuple
+# also adds it to NON_NEGATIVE_FEATURES below, which is derived as the complement,
+# so the lower bound is not lost.
 BOUNDED_UNIT_FEATURES = (
     "degree_balance",
     "flow_passthrough",
-    "pagerank",
     "clustering_coefficient",
     "cycle_participation",
     "reciprocity",
@@ -191,26 +239,53 @@ class TestPerturbationStability:
         """
         PageRank is exempt from bit-identity but not from a bound.
 
-        It is a global fixpoint, so every node shifts by construction; the
-        question is whether the shift is small enough to be irrelevant to a
-        decision. The bound is PAGERANK_PERTURBATION_TOLERANCE — 1e-3 on the v4
-        mean-1.0 column, a bound the cancellation argument clears comfortably
-        rather than a re-measurement (see the constant's definition). The v3
-        figure of 9.5e-06 was measured on the raw 1/N-scaled column and does not
-        carry over to what is emitted now; the Windows retrain re-measures it.
+        The exemption is narrower than it looks. For THIS perturbation the emitted
+        column is exactly invariant in exact arithmetic — the probe pair is a closed
+        component, so the only thing that changes for a pre-existing account is the
+        uniform teleport magnitude, every raw value scales by exactly N/N', and the
+        ×N' emission cancels it. See PAGERANK_PERTURBATION_RELATIVE_TOLERANCE for
+        the derivation. So the expected drift is zero and the residual measured here
+        is `nx.pagerank`'s power-iteration tolerance amplified by N, which is a
+        property of the solver rather than of the feature.
+
+        That is why the magnitude check is relative and generous while the rank
+        check is tight. A regression in the ×N scaling shows up as a rank change or
+        as a mean that is no longer 1.0, not as a slightly larger residual.
         """
         common = base_features.index
         before = base_features["pagerank"].to_numpy(dtype=float)
         after = perturbed_features.loc[common, "pagerank"].to_numpy(dtype=float)
+
         worst = float(np.abs(after - before).max())
-        assert worst <= PAGERANK_PERTURBATION_TOLERANCE, (
-            f"pagerank moved by up to {worst:.3e}, above the "
-            f"{PAGERANK_PERTURBATION_TOLERANCE:.0e} budget in design rule 5. A "
-            f"global centrality is allowed to drift when the graph grows, but not "
-            f"enough to change a verdict. If this fires just over the bound, "
-            f"re-measure on the retrained graph before loosening it: the ×N scaling "
-            f"should cancel most of the 1/N drift, so a large residual is more "
-            f"likely a regression in that scaling than a real centrality shift."
+        scale = float(np.abs(before).max())
+        budget = PAGERANK_PERTURBATION_RELATIVE_TOLERANCE * scale
+        assert worst <= budget, (
+            f"pagerank moved by up to {worst:.3e} on a column whose largest value "
+            f"is {scale:.4f} — {worst / scale:.2e} of full scale, above the "
+            f"{PAGERANK_PERTURBATION_RELATIVE_TOLERANCE:.0e} relative budget in "
+            f"design rule 5.\n"
+            f"Adding two accounts that transact only with each other should move "
+            f"this column by EXACTLY nothing: the probe pair is a closed component, "
+            f"so ×N cancels the teleport rescale in full. A residual this large is "
+            f"not solver noise. Check that compute_pagerank_vs_uniform is still "
+            f"multiplying by G.number_of_nodes() of the SAME graph it ranked, and "
+            f"that the probe accounts really are disconnected."
+        )
+
+        # The assertion that matches what the model consumes. Trees split on order,
+        # so an ordering that survives the perturbation is the operative claim —
+        # and it is the claim data/extractor.py and api/main.py both make in prose.
+        # Spearman via ranks + Pearson, so this needs no scipy.
+        ranked_before = pd.Series(before).rank().to_numpy()
+        ranked_after = pd.Series(after).rank().to_numpy()
+        rho = float(np.corrcoef(ranked_before, ranked_after)[0, 1])
+        assert rho >= PAGERANK_PERTURBATION_RANK_CORRELATION, (
+            f"pagerank's rank order changed after the perturbation (Spearman "
+            f"{rho:.6f} < {PAGERANK_PERTURBATION_RANK_CORRELATION}). The magnitude "
+            f"budget above can be met by a column that has been quietly reordered; "
+            f"this cannot. Reordering means the trees see different splits for "
+            f"accounts the perturbation never touched, which is design rule 5's "
+            f"actual failure mode."
         )
 
     def test_no_pre_existing_account_changes_community(
@@ -305,11 +380,74 @@ class TestArithmeticAgainstAnIndependentImplementation:
     attributes, so a naive implementation silently drops every repeat transaction
     between the same pair — 86% of pairs here — and every sum, count and rate
     comes out wrong while still looking plausible.
+
+    ON THE WINDOW RESCALE, AND WHY THIS STAYS AN INDEPENDENT IMPLEMENTATION
+    ──────────────────────────────────────────────────────────────────────
+    Three of the five features below — `in_amount_sum`, `out_amount_sum` and
+    `repeat_ratio` — are emitted on a 60-day reference window rather than raw (see
+    `data/extractor.py::window_scale`). This fixture knew nothing about that and so
+    disagreed with correct output for ~97% of accounts, by exactly the rescale
+    factor: 0.034% on the shipped test split, whose window is 59.979 days.
+
+    The recomputation now applies the same normalisation, and the way it does so is
+    the point. It imports the two DECLARED CONSTANTS, `REFERENCE_WINDOW_DAYS` and
+    `MIN_WINDOW_DAYS_FOR_RESCALE`, and derives the factor itself from the edge
+    file's own timestamps. It deliberately does NOT call `window_scale()` or
+    `observation_window_days()`. Calling either would make the comparison circular
+    — the extractor's own helper on both sides of an equals sign proves only that
+    the helper is deterministic — whereas re-deriving the span from the raw CSV
+    still fails if the extractor measures the wrong window, applies the factor to
+    the wrong features, applies it twice, or applies it in the wrong order relative
+    to its 2-decimal rounding. Knowing the declared UNIT of a column is not the
+    same as borrowing its implementation.
+
+    One consequence worth naming: if a future regeneration produces a split
+    spanning exactly REFERENCE_WINDOW_DAYS, the factor is 1.0 and these three
+    assertions quietly degenerate into the raw comparison they used to be. That is
+    still a valid check of the summation, just a weaker check of the rescale.
+    `test_the_window_rescale_is_actually_exercised` fails loudly in that case
+    rather than letting the coverage evaporate silently.
     """
 
     @classmethod
     @pytest.fixture(scope="class")
-    def reference(cls, raw_edges) -> pd.DataFrame:
+    def window_rescale(cls, raw_edges) -> float:
+        """
+        The reference window factor for the test split, derived from the raw edge
+        file without touching the extractor's own window helpers.
+
+        Integer nanoseconds and the same day divisor the extractor uses, so this is
+        the identical arithmetic reached by an independent route — not a
+        floating-point approximation of it that would leave every comparison
+        hostage to a rounding boundary.
+
+        PIN THE UNIT BEFORE CASTING TO int64. `to_numpy(dtype="datetime64[ns]")`
+        is not decoration; it is the whole correctness of this fixture, and it is
+        the same idiom `data/extractor.py:267` uses for the same reason. An
+        unpinned `pd.to_datetime(...).astype("int64")` returns epoch counts in
+        WHATEVER resolution pandas happened to infer while parsing — seconds for
+        ISO strings on newer pandas, nanoseconds on older — so the divisor below
+        silently becomes wrong by a factor of a billion. That is not hypothetical:
+        this fixture shipped that way for one run. The span came out at 6e-8 days,
+        fell through the `< MIN_WINDOW_DAYS_FOR_RESCALE` branch, returned exactly
+        1.0, and took three recomputation assertions down with it while passing
+        cleanly on the pandas version it was written against. Deriving a fact
+        independently is worth nothing if the derivation is environment-dependent.
+        """
+        from data.extractor import (MIN_WINDOW_DAYS_FOR_RESCALE,
+                                    REFERENCE_WINDOW_DAYS)
+
+        stamps = (raw_edges["test"]["timestamp"]
+                  .to_numpy(dtype="datetime64[ns]")
+                  .astype("int64"))
+        span_days = float((stamps.max() - stamps.min()) / 86_400_000_000_000)
+        if span_days < MIN_WINDOW_DAYS_FOR_RESCALE:
+            return 1.0
+        return REFERENCE_WINDOW_DAYS / span_days
+
+    @classmethod
+    @pytest.fixture(scope="class")
+    def reference(cls, raw_edges, window_rescale) -> pd.DataFrame:
         edges = raw_edges["test"]
         pairs = (edges.groupby(["sender", "receiver"], sort=False)
                  .agg(total_amount=("amount", "sum")).reset_index())
@@ -320,10 +458,17 @@ class TestArithmeticAgainstAnIndependentImplementation:
             nodes).fillna(0).astype(int)
         out["out_degree"] = pairs.groupby("sender").size().reindex(
             nodes).fillna(0).astype(int)
-        out["in_amount_sum"] = pairs.groupby("receiver")["total_amount"].sum().reindex(
-            nodes).fillna(0.0).round(2)
-        out["out_amount_sum"] = pairs.groupby("sender")["total_amount"].sum().reindex(
-            nodes).fillna(0.0).round(2)
+
+        # Scale THEN round, in that order: the extractor rounds the rescaled rupee
+        # figure, so rounding first here would disagree in the last paisa for a
+        # value sitting near a boundary and the failure would read as an arithmetic
+        # bug rather than an ordering one.
+        raw_in = pairs.groupby("receiver")["total_amount"].sum().reindex(
+            nodes).fillna(0.0)
+        raw_out = pairs.groupby("sender")["total_amount"].sum().reindex(
+            nodes).fillna(0.0)
+        out["in_amount_sum"] = (raw_in * window_rescale).round(2)
+        out["out_amount_sum"] = (raw_out * window_rescale).round(2)
 
         # Distinct UNDIRECTED counterparties, then transactions per counterparty.
         both_ways = pd.concat([
@@ -338,9 +483,58 @@ class TestArithmeticAgainstAnIndependentImplementation:
             edges.groupby("sender").size(),
             edges.groupby("receiver").size(),
         ]).groupby(level=0).sum().reindex(nodes).fillna(0)
+        # Not rounded, because the extractor does not round this one.
         out["repeat_ratio"] = (
-            n_txns / n_counterparties.replace(0, np.nan)).fillna(0.0)
+            (n_txns / n_counterparties.replace(0, np.nan)) * window_rescale
+        ).fillna(0.0)
         return out
+
+    def test_the_window_rescale_is_actually_exercised(self, raw_edges,
+                                                      window_rescale):
+        """
+        Guard against a vacuous pass in the three rescaled features above.
+
+        If the test split ever spans exactly the reference window the factor is
+        1.0, the recomputation stops distinguishing rescaled output from raw, and
+        three assertions silently become weaker without anyone editing them. The
+        shipped span is 59.979 days, giving 1.000343.
+
+        The span is re-derived here rather than read off the fixture, because the
+        two ways of arriving at a factor of exactly 1.0 need telling apart and only
+        the span separates them: a split that genuinely spans REFERENCE_WINDOW_DAYS
+        is a legitimate loss of coverage, whereas a span of 6e-8 days means the
+        timestamps were read in the wrong RESOLUTION and fell through the
+        `< MIN_WINDOW_DAYS_FOR_RESCALE` branch. This test has already caught the
+        second case once, and reported it as the first — hence the split assertion.
+        """
+        from data.extractor import MIN_WINDOW_DAYS_FOR_RESCALE
+
+        # Same pinned-unit idiom as the fixture and as data/extractor.py:267.
+        stamps = (raw_edges["test"]["timestamp"]
+                  .to_numpy(dtype="datetime64[ns]")
+                  .astype("int64"))
+        span_days = float((stamps.max() - stamps.min()) / 86_400_000_000_000)
+
+        assert span_days >= MIN_WINDOW_DAYS_FOR_RESCALE, (
+            f"the test split's span reads as {span_days!r} days, under "
+            f"MIN_WINDOW_DAYS_FOR_RESCALE ({MIN_WINDOW_DAYS_FOR_RESCALE}), so "
+            f"window_rescale returns 1.0 and the three rescaled comparisons below "
+            f"degenerate to raw. A file of ~60 days of transactions cannot really "
+            f"span under a day: the likely cause is an epoch count read in the "
+            f"wrong resolution — seconds or microseconds rather than nanoseconds — "
+            f"which is off by a factor of a billion and looks exactly like this. "
+            f"Pin the unit with to_numpy(dtype='datetime64[ns]') before casting to "
+            f"int64; do not trust whatever resolution pandas inferred at parse."
+        )
+        assert window_rescale != 1.0, (
+            f"the window rescale factor for the test split is exactly 1.0 off a "
+            f"span of {span_days} days, so test_matches_a_plain_pandas_recomputation "
+            f"no longer distinguishes a correctly rescaled in_amount_sum / "
+            f"out_amount_sum / repeat_ratio from an unrescaled one. The span is "
+            f"sane, so this is the legitimate case: either the split now spans "
+            f"exactly REFERENCE_WINDOW_DAYS, or the rescale has been switched off. "
+            f"Neither is wrong on its own; losing the coverage without noticing is."
+        )
 
     @pytest.mark.parametrize("feature", [
         "in_degree", "out_degree", "in_amount_sum", "out_amount_sum", "repeat_ratio",
@@ -424,8 +618,66 @@ class TestEmittedValues:
                 f"outside [0, 1]."
             )
 
+    @pytest.mark.parametrize("split", SPLITS)
+    def test_pagerank_is_a_multiple_of_the_uniform_baseline(
+        self, node_features, split
+    ):
+        """
+        `pagerank` replaced a [0, 1] range check with this, and it is the stronger
+        assertion of the two.
+
+        The column is `raw_pagerank × N` — a multiple of the graph's uniform 1/N
+        baseline, so "2.0" reads as "twice as central as the average account"
+        whether the graph holds 3,000 accounts or 300,000. Raw PageRank sums to 1,
+        so the emitted column sums to exactly N and its MEAN is exactly 1.0. That
+        is an identity, not a distributional fact about this data, which is why it
+        can be asserted this tightly: the shipped splits sit within 2.3e-16 of it.
+
+        Why this beats the range check it replaced. `[0, 1]` was true of the raw
+        column and false of this one, so it failed on correct output; the obvious
+        repair, widening to `[0, ∞)`, would have been satisfied by any non-negative
+        garbage — including the raw column with the ×N scaling deleted, which is
+        precisely the regression worth catching. "Mean is exactly 1.0" can only be
+        satisfied by the scaling being applied to the right node count. It is also
+        what makes design rule 5's relative perturbation budget non-vacuous; see
+        PAGERANK_PERTURBATION_RELATIVE_TOLERANCE.
+
+        The lower bound is not lost: removing `pagerank` from BOUNDED_UNIT_FEATURES
+        adds it to NON_NEGATIVE_FEATURES, which is derived as the complement and is
+        asserted by test_unbounded_features_are_non_negative directly below.
+        """
+        values = node_features[split]["pagerank"]
+        n = len(values)
+        mean = float(values.mean())
+        assert abs(mean - 1.0) < 1e-12, (
+            f"'{split}' pagerank has mean {mean:.12f}, not 1.0. The column is "
+            f"defined as raw pagerank × N and raw pagerank sums to 1, so the mean "
+            f"is 1.0 by identity for any N. A mean near 1/{n} means "
+            f"compute_pagerank_vs_uniform is emitting the raw vector; any other "
+            f"value means it multiplied by a node count that is not this graph's."
+        )
+        assert values.max() > 1.0, (
+            f"'{split}' pagerank never exceeds 1.0 (max {values.max():.6f}) even "
+            f"though its mean is 1.0, which means the column is constant. A "
+            f"centrality that does not vary carries no signal and would have been "
+            f"silently accepted by the [0, 1] range check this test replaced."
+        )
+
     @pytest.mark.parametrize("feature", NON_NEGATIVE_FEATURES)
     def test_unbounded_features_are_non_negative(self, node_features, feature):
+        """
+        The lower half of the bound for every feature that is NOT confined to
+        [0, 1]: counts, sums, rates, dispersions and `pagerank` are all unbounded
+        above and all floored at zero.
+
+        This test is the reason `pagerank` could be removed from
+        BOUNDED_UNIT_FEATURES without losing anything. NON_NEGATIVE_FEATURES is
+        derived as the complement of that tuple, so deleting a name from there
+        moves it here automatically and the floor follows it across. Keep the two
+        tuples complementary: if a feature ends up in neither, it is asserted by
+        nothing at all, and `test_columns_match_the_contract_exactly` will not
+        notice because the column still exists.
+        """
         for split in SPLITS:
             worst = node_features[split][feature].min()
             assert worst >= 0.0, (

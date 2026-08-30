@@ -23,6 +23,18 @@ path that can ban, block, freeze, suspend, terminate, disable, revoke, seize or
 close anything, and that is enforced at import time and by test, not by
 convention. See [Defense-only, by construction](#defense-only-by-construction).
 
+**The data is synthetic, and that is the first thing to know before reading any
+number below.** No labelled UPI mule-ring dataset exists publicly, so the traffic
+and the rings were generated here — which makes every metric exactly as
+trustworthy as the generator's assumptions, and those assumptions are written
+down rather than buried. What this establishes is a *mechanism*: these features
+separate these ring archetypes, and the leakage gate demonstrates that no single
+column carries the label. What it does not establish is that real mule rings take
+these shapes, and no amount of work inside this repo could — that needs labelled
+production data. See [Why a Custom Synthetic
+Generator?](#why-a-custom-synthetic-generator) for why an off-the-shelf simulator
+would not do, and [Limitations](#limitations) for the full scope boundary.
+
 ---
 
 ### Why a Custom Synthetic Generator?
@@ -38,41 +50,55 @@ Real-world payment graphs carry no ground-truth labels for unflagged accounts, w
 
 <!-- METRICS:BEGIN -->
 
-Held-out **test** split, threshold selected on **validation** (never on test). Model `sentinel_v3`, 18 features, trained 2026-08-27T09:15:43+00:00.
+Held-out **test** split, threshold selected on **validation** (never on test). Model `sentinel_v4`, 18 features, trained 2026-08-30T16:14:21+00:00.
 
 | | |
 |---|---|
-| ROC-AUC | 0.9693 (95% CI 0.947–0.988) |
-| Average precision | 0.8037 |
-| Precision | 33.5% |
-| Recall | 87.1% |
-| F1 | 0.484 |
-| Operating threshold | 0.1836 |
-| Total cost on test | ₹64,10,000 |
+| ROC-AUC | 0.9739 (95% CI 0.952–0.990) |
+| Average precision | 0.7997 |
+| Precision | 42.9% |
+| Recall | 87.3% |
+| F1 | 0.575 |
+| Operating threshold | 0.1257 |
+| Total cost on test | ₹47,20,000 |
 
 Costs are assumptions, not measurements: a missed mule is priced at ₹2,00,000 and a false alert at ₹15,000 — a ratio of 13.3333 : 1. Only the ratio sets the threshold. The break-even probability that follows from it is **6.98%**, which is also the break-even *precision* of the alert queue: any queue cleaner than that is cheaper to work than to ignore.
 
 ### What it cost to pick the threshold honestly
 
-The operating threshold 0.1836 was chosen on validation, where it scored recall 91.2% at precision 37.5%. Applied unchanged to test it gives recall 87.1% at precision 33.5% — recall fell, precision fell, and neither was tuned to make that happen.
+The operating threshold 0.1257 was chosen on validation, where it scored recall 87.4% at precision 50.9%. Applied unchanged to test it gives recall 87.3% at precision 42.9% — recall fell, precision fell, and neither was tuned to make that happen.
 
-Had the threshold been chosen *with test labels in hand* it would have been 0.5408 and cost ₹58,60,000 instead of ₹64,10,000. **That ₹5,50,000 difference — 9% of the reported total — is the price of not peeking**, and it is published because the alternative — quietly reporting the cheaper number — is the exact failure this repo already shipped once.
+Had the threshold been chosen *with test labels in hand* it would have been 0.0700 and cost ₹45,00,000 instead of ₹47,20,000. **That ₹2,20,000 difference — 5% of the reported total — is the price of not peeking**, and it is published because the alternative — quietly reporting the cheaper number — is the exact failure this repo already shipped once.
 
-The run flagged this risk before test was ever touched: the validation cost plateau spans 0.1834–0.1837, width 0.0004 — **narrow**, so the training run warned in advance that this threshold might be fitted to validation noise. Total cost is a step function of the threshold, so a narrow plateau means the minimum was a knife-edge rather than a basin, which is precisely when a validation-selected cutoff transfers poorly.
+The run flagged this risk before test was ever touched: the validation cost plateau spans 0.1256–0.1259, width 0.0002 — **narrow**, so the training run warned in advance that this threshold might be fitted to validation noise. Total cost is a step function of the threshold, so a narrow plateau means the minimum was a knife-edge rather than a basin, which is precisely when a validation-selected cutoff transfers poorly.
 
 ### Calibration, and why the threshold is not the break-even p\*
 
-Break-even p\* is the correct score cutoff only for a *calibrated* model, and this one is deliberately not calibrated: `scale_pos_weight` trades calibration away to fight 4.3% prevalence, and the scores come out inflated. Mean predicted probability is 0.0872 against an actual rate of 0.0433; Brier score 0.0297, expected calibration error 0.0439.
+Break-even p\* is the correct score cutoff only for a *calibrated* model, and this one is deliberately not calibrated: `scale_pos_weight` trades calibration away to fight 3.6% prevalence, and the scores come out inflated. Mean predicted probability is 0.0461 against an actual rate of 0.0360; Brier score 0.0162, expected calibration error 0.0101.
 
 | score bin | accounts | mean predicted | observed rate |
 |---|---|---|---|
-| `[0.0, 0.2)` | 2555 | 0.0202 | 0.0063 |
-| `[0.2, 0.4)` | 90 | 0.2903 | 0.0778 |
-| `[0.4, 0.6)` | 53 | 0.5044 | 0.0943 |
-| `[0.6, 0.8)` | 54 | 0.7118 | 0.1481 |
-| `[0.8, 1.0)` | 114 | 0.9386 | 0.7719 |
+| `[0.0, 0.2)` | 2877 | 0.0090 | 0.0073 |
+| `[0.2, 0.4)` | 61 | 0.2856 | 0.1967 |
+| `[0.4, 0.6)` | 20 | 0.5095 | 0.2500 |
+| `[0.6, 0.8)` | 22 | 0.7036 | 0.1818 |
+| `[0.8, 1.0)` | 75 | 0.9579 | 0.9067 |
 
 The model over-states risk in **every** bin, the top one included, so the scores are not probabilities. That is why p\* is used here as a statement about the **alert queue** — break-even precision — and never as a score cutoff. The cutoff is the empirical validation optimum. Reporting p\* as though it were the operating threshold would be arithmetically tidy and wrong.
+
+### How far off the probabilities are
+
+A two-parameter Platt map (a logistic fit on the score log-odds) was fitted on **validation** and measured on **test**, the same split discipline every threshold here follows. Slope 0.7801, intercept -0.8744: it shrinks the log-odds — the signature of **over**-confident scores, spread wider than the evidence supports, which is the expected effect of `scale_pos_weight`. Two parameters rather than an isotonic fit because the validation split carries only 127 positives, and a free-form monotone fit on that many points memorises them.
+
+| | raw | calibrated | change |
+|---|---|---|---|
+| Brier score | 0.01621 | 0.01409 | -0.00212 |
+| Expected calibration error | 0.01005 | 0.00496 | -0.00509 |
+| ROC-AUC | 0.97386 | 0.97386 | +0.000000 |
+
+ROC-AUC does not move at all — the map is monotone, so it can compress two adjacent scores into a tie but cannot swap a pair. **The alert queue is in the same order.** That is what makes this a diagnostic and not an undisclosed model change: nothing above or below this section is computed on the calibrated scale.
+
+The map is reported and never applied. The operating threshold in the headline table was selected on the raw scores, so calibrating underneath it would move the published precision, recall and cost without changing a single number in this README. If a downstream consumer needs scores that read as probabilities — expected-loss arithmetic, or blending with another model's output — apply this map at that boundary and re-select the threshold on the calibrated scale.
 
 ### Does the operating point survive a different cost ratio?
 
@@ -80,12 +106,12 @@ The FN:FP ratio is the one number in the cost model nobody can verify, so a resu
 
 | FN:FP | break-even p\* | threshold (val) | test precision | test recall | test cost |
 |---|---|---|---|---|---|
-| 2.0 : 1 | 33.33% | 0.7363 | 69.7% | 74.2% | ₹15,60,000 |
-| 5.0 : 1 | 16.67% | 0.6614 | 60.9% | 76.6% | ₹30,90,000 |
-| 10.0 : 1 | 9.09% | 0.2261 | 36.4% | 86.3% | ₹53,55,000 |
-| 13.333333333333334 : 1 | 6.98% | 0.1836 | 33.5% | 87.1% | ₹64,10,000 |
-| 25.0 : 1 | 3.85% | 0.1471 | 31.2% | 90.3% | ₹82,05,000 |
-| 50.0 : 1 | 1.96% | 0.1028 | 26.6% | 93.5% | ₹1,08,00,000 |
+| 2.0 : 1 | 33.33% | 0.5745 | 72.3% | 66.4% | ₹15,30,000 |
+| 5.0 : 1 | 16.67% | 0.4094 | 65.8% | 70.0% | ₹30,75,000 |
+| 10.0 : 1 | 9.09% | 0.2301 | 53.8% | 78.2% | ₹47,10,000 |
+| 13.333333333333334 : 1 | 6.98% | 0.1257 | 42.9% | 87.3% | ₹47,20,000 |
+| 25.0 : 1 | 3.85% | 0.0686 | 35.1% | 91.8% | ₹61,80,000 |
+| 50.0 : 1 | 1.96% | 0.0284 | 25.1% | 94.5% | ₹91,50,000 |
 
 ### Does the model earn its complexity?
 
@@ -93,30 +119,62 @@ Every row is priced on the same cost model, with each baseline's own threshold a
 
 | | precision | recall | F1 | alerts/1k | total cost |
 |---|---|---|---|---|---|
-| flag nothing | — | 0.0% | — | 0.0 | ₹2,48,00,000 |
-| flag everything | 4.3% | 100.0% | 0.083 | 1000.0 | ₹4,11,30,000 |
-| one-line rule: `cycle_participation >= 0.0524` | 16.4% | 91.9% | 0.278 | 242.5 | ₹1,07,15,000 |
-| logistic regression, same features | 24.6% | 80.7% | 0.377 | 141.7 | ₹93,90,000 |
-| XGBoost, no graph features | 46.7% | 79.0% | 0.587 | 73.3 | ₹68,80,000 |
-| **XGBoost, full model** | **33.5%** | **87.1%** | **0.484** | **112.4** | **₹64,10,000** |
+| flag nothing | — | 0.0% | — | 0.0 | ₹2,20,00,000 |
+| flag everything | 3.6% | 100.0% | 0.070 | 1000.0 | ₹4,41,75,000 |
+| one-line rule: `cycle_participation >= 0.0736` | 11.1% | 85.5% | 0.196 | 278.2 | ₹1,45,40,000 |
+| logistic regression, same features | 17.1% | 78.2% | 0.281 | 164.3 | ₹1,10,40,000 |
+| XGBoost, no graph features | 38.7% | 80.9% | 0.523 | 75.3 | ₹63,15,000 |
+| **XGBoost, full model** | **42.9%** | **87.3%** | **0.575** | **73.3** | **₹47,20,000** |
 
-Against the identical model trained without them, graph features avoid ₹4,70,000 of cost and move average precision by +0.0189.
+Against the identical model trained without them, graph features avoid ₹15,95,000 of cost and move average precision by +0.0400.
 
-That cost figure flatters them, and the reason is worth stating: with a miss priced at 13.3333× a false alert, total cost is nearly insensitive to precision — and precision is exactly where the graph features land. False positives **rise** from 112 to 214 (91% more) at higher recall (79.0% → 87.1%), growing the review queue from 73.3 to 112.4 alerts per 1,000 accounts. An analyst feels that; the cost model barely does.
+That cost figure understates them, and the reason is worth stating: with a miss priced at 13.3333× a false alert, total cost is nearly insensitive to precision — and precision is exactly where the graph features land. False positives fall from 141 to 128 (9% fewer) at higher recall (80.9% → 87.3%), shrinking the review queue from 75.3 to 73.3 alerts per 1,000 accounts. An analyst feels that; the cost model barely does.
 
-Read the other way, this ablation is also the strongest argument against the framing at the top of this README. 13 non-structural features reach test AUC 0.9586 on their own, against 0.9693 with the full set — 97.7% of the above-chance separation, so most of the separating signal is reachable without a graph at all. The structural features sharpen the queue; they do not find a fundamentally different population of mules. Anyone deciding whether to build this pipeline should weigh that.
+Read the other way, this ablation is also the strongest argument against the framing at the top of this README. 13 non-structural features reach test AUC 0.9572 on their own, against 0.9739 with the full set — 96.5% of the above-chance separation, so most of the separating signal is reachable without a graph at all. The structural features sharpen the queue; they do not find a fundamentally different population of mules. Anyone deciding whether to build this pipeline should weigh that.
 
 ### What happens when the review queue is capped
 
-Every row above assumes an analyst queue of unlimited size. Cap it at 20 alerts per 1,000 accounts — a stated assumption, with the threshold that satisfies it chosen on validation like every other threshold here — and the model is pushed to the high-precision end of its own curve: threshold 0.9776, precision 98.0% at recall 39.5%, 17.4 alerts per 1,000 accounts, total test cost ₹1,50,15,000.
+Every row above assumes an analyst queue of unlimited size. Cap it at 20 alerts per 1,000 accounts — a stated assumption, with the threshold that satisfies it chosen on validation like every other threshold here — and the model is pushed to the high-precision end of its own curve: threshold 0.9755, precision 97.9% at recall 41.8%, 15.4 alerts per 1,000 accounts, total test cost ₹1,28,15,000.
 
-On cost alone that loses to the one-line rule (₹1,07,15,000), and the inversion is a property of the cost model rather than a defect. The rule reaches recall 91.9% by issuing 242.5 alerts per 1,000 accounts — roughly 12× the capped budget, so it is not a policy the cap permits. With a miss priced at 13.3333× a false alert, misses dominate the total, and any policy free to flood the queue wins on cost by construction. Note the rule's queue is not economically absurd either — at 16.4% precision it sits above the 6.98% break-even, so it is worth working if you have the staff. The objection to it is capacity, not arithmetic.
+Even under the cap the model stays below the one-line rule (₹1,45,40,000), which the rule reaches only by issuing 278.2 alerts per 1,000 accounts — a queue the budget forbids outright.
 
-The defensible claim is therefore the joint one: cheaper than the alternatives *and* a queue small enough for a human to actually work. Cost in isolation, under a cap the winning baseline could never satisfy, is not a claim this project makes. A team whose binding constraint is reviews-per-day should re-derive its own operating point from its own budget.
+#### The same cap, applied to every policy
+
+Each threshold below was re-selected **on validation** to fit the same 20 alerts per 1,000 accounts, then applied once to test. The two trivial policies have no threshold to select and are priced closed-form.
+
+| policy under the cap | val threshold | precision | recall | F1 | alerts / 1,000 (test) | total cost |
+|---|---|---|---|---|---|---|
+| one-line rule: cycle_participation >= 0.0736 | 0.9000 | 9.2% | 9.1% | 0.091 | 35.7 ⚠ | ₹2,14,85,000 |
+| logistic regression, same features | 0.9494 | 66.2% | 42.7% | 0.519 | 23.2 ⚠ | ₹1,29,60,000 |
+| XGBoost, no graph features | 0.9602 | 97.9% | 41.8% | 0.586 | 15.4 | ₹1,28,15,000 |
+| **XGBoost, full model** | 0.9755 | 97.9% | 41.8% | 0.586 | 15.4 | ₹1,28,15,000 |
+| flag nothing _(infeasible)_ | — | — | 0.0% | — | 0.0 | ₹2,20,00,000 |
+| flag everything _(infeasible)_ | — | 3.6% | 100.0% | 0.070 | 1000.0 | ₹4,41,75,000 |
+
+⚠ marks a policy whose validation-selected threshold overflowed the cap on test — two of four here, the widest at 35.7 alerts per 1,000 against a budget of 20. Each threshold was frozen on validation and the test score distribution is not identical, so the queue comes out a different size. It is reported rather than corrected: re-solving the threshold on test until the constraint held would be threshold selection on test, which is the one thing this project refuses to do anywhere else.
+
+With the cap binding on everyone, the model is the cheapest policy in the table at ₹1,28,15,000 against ₹1,28,15,000 for the next best (XGBoost, no graph features) — ₹0 cheaper on the same queue size. That is the comparison the capped claim above rests on. The one-line rule's apparent win on cost alone was bought with a queue the cap does not permit, not with better detection.
+
+### The same operating point at a realistic base rate
+
+Precision and rupee cost depend on how many mules there are; recall, ROC-AUC and the leakage headroom do not. So the honest way to read the numbers above is to re-price them at base rates a real network would see. Nothing is retrained here — the class-conditional score distributions are held fixed and only the mix is re-weighted.
+
+| mule base rate | recall | precision | alerts / 1,000 | cost / 1,000 accounts | queue pays for itself |
+|---|---|---|---|---|---|
+| **3.601%** _(measured)_ | 87.3% | 42.86% | 73.3 | ₹15,45,019 | yes |
+| 2.000% | 87.3% | 29.07% | 60.0 | ₹11,48,004 | yes |
+| 1.000% | 87.3% | 16.86% | 51.8 | ₹8,99,978 | yes |
+| 0.500% | 87.3% | 9.17% | 47.6 | ₹7,75,965 | yes |
+| 0.200% | 87.3% | 3.87% | 45.1 | ₹7,01,558 | **no** |
+| 0.100% | 87.3% | 1.97% | 44.3 | ₹6,76,755 | **no** |
+
+Recall holds at 87.3% down the whole table, which is not an approximation: it is a within-class rate, so no change of base rate can touch it. The break-even line falls between 0.200% and 0.500%: below roughly that base rate this operating point's queue costs more to work than to ignore, because precision drops under the 6.98% break-even the cost model implies. That is a real limit on the result and not a fixable one at this threshold — a rarer mule population needs a tighter cutoff, which trades recall for a queue worth working.
+
+The bolded row is the one actually measured: 3.601% prevalence on the test split. Every other row is arithmetic on that measurement, and answers "what would this queue look like if mules were rarer" — not "what will this model do in production", which needs real data and is out of scope. See Limitations.
 
 ### Is the task actually hard?
 
-The strongest *single* feature on test is `cycle_participation` at direction-corrected AUC **0.8678**, against a leakage ceiling of 0.99. If any one column reached that ceiling the generator would be planting the label and every number above would be theatre — `tests/test_baselines.py` recomputes this from the shipped CSVs and fails the build if it ever does.
+The strongest *single* feature on test is `cycle_participation` at direction-corrected AUC **0.8183**, against a leakage ceiling of 0.99. If any one column reached that ceiling the generator would be planting the label and every number above would be theatre — `tests/test_baselines.py` recomputes this from the shipped CSVs and fails the build if it ever does.
 
 ### Recall by ring archetype
 
@@ -124,18 +182,18 @@ Reported separately because one headline recall hides *which* laundering shapes 
 
 | archetype | accounts | account recall | rings | ring recall |
 |---|---|---|---|---|
-| `fast_cycle` | 36/36 | 100.0% | 8/8 | 100.0% |
-| `layered_fanin` | 24/25 | 96.0% | 6/6 | 100.0% |
-| `stealth_cycle` | 48/63 | 76.2% | 10/10 | 100.0% |
+| `fast_cycle` | 38/38 | 100.0% | 8/8 | 100.0% |
+| `layered_fanin` | 21/21 | 100.0% | 6/6 | 100.0% |
+| `stealth_cycle` | 37/51 | 72.5% | 10/10 | 100.0% |
 | **all rings** | | | **24/24** | **100.0%** |
 
 ### Data the numbers were measured on
 
 | split | accounts | mules | prevalence | rings |
 |---|---|---|---|---|
-| train | 3096 | 209 | 6.75% | 40 |
-| val | 2947 | 136 | 4.61% | 24 |
-| test | 2866 | 124 | 4.33% | 24 |
+| train | 3091 | 190 | 6.15% | 40 |
+| val | 3060 | 127 | 4.15% | 24 |
+| test | 3055 | 110 | 3.60% | 24 |
 
 Splits are consecutive equal-length time windows — no account's future is used to predict its past, and no ring appears in two splits.
 
@@ -332,17 +390,24 @@ in place the same perturbation moves the feature for **0 of 2,954** accounts.
 `tests/test_features.py` asserts bit-identical values for 17 of 18 features under
 perturbation, so deleting that plumbing breaks the build.
 
-PageRank is the one exemption, and it is a principled one: it is a global fixpoint
-over a normalised rank vector, so strictly every node shifts when any node is
-added. That is the definition, not a bug, so it is held to a *bound* rather than
-to identity. v4 emits it as `pagerank × N` — mean 1.0 rather than a value that
-tracks node count — which also cancels most of the drift to first order, since
-adding accounts rescales every raw value by about N/(N+k) and the ×N undoes that
-term. The bound is `PAGERANK_PERTURBATION_TOLERANCE` = 1e-3 on that mean-1.0
-column, chosen as a bound the cancellation argument clears comfortably rather than
-as a measurement; the v3-era ~1e-5 reading was taken on the old 1/N-scale column,
-and the true v4 residual is confirmed on the retrain. See rule 5 in
-`models/features.py`.
+PageRank is the one exemption from bit-identity, and it is a principled one: it is
+a global fixpoint over a normalised rank vector, computed by an iterative solver
+that stops at a tolerance rather than at a fixed point. The invariant it is held to
+is stronger than "small", though. v4 emits it as `pagerank × N` — mean 1.0 rather
+than a value that tracks node count — and for *this* perturbation that scaling is
+**exactly** cancelling, not approximately: two new accounts transacting only with
+each other form a closed component, so the only thing that changes for an existing
+account is PageRank's uniform teleport term, every raw value scales by exactly
+N/N′, and multiplying by the new N undoes it in full. The expected drift is zero.
+
+That derivation is what fixed the guard. An earlier absolute budget of 1e-3 was the
+wrong *shape* rather than the wrong number — an absolute tolerance on a quantity
+defined as a multiple of the graph's own baseline means something different in every
+graph — and the retrain measured 6.9e-3 against it, which turned out to be the
+solver's own residual read on a column N times larger. The guard is now a relative
+magnitude budget, a rank-order assertion (Spearman ≥ 0.9999, which is what a
+tree model actually consumes), and `mean == 1.0` to pin the ×N scaling itself so the
+relative budget cannot pass vacuously. See rule 5 in `models/features.py`.
 
 ---
 
@@ -382,9 +447,20 @@ response and requires the validator to raise.
 pip install -r requirements.txt
 ```
 
-Steps 1 and 2 write the CSVs the rest of the pipeline reads. They are
-gitignored — deterministic from `SEED = 42`, so the recipe is committed instead of
-the output — which means a fresh clone must run them before anything else works.
+The generated CSVs and the trained booster are committed, so a fresh clone works
+on arrival — no pipeline run needed:
+
+```bash
+uvicorn api.main:app --reload --port 8000    # docs at /docs
+streamlit run dashboard/app.py               # http://localhost:8501
+pytest tests/ -v                             # add -m "not slow" for a fast loop
+python -m models.report --check               # exit 1 if Results is stale
+```
+
+To rebuild everything from scratch rather than trust the shipped artifacts, run
+the pipeline in this order. `data.extractor` must precede `models.train`, because
+train's ring-attribution step reads columns the extractor writes — run it the
+other way and that figure publishes as `null`:
 
 ```bash
 python -m data.generator     # → data/raw/{train,val,test,serving_context}_edges.csv
@@ -392,6 +468,13 @@ python -m data.extractor     # → data/processed/{train,val,test}_features.csv
 python -m models.train       # → models/saved_models/<features.MODEL_NAME> + metrics.json
 python -m models.report --write   # fills the Results section of this README
 ```
+
+Regenerating will not reproduce the committed CSVs row-for-row. `SEED = 42` is
+fixed, but a seed only reproduces data while the generator consumes the same
+number of random draws, so the distributions match while the individual accounts
+do not. Retrain after regenerating, or the committed `metrics.json` describes a
+dataset that is no longer on disk — which the suite will tell you about rather
+than let you ship.
 
 `models.train` prints the baseline comparison table, per-archetype recall, the
 leakage check and the SHAP-identity confirmation. Read that output rather than
@@ -463,6 +546,36 @@ chances for training and serving to drift apart.
   * *Demo surface:* `tests/test_dashboard.py` tests the dashboard's scoring path behaviourally rather than only contract-checking its feature names — the label cannot reach the model, column order is enforced, the threshold has no default to fall back on, a `metrics.json` describing another model version stops the page, and an AST walk fails the build if a simulated score or a random draw reappears in a module that computes displayed figures.
   * *Traceability:* tests are documented with the specific production defect or regression they exist to prevent, so the suite reads as a changelog of failures already fixed.
 * **Platform-independent artifacts.** `metrics.json` and this README's generated block are written with an explicit `newline="\n"`, and `.gitattributes` normalises the repository to LF. Python's text mode otherwise translates line endings per platform, so the same artifact written on Windows and on Linux differs on every line — and a retrain that moved one number arrives as a 1,900-line diff with the actual change buried inside it.
+
+---
+
+## How this was built
+
+Written with heavy AI assistance, which is worth stating plainly rather than
+leaving a reader to wonder about the volume of commentary in these modules. The
+useful question is not whether a model helped write it, but where its suggestions
+were overruled — so, three that were cut. The streaming layer: Kafka and PySpark
+for a dataset that fits in memory is résumé architecture, not engineering. The
+vector database: there is nothing here to retrieve, the representation is
+eighteen floats per account. The agent framework: LangGraph orchestrating a
+single scoring call buys a dependency and a failure mode in exchange for nothing.
+
+The larger override is the model itself. The reflexive 2026 move is to point a
+language model at the problem, and it would have been the wrong tool. This is a
+tabular problem over a graph; the label is structural rather than semantic; and
+gradient boosting over eighteen engineered features is both stronger here and
+auditable by exact TreeSHAP in a way a prompt is not. A language model cannot tell
+you that `cycle_participation` contributed 0.11 to a particular account's score,
+and on a decision that costs a merchant real money, that attribution is the point.
+
+What the assistance did not do is decide what to trust. Every figure in
+[Results](#results) is generated from `metrics.json` by `python -m models.report
+--write` rather than typed by hand, the operating threshold is chosen on
+validation and never on test, and the defects catalogued in
+[`AUDIT-2026-08-30.md`](AUDIT-2026-08-30.md) were found by auditing this code
+against its own claims — including the one where the graph viewer inferred mule
+labels from edge incidence and so painted fan-in victims as suspects, on the one
+page whose entire subject is the cost of false accusation.
 
 ---
 

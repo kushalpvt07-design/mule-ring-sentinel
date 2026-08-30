@@ -701,6 +701,16 @@ class TestRequestValidationIsDeclared:
         satisfies `>= 0`, which rates the whole population CRITICAL. Rejecting it
         at the schema turns a 500 deep in the responder into a 422 naming the
         field.
+
+        The upper bound is asserted as `lt`, not `le`, and that is the contract
+        rather than a preference. At t = 1 the CRITICAL cutoff is
+        t + (1 - t)/2 = 1, so the HIGH band [1, 1) is empty and the only account
+        that can be flagged at all is one scored at exactly 1.0 — well-defined
+        arithmetic describing no operating point. `le=1.0` was what this file
+        checked for while the schema had already been tightened to `lt=1.0`, so the
+        test failed against a stricter and more correct schema. Accepting either
+        form would have been the easy repair and the wrong one: it would leave the
+        door open to relaxing the bound back to admitting t = 1.
         """
         field = _field_call_source(_tree(SCHEMAS_PATH), "ScoringRequest",
                                    "threshold_override")
@@ -709,10 +719,12 @@ class TestRequestValidationIsDeclared:
             f"zero reaches classify_risk and surfaces as a 500 rather than a "
             f"validation error naming the field.\n  Field(...) reads: {field}"
         )
-        assert "le=1.0" in field or "le=1" in field, (
-            f"the threshold override has no upper bound; a threshold above 1 "
-            f"flags nothing and so describes no operating point.\n"
-            f"  Field(...) reads: {field}"
+        assert "lt=1.0" in field or "lt=1" in field, (
+            f"the threshold override is not bounded strictly below 1. A threshold "
+            f"above 1 flags nothing; a threshold of exactly 1 leaves the HIGH band "
+            f"[1, 1) empty and flags only a score of exactly 1.0. Neither is an "
+            f"operating point, so the bound has to be exclusive — `le=1.0` would "
+            f"admit the second case.\n  Field(...) reads: {field}"
         )
 
     def test_self_transfers_are_rejected_at_the_edge(self):
@@ -1473,14 +1485,34 @@ class TestTheEndpointScoresForReal:
 
     # ── refusals ──
 
-    def test_a_batch_dated_outside_the_context_is_refused(self, service, loop,
-                                                          edges):
+    def test_a_batch_dated_outside_the_context_keeps_the_whole_graph(
+            self, service, loop, edges, response):
         """
-        The 422. This is the common case, not the exotic one: any present-day
-        timestamp lands here, because the shipped context file ends in 2025.
+        THIS TEST USED TO ASSERT THE OPPOSITE, AND THE OPPOSITE WAS THE BUG.
+
+        It expected a 422 for any batch dated past the context, on the grounds that
+        the trim would have removed every historical edge. That was true while
+        `merge_with_context` computed `window_end = max(submitted.max(),
+        context.max())`: a late batch slid the window forward and deleted the OLDEST
+        context edges — history belonging to accounts with nothing to do with the
+        request. Measured then: a four-transaction batch dated 20 days late dropped
+        19,829 edges, a third of the graph, and every one of those requests was
+        reported as `window_comparable: true` with no warning. The 422 only fired
+        once the batch was late enough to slide the window clear of the context
+        entirely, so it was the visible tail of a defect that was silently
+        mis-scoring everything short of it.
+
+        The window is now ANCHORED to `context["timestamp"].max()`. Nothing the
+        caller sends moves it, so a late batch is scored against the FULL historical
+        graph and told how far outside it fell. That is the contract this test now
+        pins, and it pins it the sharp way — by comparing against the in-window
+        baseline rather than by asserting a number. Revert the anchoring and
+        `n_context_transactions_used` collapses here while staying put in
+        `response`, so this fails on the exact regression it exists for. An
+        `assert > 0` would not have: the old code kept plenty of context at 20 days
+        late.
         """
         import pandas as pd
-        from fastapi import HTTPException
 
         from api.schemas import ScoringRequest
 
@@ -1489,16 +1521,82 @@ class TestTheEndpointScoresForReal:
         stale = [dict(e, timestamp=(far_future + pd.Timedelta(hours=i)).isoformat())
                  for i, e in enumerate(edges)]
 
+        late = loop.run_until_complete(service.score_transactions(
+            ScoringRequest(transactions=stale)))
+
+        assert (late.context.n_context_transactions_used
+                == response.context.n_context_transactions_used), (
+            f"dating the batch 3,650 days late changed how much history survived "
+            f"the window: {late.context.n_context_transactions_used:,} context "
+            f"transactions against {response.context.n_context_transactions_used:,} "
+            f"for the identical batch dated inside it. The observation window is "
+            f"supposed to be anchored to the context file's own last timestamp, so "
+            f"the caller's dates cannot decide whose history gets discarded. This "
+            f"is the sliding-window defect returning."
+        )
+        assert len(late.node_scores) == len(response.node_scores), (
+            "the late batch returned a different number of accounts than the same "
+            "batch dated inside the window."
+        )
+
+        joined = " ".join(late.context.warnings).lower()
+        assert "outside the reference window" in joined, (
+            f"nothing in the response says the submitted transactions fall outside "
+            f"the reference window. They are scored anyway — by design, the request "
+            f"is never trimmed — so the warning is the only thing standing between "
+            f"the caller and a score whose effective window is "
+            f"{late.context.observation_window_days} days against a trained "
+            f"{late.context.trained_window_days}. Warnings were: "
+            f"{late.context.warnings}"
+        )
+        assert late.context.window_comparable is False, (
+            f"a batch dated 3,650 days past the context reports "
+            f"window_comparable=True at an observed window of "
+            f"{late.context.observation_window_days} days. The flag is what a "
+            f"caller checks before trusting the score against the published "
+            f"metrics; if it survives this, it means nothing."
+        )
+
+    def test_a_request_with_no_usable_context_is_refused_with_422(
+            self, service, loop, edges, monkeypatch):
+        """
+        The 422 that remains, and the narrow case it now covers.
+
+        Anchoring the window to the context made the old trigger unreachable: the
+        window always contains `context["timestamp"].max()`, so at least the edges
+        at that instant survive and `n_context_used` cannot reach zero for any
+        non-empty context. What CAN still reach it is a deployment fault rather than
+        a caller fault — a context file that loaded but holds no rows, or holds
+        timestamps that did not parse. Then every comparison against the window is
+        False, the trim keeps nothing, and features would be computed on the
+        submitted transactions alone: PageRank collapses to ~1/n, clustering and
+        cycle participation to 0, and a tier derived from that is a threshold
+        calibrated on a 60-day graph applied to six edges.
+
+        Kept as a refusal rather than deleted as dead code, and tested rather than
+        assumed: an unreachable guard that nothing exercises is how a guard rots
+        into a guard that no longer works when it becomes reachable again.
+        """
+        from fastapi import HTTPException
+
+        from api.schemas import ScoringRequest
+
+        # An empty slice, not a fresh frame: it keeps the real dtypes, so this
+        # exercises "the file loaded and held nothing" rather than a type error.
+        monkeypatch.setattr(service.STATE, "context_edges",
+                            service.STATE.context_edges.iloc[0:0])
+
         with pytest.raises(HTTPException) as caught:
             loop.run_until_complete(service.score_transactions(
-                ScoringRequest(transactions=stale)))
+                ScoringRequest(transactions=[dict(e) for e in edges])))
         assert caught.value.status_code == 422, (
             f"expected a 422 for a batch with no surviving context, got "
             f"{caught.value.status_code}."
         )
         assert "context" in str(caught.value.detail).lower(), (
-            "the refusal does not tell the caller that the problem is the dates; "
-            "without that they cannot fix the request."
+            "the refusal does not tell the caller that the problem is the missing "
+            "context; without that they cannot tell a bad request from a broken "
+            "deployment."
         )
 
     def test_an_unready_service_refuses_with_503(self, service, loop, edges,

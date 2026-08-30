@@ -163,27 +163,35 @@ DESIGN RULES for anything added to FEATURE_COLS
    pagerank by at most 1.0e-05 with rank correlation > 0.9999. Bounded and
    negligible is acceptable; 0.29 is not.
 
-   v4 NOTE, and an admission about that tolerance. `pagerank` is now emitted as
-   pagerank × N (rule 3), which changes what a tolerance on it means twice over.
-   First, the honest reading of the v3 guard: raw pagerank has mean 1/N ≈ 3.4e-04
-   on these graphs, and the guard allowed an absolute 1e-4 — i.e. 29% of a typical
-   value, and 10x the drift ever measured. "Within 1e-4" sounded tight and was
-   nearly vacuous. Second, the direction of the fix: most of that 1e-05 drift IS
-   the 1/N normalisation moving, because adding k nodes rescales every existing
-   node's raw value by about N/(N+k) — and multiplying by N cancels exactly that
-   term to first order. So on a quantity whose mean is now 1.0 by construction,
-   the residual should be materially smaller in RELATIVE terms than v3's 29%
-   allowance, not larger.
+   v4 NOTE, and an admission about that tolerance — twice over, because the first
+   attempt at this note was also wrong. `pagerank` is now emitted as pagerank × N
+   (rule 3), which changes what a tolerance on it means. First, the honest reading
+   of the v3 guard: raw pagerank has mean 1/N ≈ 3.4e-04 on these graphs, and the
+   guard allowed an absolute 1e-4 — i.e. 29% of a typical value, and 10x the drift
+   ever measured. "Within 1e-4" sounded tight and was nearly vacuous.
 
-   tests/test_features.py asserts this: perturb the graph with disconnected
-   accounts, require bit-identical values for every feature except pagerank, and
-   require pagerank within `PAGERANK_PERTURBATION_TOLERANCE`. That constant is set
-   to 1e-3 on the mean-1.0 column — 290x tighter than v3's effective allowance,
-   and chosen as a bound the cancellation argument clears comfortably rather than
-   as a measurement, because the perturbation cannot be re-measured until the
-   retrain runs. If the retrain shows the true residual is orders of magnitude
-   below it, tighten it and record the figure here; a tolerance nobody has
-   measured against is how the v3 one got to 29%.
+   Second, the direction of the fix, which this note previously understated as
+   "cancels that term to first order". The cancellation is EXACT for the
+   perturbation the test applies. Two new accounts transacting only with each other
+   form a closed component: no edge enters it from the main graph and none leaves
+   it. PageRank's teleport is uniform, so the only quantity that changes for a
+   pre-existing account is the teleport magnitude, (1-d)/N → (1-d)/N'; the main
+   component's linear system is otherwise untouched, so every raw value scales by
+   exactly N/N' and emitting `raw × N'` cancels it in full. The expected drift is
+   zero, not "materially smaller".
+
+   That matters because it decides what the guard should be. The absolute 1e-3 that
+   replaced v3's 1e-4 was the wrong SHAPE, not the wrong number: an absolute budget
+   on a column defined as a multiple of the graph's own baseline means a different
+   thing in every graph, and the retrain duly measured 6.9e-3 against it — solver
+   residual from `nx.pagerank`'s power iteration, amplified by N, not a centrality
+   shift. tests/test_features.py now asserts the invariant three ways instead:
+   every other feature bit-identical, pagerank's rank order preserved
+   (PAGERANK_PERTURBATION_RANK_CORRELATION, the claim this file already made in
+   prose), pagerank's magnitude within a RELATIVE budget
+   (PAGERANK_PERTURBATION_RELATIVE_TOLERANCE), and the ×N scaling itself pinned by
+   `mean == 1.0`, which is an identity rather than a property of this data and is
+   what keeps the relative budget from passing vacuously.
 
 ─────────────────────────────────────────────────────────────────────────────
 v3 → v4 CHANGES
@@ -407,6 +415,25 @@ METADATA_COLS: list[str] = [
 LABEL_META_COLS: list[str] = [
     "ring_id",
     "ring_type",
+    # First-ring attribution is lossy: `ring_id` records one ring per account, so
+    # an account bridging two rings is credited to whichever edge was visited
+    # first, and ring recall's denominator silently shrinks. These two columns
+    # carry the FULL attribution set, pipe-separated, which is what lets
+    # train.py::_attribution_slack report that loss exactly rather than assume it
+    # is zero.
+    #
+    # Both are derived from the label and must never become features. Nothing
+    # here enforces that by exclusion — it holds because every feature matrix in
+    # models/train.py is built positively as `df[FEATURE_COLS]`, never by
+    # dropping columns from the frame. Keep it that way: a `drop`-based X would
+    # feed the answer straight into the model.
+    #
+    # They were emitted by the extractor and read by train.py from the start but
+    # never declared here, so `process_split`'s column-set assertion rejected the
+    # extractor's own output and the pipeline could not run at all. Declared
+    # columns are the contract; emitting one without declaring it is the bug.
+    "rings_attributed",
+    "ring_types_attributed",
 ]
 
 

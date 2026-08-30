@@ -105,11 +105,25 @@ KNOWN LIMITATIONS — read before quoting a latency figure
   amount of evidence than training used, which moves `degree_balance`,
   `reciprocity`, `clustering_coefficient` and `cycle_participation`. Distinct
   counterparties saturate rather than scale, so that residual does not divide out.
-  The window is still enforced per request and `context.window_comparable` says
-  whether it holds. A request whose window keeps NO historical context is refused
-  with 422 rather than scored: the graph features are constants at that point, and
-  a tier derived from them is a threshold calibrated on a 60-day graph applied to
-  a handful of edges.
+  `context.window_comparable` says whether the effective window matched the trained
+  one, and it is the flag to check before reading a score against the published
+  metrics.
+
+  A batch dated outside the window is SCORED, not refused. The window is anchored
+  to the context file's own last timestamp, so nothing the caller sends can move it
+  and no other account's history is dropped to accommodate a late request; the
+  request's own edges are never trimmed either. What the caller gets instead of a
+  refusal is `window_comparable: false` and a warning saying how far outside the
+  batch fell. An earlier version refused these with 422, which sounded stricter and
+  was worse: the refusal only fired once a batch was late enough to slide the
+  window clear of the context entirely, and every batch short of that was quietly
+  scored against a graph the request itself had truncated.
+
+  The 422 still exists for the case that is a deployment fault rather than a caller
+  fault: a context file that loaded but holds no usable rows, leaving nothing for
+  the window to keep. Graph features are constants at that point and a tier derived
+  from them is a threshold calibrated on a 60-day graph applied to a handful of
+  edges.
 
 • An account with no history in the context graph is scored on the submitted
   transactions alone, so its graph features are weak by construction. Those
@@ -721,10 +735,9 @@ def merge_with_context(
     inflating `in_amount_sum`, `out_amount_sum`, `repeat_ratio`, `txn_velocity`
     and `burst_ratio` for both endpoints of that edge.
 
-    That is not an exotic input. The 422 below tells the caller to "Date the
-    transactions inside the context window", the context file ships in the repo,
-    and copying rows out of it is the obvious way to build a request that scores.
-    The natural first attempt at using this API was silently mis-scored.
+    That is not an exotic input. The context file ships in the repo and copying rows
+    out of it is the obvious way to build a request that scores against real
+    history, so the natural first attempt at using this API was silently mis-scored.
 
     Exact matches on (sender, receiver, amount, timestamp) are dropped, keeping
     the context copy, and the count is reported. Two genuinely distinct
@@ -808,21 +821,30 @@ def merge_with_context(
             f"repeat_ratio, txn_velocity and burst_ratio for both endpoints. The "
             f"scores are correct; the request is redundant.")
 
-    # The failure that matters: the batch is dated outside the context range, so
-    # the trim removed everything and we are back to scoring a bare batch graph —
-    # the exact defect this function exists to fix. It must be loud.
+    # The failure that matters: nothing at all survived the trim, so we are back to
+    # scoring a bare batch graph — the exact defect this function exists to fix. It
+    # must be loud.
+    #
+    # Now that the window is anchored to `context["timestamp"].max()`, that instant
+    # is always inside the window, so a non-empty context with parseable timestamps
+    # cannot reach this. Reaching it means the context frame is empty or its
+    # timestamps are NaT. The message therefore names THAT, and deliberately no
+    # longer ends with "date the transactions inside the context window": under
+    # anchoring, re-dating the request changes nothing here, and an instruction that
+    # cannot fix the problem sends the caller to debug their own input while a
+    # broken deployment serves constants.
     if kept.empty:
         diagnostics["warnings"].append(
-            f"NO historical context survived the observation window. The "
-            f"submitted transactions are dated "
-            f"{submitted['timestamp'].min().date()} to "
-            f"{submitted['timestamp'].max().date()}, while the context file "
-            f"covers {context['timestamp'].min().date()} to "
-            f"{context['timestamp'].max().date()}. Graph features are therefore "
-            f"computed on the submitted transactions alone: PageRank collapses "
-            f"to ~1/n, clustering and cycle participation to 0. These scores are "
-            f"not comparable to the reported metrics. Date the transactions "
-            f"inside the context window.")
+            f"NO historical context survived the observation window, and the "
+            f"submitted dates are not the reason — the window is anchored to the "
+            f"context file, so the request cannot move it. The context frame holds "
+            f"{len(context):,} row(s) and its timestamps read as "
+            f"{context['timestamp'].min()} to {context['timestamp'].max()}, so "
+            f"either data/raw/serving_context_edges.csv is empty or its timestamp "
+            f"column did not parse. Graph features are therefore computed on the "
+            f"submitted transactions alone: PageRank collapses to ~1/n, clustering "
+            f"and cycle participation to 0. These scores are not comparable to the "
+            f"reported metrics. Check the context file, not the request.")
     elif len(kept) < len(context):
         # ANY trim is reported, not only a trim past some floor. The old 50% floor
         # meant a third of the graph could vanish silently; and now that the window
@@ -1076,8 +1098,25 @@ async def score_transactions(request: ScoringRequest):
     # submitted transactions alone: PageRank collapses to ~1/n, clustering and
     # cycle participation to 0. A tier and an action derived from that are a
     # threshold calibrated on a 60-day graph applied to a 4-edge one — well-formed
-    # and meaningless. Any present-day timestamp lands here, because the context
-    # file ends 2025-04-30, so this is the common case rather than the exotic one.
+    # and meaningless.
+    #
+    # WHAT REACHES THIS, WHICH IS NOT WHAT THIS COMMENT USED TO CLAIM. It said "any
+    # present-day timestamp lands here, because the context file ends 2025-04-30, so
+    # this is the common case rather than the exotic one." That was true while the
+    # window slid forward to the latest submitted transaction. It is not true now:
+    # `merge_with_context` anchors the window to `context["timestamp"].max()`, which
+    # is always inside the window, so a non-empty context always keeps at least the
+    # edges at that instant and a late batch is scored against the whole graph. A
+    # present-day timestamp now lands in the `submitted_outside_window` warning and
+    # `window_comparable: false`, not here.
+    #
+    # What still reaches this is a deployment fault: a context file that loaded and
+    # holds no rows, or holds timestamps that did not parse, so every comparison
+    # against the window is False. Rare, and worth a distinct refusal rather than a
+    # score — which is why it is kept and why
+    # tests/test_api.py::test_a_request_with_no_usable_context_is_refused_with_422
+    # exercises it directly. An unreachable guard nothing tests is a guard that will
+    # not work the day it becomes reachable.
     #
     # Refused with 422 rather than returned as a 200 with `risk_level` and
     # `action` suppressed: both are required fields on NodeRiskScore, and a

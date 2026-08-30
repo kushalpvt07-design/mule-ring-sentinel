@@ -421,12 +421,18 @@ def compute_pagerank_vs_uniform(G: nx.DiGraph) -> dict[str, float]:
     constant per graph the within-graph rank order is untouched — so the trees see
     the same ordering they always did, on an axis that now transfers.
 
-    What it does NOT fix is rule 5: pagerank is a global fixpoint, so adding any
-    node still perturbs every value. That was measured and accepted separately
-    (max |Δ| 1.0e-05, rank correlation > 0.9999 for a two-account perturbation),
-    and `tests/test_features.py` allows pagerank a 1e-4 tolerance for it. Note the
-    tolerance is on the EMITTED column, so it now sits on a quantity ~N times
-    larger and had to be rescaled with this change.
+    What it does NOT fix is rule 5 in general: pagerank is a global fixpoint, so
+    adding a node that TRANSACTS with the existing graph perturbs every value. For
+    the specific perturbation tests/test_features.py applies — a closed pair of new
+    accounts, no edge in or out — the ×N emission is exactly invariant, because the
+    only thing that changes for a pre-existing node is the uniform teleport
+    magnitude and multiplying by the new N cancels it in full. So the residual seen
+    there is `compute_pagerank`'s power-iteration tolerance read on a column N times
+    larger, not a centrality shift: measured 6.9e-3 on a column whose maximum is
+    16.9, with rank correlation > 0.9999. That is why the guard in that file is a
+    RELATIVE budget plus a rank-order assertion plus `mean == 1.0`, rather than the
+    absolute tolerance it used to be — an absolute budget on a quantity defined as a
+    multiple of the graph's own baseline means something different in every graph.
     """
     raw = compute_pagerank(G)
     n = G.number_of_nodes()

@@ -1,31 +1,47 @@
 # .gitignore
 # ──────────
-# Generated data artifacts (large, and exactly reproducible from SEED=42 in
-# data/generator.py — so the recipe is committed instead of the output).
-data/raw/*.csv
-data/processed/*.csv
-
-# Trained model binaries. Regenerate with `python -m models.train`.
-models/saved_models/*.xgb
-models/saved_models/*.bin
-models/saved_models/*.pkl
-
-# ── DELIBERATELY NOT IGNORED: models/saved_models/metrics.json ──
-# It is generated, so the instinct is to ignore it. Don't. It is the published
-# evidence for every number in the README, and the dashboard and API read it,
-# so a clone without it cannot show a single metric.
+# ── DELIBERATELY NOT IGNORED: the generated artifacts ──
+# `data/raw/*.csv`, `data/processed/*.csv` and `models/saved_models/*.xgb` are
+# committed on purpose. They were excluded once, for a reason that turned out to
+# be wrong: "exactly reproducible from SEED=42, so the recipe is committed
+# instead of the output."
 #
-# The reason committing it is safe is that staleness is now *guarded*: v2
-# shipped a metrics.json advertising ROC-AUC 0.9999 for a model that had already
-# been retired, and nothing caught it. tests/test_baselines.py::
-# TestMetricsAreNotStale::test_metrics_describe_the_current_model_version fails
-# the build the moment the file's model_version drifts from features.MODEL_VERSION,
-# and a second test recomputes the leakage claim against the shipped CSVs. Keep
-# both if you keep the file committed.
+# The seed is fixed, but reproducibility from a seed only holds while the
+# generator is byte-identical. Changing how many random draws it consumes
+# reshuffles the entire downstream stream, so a later generator at the same seed
+# produces DIFFERENT data — same distributions, different accounts and different
+# counts. The recipe is therefore not a substitute for the output, and treating
+# it as one is how prose ends up quoting measurements of data nobody can
+# regenerate.
+#
+# The deciding reason is a reader's first ten minutes. Without these files a
+# fresh clone has no data and no booster, so `uvicorn api.main:app` cannot load a
+# model and the dashboard cannot score until three pipeline commands have run and
+# every dependency is installed. ~23 MB buys a clone that works on arrival.
+#
+# models/saved_models/metrics.json is committed for the same reason and one more:
+# it is the published evidence for every number in the README, and both the
+# dashboard and the API read it, so a clone without it cannot show a single
+# metric. Committing generated evidence is only safe because staleness is
+# *guarded* — v2 shipped a metrics.json advertising ROC-AUC 0.9999 for a model
+# that had already been retired, and nothing caught it. Now
+# tests/test_baselines.py::TestMetricsAreNotStale::
+# test_metrics_describe_the_current_model_version fails the build the moment the
+# file's model_version drifts from features.MODEL_VERSION, and a second test
+# recomputes the leakage claim against the shipped CSVs. Keep both tests if you
+# keep these files committed.
 
 # pyvis writes its bundled vis-network/tom-select JS beside any saved HTML.
 # Vendored third-party assets, regenerated on every dashboard run.
 lib/
+
+# Local working notes and run logs for the retrain-and-publish sequence. Useful
+# while shipping, but scaffolding rather than part of the project, so they stay out
+# of the repo.
+PUBLISH-RUNBOOK.md
+ANTIGRAVITY-PROMPT.md
+retrain-log.txt
+SUBMISSION-FORM-ANSWERS.md
 
 # Python
 __pycache__/

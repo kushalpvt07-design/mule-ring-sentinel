@@ -299,7 +299,22 @@ def load_data() -> dict[str, pd.DataFrame]:
             )
         # reset_index so positional and label indexing coincide; the fold
         # builder below relies on it.
-        df = pd.read_csv(path).reset_index(drop=True)
+        #
+        # The two attribution columns are read as strings rather than inferred.
+        # They hold pipe-separated ring-id sets like "64|12", but when no account
+        # in a split bridges two rings, every cell is a bare integer, pandas
+        # infers float64, and `_attribution_slack`'s `astype(str)` then yields
+        # "64.0" — which `int()` refuses. So the inferred dtype depends on the
+        # data: the column parses cleanly as soon as one account bridges two
+        # rings and breaks when none does, which is exactly the case the function
+        # exists to report as zero slack. Pinning the dtype removes that
+        # dependence. dtype keys naming absent columns are ignored by pandas, so
+        # the missing-column check below still reports in its own words instead
+        # of surfacing a parser error.
+        df = pd.read_csv(
+            path,
+            dtype={"rings_attributed": str, "ring_types_attributed": str},
+        ).reset_index(drop=True)
 
         missing = sorted(required - set(df.columns))
         if missing:
