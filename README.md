@@ -19,9 +19,10 @@ So the honest framing is that graph structure is what makes the queue cheap enou
 for a human to work, not what makes the signal visible in the first place.
 
 The strongest action this system can emit is `HOLD_FOR_REVIEW`. It has no code
-path that can ban, block, freeze, suspend, terminate, disable, revoke, seize or
-close anything, and that is enforced at import time and by test, not by
-convention. See [Defense-only, by construction](#defense-only-by-construction).
+path that can ban, block, freeze, suspend or otherwise act on an account —
+seventeen enforcement verbs are rejected by substring — and that is enforced at
+import time and by test, not by convention.
+See [Defense-only, by construction](#defense-only-by-construction).
 
 **The data is synthetic, and that is the first thing to know before reading any
 number below.** No labelled UPI mule-ring dataset exists publicly, so the traffic
@@ -424,8 +425,12 @@ precisely because nothing is ever frozen automatically.
 Three independent rails hold this, in `api/responder.py`:
 
 A **blocklist** rejects named enforcement actions. A **substring rail** rejects
-any action name containing an enforcement verb — `BAN`, `BLOCK`, `FREEZE`,
-`SUSPEND`, `TERMINATE`, `DISABLE`, `REVOKE`, `SEIZE`, `CLOSE` — which is what
+any action name containing an enforcement verb — seventeen of them, listed as
+`FORBIDDEN_VERBS` at `api/responder.py:163` rather than enumerated here, because
+this paragraph has already gone stale once against that tuple. It began as nine
+(`BAN`, `BLOCK`, `FREEZE`, `SUSPEND`, `TERMINATE`, `DISABLE`, `REVOKE`, `SEIZE`,
+`CLOSE`), which let `LOCK_ACCOUNT` through; the audit added `LOCK`, `QUARANTINE`,
+`RESTRICT`, `HALT`, `BLACKLIST`, `DENY`, `LIMIT` and `REVERSE`. The rail is what
 makes the guarantee hold against action names nobody has invented yet. A blocklist
 only catches what someone thought of; `DISABLE_VPA` is not on any list and is
 plainly enforcement. And the whole `ActionCode` enum is **swept at import time**,
