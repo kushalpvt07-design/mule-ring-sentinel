@@ -42,6 +42,13 @@ PUBLISH-RUNBOOK.md
 ANTIGRAVITY-PROMPT.md
 retrain-log.txt
 SUBMISSION-FORM-ANSWERS.md
+SUBMISSION-CHECKLIST.md
+VIDEO-SCRIPT.md
+
+# Personal documents that live in this folder only because this folder is also
+# the working directory. A resume is not part of the project and must never be
+# committed — it carries a phone number and an email address into a public repo.
+*.docx
 
 # Python
 __pycache__/
