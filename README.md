@@ -277,9 +277,49 @@ documented fix if this is ever pointed at something real.
 
 ---
 
-## How it works
+## Architecture
 
-Five stages, each a module you can run on its own.
+![Architecture — offline pipeline, serving path, defense-only gate, and integrity rails](docs/architecture.png)
+
+Four edges in that picture carry the design, and they are the ones to read first.
+
+**The dotted arrow is train/serve parity.** `api/main.py` does not reimplement
+feature extraction; it imports `build_graph` and `compute_node_features` from
+`data/extractor.py` and calls them on the request graph. Training and serving
+cannot disagree about what a feature means, because there is only one function to
+disagree with. The Louvain partition is the exception that proves the rule: it is
+computed **once** from the reference graph and passed *into* that same call, for
+the reason set out under [Feature
+stability](#feature-stability-which-is-the-requirement-that-actually-costs-something).
+
+**`models/features.py` has arrows out and none in.** Seven modules import the
+contract — the four drawn here plus `explain.py`, `report.py` and
+`dashboard/scoring.py`, left out only to keep the picture readable — and it imports
+nothing from this repo in return, which is what makes it a contract rather than a
+layer. The feature list, its order and the model version exist in exactly one file,
+and `tests/test_contract.py` walks every module's AST and fails the build if any other
+file declares its own — because a stale copy of a feature list is how a 12-feature
+model once got served against an 18-feature threshold with nothing raising.
+
+**Nothing reaches the Results block except through `models/report.py`.** Numbers
+travel `metrics.json` → `report.py` → README, never keyboard → README, and
+`--check` fails the build when the two drift apart.
+
+**The last box is a person, and the rail before it fails closed.** The primary
+gate is an *allowlist* of four action names, not a list of banned ones, because a
+blocklist cannot enumerate every enforcement verb in advance and demonstrably did
+not — `LOCK_ACCOUNT` passed both the named blocklist and the substring scan, since
+the banned verb was `BLOCK` and `BLOCK` is not a substring of `LOCK_ACCOUNT`. An
+action nobody anticipated is therefore refused by default rather than permitted by
+default, the seventeen-verb scan and the named blocklist stay on as secondary
+rails, and `validate_response_batch` re-derives the tier from the score before any
+response leaves the process. The strongest action the API can emit is a hold, and
+the node after it is an analyst. There is no arrow out of this diagram into a
+ledger, a block list or an account state — that absence is the whole
+[defense-only claim](#defense-only-by-construction), and it is enforced at
+import time and by test rather than by intention.
+
+Five stages follow, each a module you can run on its own.
 
 **1. Generate** (`data/generator.py`) — 3,000 accounts over six months of
 synthetic UPI traffic, split into three equal ~60-day windows. Legitimate traffic
