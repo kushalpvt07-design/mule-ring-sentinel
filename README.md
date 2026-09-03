@@ -279,62 +279,6 @@ documented fix if this is ever pointed at something real.
 
 ## How it works
 
-```mermaid
-flowchart TB
-    subgraph OFFLINE["Offline pipeline — run once, artifacts committed"]
-        direction TB
-        GEN["<b>1. Generate</b><br/><code>data/generator.py</code><br/>3,000 accounts · 6 months<br/>88 rings in 3 archetypes<br/>3 equal 60-day windows"]
-        EXT["<b>2. Extract</b><br/><code>data/extractor.py</code><br/>Directed multigraph per window<br/>→ 18 account-level features"]
-        TRN["<b>3. Train</b><br/><code>models/train.py</code><br/>XGBoost · ring-grouped CV<br/>cost-optimal threshold on val<br/>5 baselines · per-archetype recall<br/>TreeSHAP identity check"]
-
-        GEN -- "train / val / test<br/>edges.csv" --> EXT
-        EXT -- "train / val / test<br/>features.csv" --> TRN
-        TRN -- "sentinel_v4.xgb<br/>metrics.json<br/>threshold" --> MODEL[("Saved model<br/>+ frozen threshold")]
-    end
-
-    subgraph SERVE["Serving path — POST /score"]
-        direction TB
-        REQ["Incoming transactions<br/>(sender, receiver, amount, timestamp)"]
-        CTX["Merge with frozen<br/>context graph<br/><code>serving_context_edges.csv</code>"]
-        FEAT["Recompute features<br/><code>compute_node_features()</code><br/>same call training used"]
-        SCORE["XGBoost predict<br/>+ TreeSHAP explanations"]
-        TIER["Risk tiering<br/><code>api/responder.py</code><br/>LOW · MEDIUM · HIGH · CRITICAL"]
-        GATE{"Defense-only gate<br/>allowlist → blocklist → substring<br/>17 forbidden verbs<br/>import-time enum sweep"}
-        RESP["Response<br/>per-account risk + action<br/>+ contributing factors<br/>in analyst language"]
-
-        REQ --> CTX --> FEAT --> SCORE --> TIER --> GATE --> RESP
-    end
-
-    subgraph DASH["Dashboard — <code>dashboard/app.py</code>"]
-        direction LR
-        OV["Overview<br/>confusion matrix<br/>+ cost breakdown"]
-        GX["Graph explorer<br/>PyVis ring viewer"]
-        CC["Cost analysis<br/>FN:FP ratio slider<br/>operating point curves"]
-        SD["Score demo<br/>live POST to /score"]
-    end
-
-    subgraph INTEGRITY["Integrity rails — enforced by test suite"]
-        direction LR
-        LK["Leakage gate<br/>single-feature AUC < 0.99"]
-        SP["Split integrity<br/>0 ring overlap across splits"]
-        CT["Contract check<br/>AST-walk: no file<br/>hard-codes feature list"]
-        ST["Stability<br/>17/18 features bit-identical<br/>under graph perturbation"]
-        RP["Report parity<br/>README ↔ metrics.json"]
-    end
-
-    MODEL --> SERVE
-    MODEL -.->|metrics.json| DASH
-    SERVE -.->|POST /score| SD
-    TRN -.->|"guarded by"| INTEGRITY
-
-    style OFFLINE fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
-    style SERVE fill:#0f3460,stroke:#16213e,color:#e0e0e0
-    style DASH fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
-    style INTEGRITY fill:#2d132c,stroke:#4a1942,color:#e0e0e0
-    style GATE fill:#c0392b,stroke:#e74c3c,color:#fff
-    style MODEL fill:#1e5631,stroke:#2d8649,color:#e0e0e0
-```
-
 Five stages, each a module you can run on its own.
 
 **1. Generate** (`data/generator.py`) — 3,000 accounts over six months of
