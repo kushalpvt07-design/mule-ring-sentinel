@@ -11,6 +11,24 @@
 #
 # Added in v3:
 #   requests     dashboard/app.py:423 posts to the live /score endpoint
+#
+# PYTHON VERSION
+# ──────────────
+# Developed and run on CPython 3.10 and 3.12 — both, not one. No lower bound is
+# claimed here because none was tested: the syntax would allow older (there are
+# no `match` statements, and every `X | None` annotation sits behind
+# `from __future__ import annotations`), but "would allow" is not "was run", so
+# use 3.10 or 3.12. Above 3.12 the failure to expect is pip building xgboost or
+# pandas from source instead of fetching a wheel — an environment problem, not a
+# code one.
+#
+# EVERY IMPORT IS ACCOUNTED FOR
+# ─────────────────────────────
+# Resolved by AST across all 30 .py files: thirteen distinct third-party imports,
+# thirteen entries below. Two do not match their import name — `community` comes
+# from python-louvain and `sklearn` from scikit-learn. `uvicorn` is listed and
+# never imported: it is the CLI that serves api.main, not a library. `console`
+# is this repo's own console.py at the root, not a package.
 
 # ── Core graph & data ──
 # networkx is upper-bounded because the extractor depends on the semantics of
